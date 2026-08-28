@@ -16,7 +16,7 @@
  */
 import { constants as fsConstants, type Dirent } from "node:fs"
 import { access, readdir, stat } from "node:fs/promises"
-import { dirname, isAbsolute, join, resolve, sep } from "node:path"
+import { posix, win32 } from "node:path"
 import { errorCode } from "../util/fs.js"
 
 /** 单次最多返回的条目数，见文件头第 2 条 */
@@ -29,6 +29,20 @@ const MAX_ENTRIES = 1000
  * 而这两个字母上今日不会有内核要访问的目录。
  */
 const DRIVE_LETTERS = "CDEFGHIJKLMNOPQRSTUVWXYZ"
+
+/**
+ * 取对应平台的路径实现
+ *
+ * 本模块的每个导出都带 `windows` 参数，于是路径计算也必须跟着这个参数走，不能用
+ * `node:path` 的平台默认导出：那些导出绑的是**当前进程**的平台，于是
+ * `dirname("C:\\Users\\x")` 在 Linux 上是 `"."`，参数就成了摆设 —— 用例在 Windows 上
+ * 全绿、在 Linux 的 CI 上挂。
+ * @param windows 是否按 Windows 处理
+ * @returns `node:path` 的 win32 或 posix 实现
+ */
+function pathOf(windows: boolean): typeof win32 | typeof posix {
+  return windows ? win32 : posix
+}
 
 /** 目录里的一项 */
 export interface BrowseEntry {
@@ -96,7 +110,7 @@ const CODE_TABLE: Record<string, { status: number; text: string }> = {
  * @returns 上一级；已在最外层时 undefined
  */
 export function parentOf(target: string, windows: boolean): string | undefined {
-  const up = dirname(target)
+  const up = pathOf(windows).dirname(target)
   if (up !== target) return up
   return windows ? "" : undefined
 }
@@ -128,12 +142,13 @@ async function listDrives(): Promise<BrowseEntry[]> {
  * 只对符号链接补 `stat`，见文件头第 3 条。
  * @param dir 所在目录
  * @param entry readdir 给出的条目
+ * @param windows 是否按 Windows 处理
  * @returns 是否为目录
  */
-async function isDirEntry(dir: string, entry: Dirent): Promise<boolean> {
+async function isDirEntry(dir: string, entry: Dirent, windows: boolean): Promise<boolean> {
   if (!entry.isSymbolicLink()) return entry.isDirectory()
   try {
-    return (await stat(join(dir, entry.name))).isDirectory()
+    return (await stat(pathOf(windows).join(dir, entry.name))).isDirectory()
   } catch {
     // 悬空链接：当作普通条目，不报错也不当目录 —— 点不进去是对的
     return false
@@ -162,16 +177,17 @@ function compareEntries(a: BrowseEntry, b: BrowseEntry): number {
  * @returns 列举结果
  */
 export async function browseDirectory(input: string | undefined, windows = process.platform === "win32"): Promise<BrowseResult> {
+  const path = pathOf(windows)
   const raw = (input ?? "").trim()
 
   if (raw === "") {
     if (windows) {
-      return { ok: true, listing: { path: "", entries: await listDrives(), truncated: false, sep } }
+      return { ok: true, listing: { path: "", entries: await listDrives(), truncated: false, sep: path.sep } }
     }
     return read("/", windows)
   }
 
-  if (!isAbsolute(raw)) {
+  if (!path.isAbsolute(raw)) {
     return {
       ok: false,
       status: 400,
@@ -179,7 +195,7 @@ export async function browseDirectory(input: string | undefined, windows = proce
     }
   }
 
-  return read(resolve(raw), windows)
+  return read(path.resolve(raw), windows)
 }
 
 /**
@@ -202,7 +218,7 @@ async function read(target: string, windows: boolean): Promise<BrowseResult> {
   const entries: BrowseEntry[] = []
   for (const item of raw) {
     const link = item.isSymbolicLink()
-    const dir = await isDirEntry(target, item)
+    const dir = await isDirEntry(target, item, windows)
     entries.push(link ? { name: item.name, dir, link: true } : { name: item.name, dir })
   }
   entries.sort(compareEntries)
@@ -218,7 +234,7 @@ async function read(target: string, windows: boolean): Promise<BrowseResult> {
       ...(parent === undefined ? {} : { parent }),
       entries: truncated ? entries.slice(0, MAX_ENTRIES) : entries,
       truncated,
-      sep
+      sep: pathOf(windows).sep
     }
   }
 }
