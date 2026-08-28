@@ -123,16 +123,24 @@ describe("目录浏览", () => {
     }
   })
 
-  it("超过 1000 项时截断并标明", async () => {
-    await Promise.all(
-      Array.from({ length: 1005 }, (_, i) => writeFile(join(dir, `f${String(i).padStart(4, "0")}.txt`), "1"))
-    )
-    const out = await listing(dir)
-    expect(out.entries.length).toBe(1000)
-    expect(out.truncated).toBe(true)
-    // 先排序再截断，故截到的必是排序后的前 1000 项
-    expect(out.entries[0]?.name).toBe("f0000.txt")
-  })
+  // 单独给 30 秒而非用 5 秒的缺省值：这一条要建 1005 个真实文件才能触到上限，
+  // 而 MAX_ENTRIES 是模块常量、无从在测试里调小。本机上光是写文件就要 0.8~1.3 秒
+  // 且波动六成，CI runner 的磁盘更慢 —— 在 ubuntu 上曾耗时 9.5 秒而超时。
+  // 试过把写入分批（64、16 个一组）反而更慢，故仍一次性并发。
+  it(
+    "超过 1000 项时截断并标明",
+    async () => {
+      await Promise.all(
+        Array.from({ length: 1005 }, (_, i) => writeFile(join(dir, `f${String(i).padStart(4, "0")}.txt`), "1"))
+      )
+      const out = await listing(dir)
+      expect(out.entries.length).toBe(1000)
+      expect(out.truncated).toBe(true)
+      // 先排序再截断，故截到的必是排序后的前 1000 项
+      expect(out.entries[0]?.name).toBe("f0000.txt")
+    },
+    30_000
+  )
 
   it("未超上限时 truncated 为假", async () => {
     await writeFile(join(dir, "one.txt"), "1")
