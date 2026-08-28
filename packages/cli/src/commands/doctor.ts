@@ -13,7 +13,7 @@ import net from "node:net"
 import process from "node:process"
 import { createRequire } from "node:module"
 import { access } from "node:fs/promises"
-import { detectPlatform, resolvePaths, sampleUsage } from "@yunzai-ng/core"
+import { detectPlatform, legacyInstance, resolvePaths, sampleUsage } from "@yunzai-ng/core"
 import { bold, cyan, dim, green, print, printRows, red, yellow } from "../terminal.js"
 
 /** Node 最低版本，与根 package.json 的 engines 保持一致 */
@@ -161,6 +161,28 @@ export interface DoctorOptions {
 }
 
 /**
+ * 检查旧默认位置上是否还留着一个实例
+ *
+ * 无遗留时**不产出结论**而非产出一条 ok：0.2.0 之后新装的机器永远不会命中这一条，
+ * 为它常驻一行「无旧实例」只是噪声。
+ *
+ * 命中时定为 warn：它不阻碍启动，但「升级之后配置全没了」是这次默认值变更最可能
+ * 被当成故障的一幕，自检必须替使用者把它答出来。
+ * @param home 本次解析出的主目录
+ * @returns 结论；无遗留时 undefined
+ */
+function checkLegacy(home: string): Finding | undefined {
+  const legacy = legacyInstance(home)
+  if (legacy === undefined) return undefined
+  return {
+    level: "warn",
+    title: "旧实例",
+    detail: `${legacy} 里还留着一个实例`,
+    next: "0.2.0 起主目录默认为当前目录。要继续用旧的，设 YZNG_HOME 指向它；要搬过来，把其中内容拷到本次的主目录"
+  }
+}
+
+/**
  * 执行一次环境自检
  * @param opts 参数
  * @returns 进程退出码；存在 error 级问题时为 1
@@ -179,9 +201,11 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<number> {
     ["常驻内存", `${(usage.rss / 1024 / 1024).toFixed(1)} MB`]
   ])
 
+  const legacy = checkLegacy(paths.home)
   const findings: Finding[] = [
     checkNode(),
     await checkDir("主目录", paths.home),
+    ...(legacy === undefined ? [] : [legacy]),
     await checkDir("配置目录", paths.config),
     await checkDir("数据目录", paths.data),
     checkNative("classic-level", "内嵌 KV，用于计数与冷却", "缺失时内核降级为 JSON 文件存储，功能不受影响但写入速度较低"),

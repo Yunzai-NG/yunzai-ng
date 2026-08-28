@@ -2,13 +2,18 @@
  * 模块职责：确定并创建运行时目录布局
  * 依赖方向：依赖 util/fs、platform/detect
  * 生命周期：启动时解析一次，之后只读
- * 注意事项：全程不使用 `process.cwd()` —— 以 Windows 服务、开机自启或 pm2 启动时
- *          工作目录并非项目目录。启动时把八个目录一次性定死成绝对路径，
- *          其余模块只准通过 `app.paths` 取。
+ * 注意事项：优先级：显式参数 > `YZNG_HOME` > 便携模式标记 > 当前目录。
+ *          启动时把八个目录一次性定死成绝对路径，其余模块只准通过 `app.paths` 取。
  *
- *          优先级：显式参数 > `YZNG_HOME` 环境变量 > 便携模式标记 > 系统默认位置。
- *          便携模式（安装目录下有 `.portable` 文件）让 ZIP 解压即用、
- *          换机拷走整个文件夹就能迁移 —— Windows 用户最常见的诉求。
+ *          **默认落在当前目录**：解压或克隆到一个文件夹、在其中 `yzng init`，数据就在
+ *          眼前，拷走整个文件夹即完成迁移。代价是本模块必须读 `process.cwd()`，而以
+ *          Windows 服务、开机自启或 pm2 启动时工作目录并非项目目录 —— 那些场景必须
+ *          显式给出 `YZNG_HOME` 或启动器的工作目录，否则数据会落在启动器所在之处。
+ *
+ *          0.1.1 及更早的默认位置是系统目录（Windows 的 `%LOCALAPPDATA%\YunzaiNG` 等）。
+ *          此处**不**为其保留静默回落 —— 那会使「默认在当前目录」在任何装过旧版的机器上
+ *          都不成立。改由 {@link legacyInstance} 把旧实例报给 CLI 显式提示：换目录应当是
+ *          使用者看得见的一步，而不是内核悄悄替他挑一个。
  */
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join, resolve } from "node:path"
@@ -63,6 +68,8 @@ function findPortableRoot(runtimeDir: string): string | undefined {
 
 /**
  * 系统默认的数据根目录
+ *
+ * 已不再是缺省取值，仅由 {@link legacyInstance} 用于查找旧实例，见文件头第 3 条。
  * @returns 绝对路径
  */
 function defaultHome(): string {
@@ -86,6 +93,44 @@ function defaultHome(): string {
 }
 
 /**
+ * 判断一个目录里是否已有实例
+ *
+ * 以 `config/` 是否存在为准：`ensurePaths` 建的七个目录中只有它必定装着文件
+ * （`ConfigStore` 会把缺省配置落盘），而空的 `data/`、`logs/` 无从区分
+ * 「一个实例」与「随手建的空目录」。
+ * @param dir 待判断的目录
+ * @returns 是否已有实例
+ */
+function hasInstance(dir: string): boolean {
+  return existsSync(join(dir, "config"))
+}
+
+/**
+ * 未显式指定、也无便携标记时的主目录
+ *
+ * 见文件头第 2、3 条。
+ * @returns 绝对路径
+ */
+function autoHome(): string {
+  return process.cwd()
+}
+
+/**
+ * 0.1.1 及更早的默认位置上是否还留着一个实例
+ *
+ * 供 CLI 提示使用：默认位置自 0.2.0 起改为当前目录，装过旧版的机器上那个实例仍在原处，
+ * 而使用者多半以为「配置全没了」。内核只负责报出位置，是否搬家由使用者决定 ——
+ * 自动迁移会在两个目录都有内容时无从判断该以谁为准。
+ * @param home 本次实际使用的主目录
+ * @returns 旧实例所在目录；不存在、或恰好就是本次所用的目录时 undefined
+ */
+export function legacyInstance(home: string): string | undefined {
+  const legacy = defaultHome()
+  if (resolve(legacy) === resolve(home)) return undefined
+  return hasInstance(legacy) ? legacy : undefined
+}
+
+/**
  * 解析目录布局
  *
  * 只做路径计算，不创建目录 —— 便于测试与 `yzng doctor` 之类"只想看看
@@ -97,7 +142,7 @@ export function resolvePaths(opts: ResolvePathsOptions = {}): RuntimePaths {
   const runtime = opts.runtime ? resolve(opts.runtime) : detectRuntimeDir()
 
   const explicit = opts.home ?? process.env.YZNG_HOME
-  const home = explicit ? resolve(process.cwd(), explicit) : (findPortableRoot(runtime) ?? defaultHome())
+  const home = explicit ? resolve(process.cwd(), explicit) : (findPortableRoot(runtime) ?? autoHome())
 
   return Object.freeze({
     home,

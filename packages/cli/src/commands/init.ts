@@ -13,6 +13,7 @@
  */
 import { ConfigStore, createLoggerHub, defineCoreConfig, ensurePaths, resolvePaths } from "@yunzai-ng/core"
 import { linkFramework } from "../link.js"
+import { noteLegacyInstance } from "../legacy.js"
 import { bold, cyan, dim, green, print, printErr, printRows, red, yellow } from "../terminal.js"
 
 /** 初始化参数 */
@@ -48,6 +49,7 @@ export async function runInit(opts: InitOptions = {}): Promise<number> {
       ["临时", cyan(paths.temp)]
     ])
     print()
+    if (noteLegacyInstance(paths.home)) print()
     if (link.failed.length > 0) {
       print(`  ${yellow("!")} 框架包未能链接至主目录，插件将无法 import @yunzai-ng/core`)
       for (const [name, reason] of link.failed) print(`      ${dim(`${name}：${reason}`)}`)

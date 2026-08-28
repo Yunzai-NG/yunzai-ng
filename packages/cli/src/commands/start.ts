@@ -12,6 +12,7 @@
 import { createApp, resolvePaths, type App } from "@yunzai-ng/core"
 import type { LogLevel } from "@yunzai-ng/types"
 import { linkFramework } from "../link.js"
+import { noteLegacyInstance } from "../legacy.js"
 import { bold, cyan, dim, green, print, printErr, printRows, red, yellow } from "../terminal.js"
 
 /** 兜底定时器的间隔：取值足够大以避免产生可测量的开销，同时不超出 32 位范围 */
@@ -76,6 +77,8 @@ export async function runStart(opts: StartOptions = {}): Promise<number> {
   // 建立链接须早于 createApp：插件在 app.start() 中被 import，此时 Node 的解析
   // 已经开始，届时再补建链接已无效果
   const home = resolvePaths({ home: opts.home }).home
+  // 在 createApp 之前提示：插件加载可能耗时数秒，而「我的数据呢」这个疑问越早解答越好
+  if (noteLegacyInstance(home)) print()
   const link = await linkFramework(home)
 
   let app: App
