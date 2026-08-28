@@ -4,6 +4,16 @@
   "description": "Yunzai NG 模板用 JSX 运行时（字符串直出，无虚拟 DOM）",
   "type": "module",
   "license": "AGPL-3.0-or-later",
+  "homepage": "https://github.com/Yunzai-NG/yunzai-ng#readme",
+  "bugs": "https://github.com/Yunzai-NG/yunzai-ng/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Yunzai-NG/yunzai-ng.git",
+    "directory": "packages/jsx"
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

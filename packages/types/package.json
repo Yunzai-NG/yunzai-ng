@@ -4,6 +4,16 @@
   "description": "Yunzai NG 公共类型契约（纯类型，零运行时依赖）",
   "type": "module",
   "license": "AGPL-3.0-or-later",
+  "homepage": "https://github.com/Yunzai-NG/yunzai-ng#readme",
+  "bugs": "https://github.com/Yunzai-NG/yunzai-ng/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Yunzai-NG/yunzai-ng.git",
+    "directory": "packages/types"
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

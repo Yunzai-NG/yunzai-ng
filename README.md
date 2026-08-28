@@ -1,5 +1,15 @@
 # Yunzai NG
 
+[![CI](https://github.com/Yunzai-NG/yunzai-ng/actions/workflows/ci.yml/badge.svg)](https://github.com/Yunzai-NG/yunzai-ng/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/@yunzai-ng/core?logo=npm&label=core)](https://www.npmjs.com/package/@yunzai-ng/core)
+[![npm](https://img.shields.io/npm/v/@yunzai-ng/cli?logo=npm&label=cli)](https://www.npmjs.com/package/@yunzai-ng/cli)
+[![npm](https://img.shields.io/npm/v/@yunzai-ng/types?logo=npm&label=types)](https://www.npmjs.com/package/@yunzai-ng/types)
+[![npm](https://img.shields.io/npm/v/@yunzai-ng/jsx?logo=npm&label=jsx)](https://www.npmjs.com/package/@yunzai-ng/jsx)
+[![下载量](https://img.shields.io/npm/dm/@yunzai-ng/core?label=%E4%B8%8B%E8%BD%BD%2F%E6%9C%88)](https://www.npmjs.com/package/@yunzai-ng/core)
+[![Node](https://img.shields.io/node/v/@yunzai-ng/core?logo=node.js)](https://nodejs.org)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](tsconfig.base.json)
+[![许可](https://img.shields.io/npm/l/@yunzai-ng/core)](LICENSE)
+
 面向 QQ 机器人的可插拔运行时内核。TypeScript,零全局变量,插件可装可卸可热重载。
 
 > 本仓库只有**内核**。适配器、渲染器、面板、业务功能全部是插件,各自成库 ——
