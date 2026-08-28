@@ -7,9 +7,12 @@
 # 第一条成功第二条失败不会当场暴露，而 @yunzai-ng/cli 对 core 是钉死版本号的硬依赖，
 # 只发成功一边，另一边的 cli 就装不上。
 #
-# 重跑是安全的：`pnpm -r publish` 遇到 registry 上已存在的版本会跳过并打印
-# 「There are no new packages that should be published」，不是报错。所以某一边失败后
+# 重跑是安全的，两边各有各的理由：npmjs 那步逐包先 `npm view` 再决定发不发，
+# GitHub Packages 那步由 `pnpm -r publish` 自行跳过已存在的版本。所以某一边失败后
 # 可以从同一个 tag 上重新 dispatch，已经发成功的那边不会被动到。
+#
+# npmjs 与 GitHub Packages 用的不是同一条命令：前者需要 provenance，而 pnpm 9.15
+# 收下 `--provenance` 却不产出 attestation 也不报错。详见「打包」那一步的注释。
 name: 发布
 
 on:
@@ -80,16 +83,46 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           GH_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # --provenance 依赖上面的 id-token 权限：npmjs 页面因此出现
-      # 「Built and signed on GitHub Actions」，并链到本次运行与具体 commit。
-      # 从本机发布拿不到这个标记，这是把发布搬到 CI 的附带收益。
+      # 为什么不是 `pnpm publish --provenance`：pnpm 9.15 收下这个参数却不产出
+      # attestation，且不报错 —— 0.1.1 就是这样发出去一个没有 provenance 的版本。
+      # 改为 `pnpm pack` 出 tarball、再交给 npm 发布：pack 会把内部依赖的
+      # `workspace:*` 改写成真实版本号（下一步会核对），而 provenance 由 npm 自己生成。
+      - name: 打包（workspace:* 在此改写为版本号）
+        run: |
+          mkdir -p .tarballs
+          for dir in packages/*/; do
+            (cd "$dir" && pnpm pack --pack-destination "$GITHUB_WORKSPACE/.tarballs")
+          done
+          ls -l .tarballs
+
+      # 这一条只为拦住一种情形：tarball 里仍留着 `workspace:*`。它装不上，而且
+      # 只有别人安装时才会暴露 —— 作者自己怎么测都碰不到。
+      - name: 核对 tarball 里没有 workspace 协议
+        run: |
+          for tgz in .tarballs/*.tgz; do
+            if tar -xzOf "$tgz" package/package.json | grep -q '"workspace:'; then
+              echo "::error::$tgz 里仍有 workspace: 协议，装的人会拿到一个装不上的包"
+              exit 1
+            fi
+          done
+          echo "四个 tarball 的内部依赖均已改写为版本号"
+
+      # 顺序即依赖顺序：types 最先，cli 最后。反过来发会有一段时间线上的包指向
+      # 尚不存在的版本。新增包时这个清单要跟着改。
       #
-      # --no-git-checks 是必需的：tag 上是 detached HEAD，pnpm 默认的分支检查会直接拒。
-      - name: 发布到 npmjs
-        run: >
-          pnpm -r --filter "./packages/*" publish
-          --access public --provenance --no-git-checks
-          --registry=https://registry.npmjs.org/
+      # 先查后发而非直接发：npm publish 遇到已存在的版本会以 EPUBLISHCONFLICT 失败，
+      # 那会让「某一边失败后从同一个 tag 重跑」这条不再成立。
+      - name: 发布到 npmjs（带 provenance）
+        run: |
+          for p in types core jsx cli; do
+            v=$(node -p "require('./packages/$p/package.json').version")
+            tgz=$(ls .tarballs/yunzai-ng-$p-$v.tgz)
+            if npm view "@yunzai-ng/$p@$v" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
+              echo "@yunzai-ng/$p@$v 已存在，跳过"
+              continue
+            fi
+            npm publish "$tgz" --access public --provenance --registry=https://registry.npmjs.org/
+          done
 
       - name: 发布到 GitHub Packages
         run: >
@@ -103,3 +136,25 @@ jobs:
         run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 放在最后、且真的会让作业变红：0.1.1 那次「步骤全绿而 attestation 不存在」
+      # 是这个文件里最值得防的一种失败 —— 绿灯本身成了误导。此处失败不影响已发出的
+      # 包，它只是把「provenance 没挂上」这件事变成看得见的。
+      - name: 核对 provenance 真的挂上了
+        run: |
+          for p in types core jsx cli; do
+            v=$(node -p "require('./packages/$p/package.json').version")
+            url="https://registry.npmjs.org/-/npm/v1/attestations/@yunzai-ng%2F$p@$v"
+            code=000
+            # registry 有短暂的传播延迟，重试几次再判定
+            for _ in 1 2 3 4 5; do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' "$url" || echo 000)
+              [ "$code" = "200" ] && break
+              sleep 6
+            done
+            if [ "$code" != "200" ]; then
+              echo "::error::@yunzai-ng/$p@$v 没有 attestation（$url → $code）"
+              exit 1
+            fi
+            echo "@yunzai-ng/$p@$v provenance 已挂上"
+          done
