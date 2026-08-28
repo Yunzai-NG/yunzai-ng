@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  /*
+   * 只用于类型检查测试代码。
+   *
+   * 为什么单独一份：测试文件被 tsconfig.build.json 的各子项目 `exclude` 掉了
+   * （测试不该进 dist），而 vitest 用 esbuild 只做转译、**完全不做类型检查**。
+   * 两者一叠加，测试代码就成了整个仓库唯一不受 strict 约束的角落 ——
+   * 一个写错类型的断言可以照样"通过"。这份配置把它补回来。
+   *
+   * 关掉 composite/declaration：本配置不产出任何东西，只负责报错。
+   */
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "incremental": false,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "jsx": "react-jsx",
+    "jsxImportSource": "@yunzai-ng/jsx"
+  },
+  "include": ["packages/*/src/**/*.test.ts", "packages/*/src/**/*.test.tsx"]
+}

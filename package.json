@@ -1,0 +1,46 @@
+{
+  "name": "yunzai-ng",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Yunzai NG - 面向 QQ 机器人的可插拔运行时内核（Windows / Android）",
+  "license": "AGPL-3.0-or-later",
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "scripts": {
+    "build": "tsc -b tsconfig.build.json",
+    "build:clean": "tsc -b tsconfig.build.json --clean",
+    "watch": "tsc -b tsconfig.build.json --watch",
+    "typecheck": "tsc -b tsconfig.build.json --dry",
+    "typecheck:test": "tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "check:layering": "node scripts/check-layering.mjs",
+    "check:firstrun": "node scripts/smoke-firstrun.mjs",
+    "bench:memory": "node scripts/bench-memory.mjs",
+    "verify": "pnpm run build && pnpm run check:layering && pnpm run check:firstrun && pnpm run typecheck:test && pnpm run lint && pnpm run test",
+    "dev": "node packages/cli/dist/bin.js dev",
+    "start": "node packages/cli/dist/bin.js start"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.18.0",
+    "@types/node": "^22.10.5",
+    "@typescript-eslint/eslint-plugin": "^8.20.0",
+    "@typescript-eslint/parser": "^8.20.0",
+    "eslint": "^9.18.0",
+    "eslint-plugin-jsdoc": "^50.6.1",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "classic-level",
+      "esbuild"
+    ]
+  }
+}

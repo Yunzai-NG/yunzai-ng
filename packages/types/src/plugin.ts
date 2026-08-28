@@ -1,0 +1,786 @@
+/**
+ * 模块职责：插件契约与注入式上下文（框架最重要的对外接口）
+ * 依赖方向：依赖本包内几乎所有其他模块
+ * 生命周期：纯类型
+ * 注意事项：插件想做的每件事都是 `ctx` 上的一个方法，且每个注册都返回 `Disposer`，
+ *          故内核在卸载时能确定性地回收一切。没有全局变量这条路。
+ */
+import type {
+  AccountState,
+  AdapterProvider,
+  AdapterRegistryView,
+  BotRegistryView,
+  ContactCache,
+  ContactCacheOptions,
+  PolicyView
+} from "./adapter.js"
+import type { BotApi } from "./bot.js"
+import type { Awaitable, Disposer, DurationLike } from "./common.js"
+import type { ConfigHandle } from "./config.js"
+import type { SendTarget } from "./contact.js"
+import type { AnyEvent, MessageEvent, MessageScene, MetaEvent, NoticeEvent, RequestEvent } from "./event.js"
+import type { HttpClient } from "./http.js"
+import type { Logger } from "./logger.js"
+import type { PlatformInfo, ResourceUsage, RuntimePaths } from "./platform.js"
+import type { RenderOptions, RenderablePage, RenderedImage, RendererProvider } from "./renderer.js"
+import type { KvDriver, KvNamespace, SqlHandle } from "./store.js"
+import type {
+  HttpMethod,
+  RouteHandler,
+  RouteOptions,
+  ServerInfo,
+  WebSocketHandler,
+  WebSocketOptions
+} from "./server.js"
+
+/* ────────────────────────────── 命令 ────────────────────────────── */
+
+/**
+ * 命令模式
+ *
+ * - 字符串：前缀匹配。内核按首字符分桶索引，一条消息只会去试同桶的候选，
+ *   而不是像旧 loader 那样对每条消息线性跑完全部正则。
+ * - 正则：完整匹配 `e.text`，捕获组会填进 `e.command.groups` / `captures`。
+ */
+export type CommandPattern = string | RegExp
+
+/** 冷却作用域 */
+export type CooldownScope = "user" | "group" | "groupUser" | "global"
+
+/** 命令声明选项 */
+export interface CommandOptions {
+  /** 别名，与主模式等价 */
+  alias?: CommandPattern | CommandPattern[]
+  /** 一句话说明，用于帮助与 WebUI */
+  desc?: string
+  /** 用法示例 */
+  usage?: string
+  /** 帮助里的分组名 */
+  group?: string
+  /** 限定生效场景，缺省全部 */
+  scene?: MessageScene | MessageScene[]
+  /** 仅主人可用 */
+  master?: boolean
+  /** 仅群管/群主可用 */
+  admin?: boolean
+  /** 冷却时长 */
+  cooldown?: DurationLike
+  /** 冷却作用域，缺省 `"user"` */
+  cooldownScope?: CooldownScope
+  /** 触发冷却时的提示语；缺省静默 */
+  cooldownTip?: string
+  /** 优先级，数值小者先匹配，缺省 100 */
+  priority?: number
+  /** 群聊中是否必须 @ 机器人才触发 */
+  atMe?: boolean
+  /** 是否允许触发词不在开头（默认必须以触发词开头） */
+  anywhere?: boolean
+  /** 命中后是否阻断后续命令，缺省 true */
+  block?: boolean
+  /** 是否在帮助中隐藏 */
+  hidden?: boolean
+  /** 是否忽略机器人自己发出的消息，缺省 true */
+  ignoreSelf?: boolean
+}
+
+/**
+ * 命令处理函数
+ *
+ * 返回 `false` 表示"我不处理这条"，内核继续尝试后续命令。
+ */
+export type CommandHandler = (e: MessageEvent) => Awaitable<void | boolean>
+
+/** 链式命令构造器 */
+export interface CommandBuilder {
+  /**
+   * 绑定处理函数
+   * @param fn 处理函数
+   * @returns 自身，便于链式调用
+   */
+  action(fn: CommandHandler): CommandBuilder
+
+  /**
+   * 追加别名
+   * @param patterns 别名模式
+   * @returns 自身
+   */
+  alias(...patterns: CommandPattern[]): CommandBuilder
+
+  /**
+   * 设置说明
+   * @param text 说明文案
+   * @returns 自身
+   */
+  desc(text: string): CommandBuilder
+
+  /**
+   * 限定场景
+   * @param scenes 允许的场景
+   * @returns 自身
+   */
+  scene(...scenes: MessageScene[]): CommandBuilder
+
+  /**
+   * 限定仅主人可用
+   * @returns 自身
+   */
+  master(): CommandBuilder
+
+  /**
+   * 限定仅群管可用
+   * @returns 自身
+   */
+  admin(): CommandBuilder
+
+  /**
+   * 设置冷却
+   * @param spec 冷却时长
+   * @param scope 作用域
+   * @returns 自身
+   */
+  cooldown(spec: DurationLike, scope?: CooldownScope): CommandBuilder
+
+  /**
+   * 设置优先级
+   * @param value 数值，小者优先
+   * @returns 自身
+   */
+  priority(value: number): CommandBuilder
+
+  /** 注销该命令 */
+  dispose(): void
+}
+
+/** 命令的对外描述（帮助、WebUI 用） */
+export interface CommandInfo {
+  /** 命令名 */
+  name: string
+  /** 全部触发模式的可读形式 */
+  patterns: string[]
+  /** 说明 */
+  desc?: string
+  /** 用法 */
+  usage?: string
+  /** 分组 */
+  group?: string
+  /** 所属插件 */
+  plugin: string
+  /** 是否仅主人 */
+  master: boolean
+  /** 是否仅群管 */
+  admin: boolean
+  /** 是否隐藏 */
+  hidden: boolean
+  /** 是否被用户禁用 */
+  disabled: boolean
+}
+
+/* ────────────────────────────── 中间件 ────────────────────────────── */
+
+/**
+ * 中间件
+ *
+ * Koa 语义：接收事件与 `next`，可在 next 前后执行动作，不调用 next 即阻断。
+ * 游戏前缀识别（`*` → 星铁、`%` → 绝区零）这类逻辑属于插件的中间件，不进内核。
+ */
+export type Middleware<E extends AnyEvent = AnyEvent> = (e: E, next: () => Promise<void>) => Awaitable<void>
+
+/** 中间件注册选项 */
+export interface MiddlewareOptions {
+  /** 优先级，小者靠外层，缺省 100 */
+  priority?: number
+  /** 只对某类事件生效，缺省全部 */
+  kind?: AnyEvent["kind"] | Array<AnyEvent["kind"]>
+}
+
+/**
+ * 中间件的对外描述
+ *
+ * 与 `CommandInfo` / `TaskInfo` 同类，供 WebUI 展示。**不含中间件函数本身** ——
+ * 那是个闭包，序列化不出去，而面板要回答的是「一条消息先过谁」。
+ */
+export interface MiddlewareInfo {
+  /** 所属插件名 */
+  plugin: string
+  /** 实际生效的优先级（未声明时即缺省值） */
+  priority: number
+  /**
+   * 适用的事件大类
+   *
+   * 未声明 `kind` 的中间件在此列出全部大类，而不是留空 —— 「适用于全部」与
+   * 「一类都不适用」在面板上必须分得开。
+   */
+  kinds: Array<AnyEvent["kind"]>
+}
+
+/* ────────────────────────────── 定时任务 ────────────────────────────── */
+
+/** 定时任务体 */
+export type TaskFn = (signal: AbortSignal) => Awaitable<void>
+
+/** 定时任务选项 */
+export interface TaskOptions {
+  /** 任务名，用于日志与 WebUI；缺省用 cron 表达式 */
+  name?: string
+  /**
+   * 上一轮还没跑完时的策略
+   *
+   * - `"skip"`（缺省）：跳过本轮。移植旧 loader 的 `taskRunning` 保护，
+   *   避免推送任务堆积把内存吃光。
+   * - `"queue"`：排队等上一轮结束。
+   */
+  overlap?: "skip" | "queue"
+  /** 单次执行超时；超时会 abort 传入的 signal */
+  timeout?: DurationLike
+  /** 是否在注册后立即执行一次 */
+  immediate?: boolean
+  /** 时区，缺省系统时区 */
+  timezone?: string
+}
+
+/** 定时任务的对外描述 */
+export interface TaskInfo {
+  /** 任务名 */
+  name: string
+  /** cron 表达式或间隔说明 */
+  schedule: string
+  /** 所属插件 */
+  plugin: string
+  /** 下次执行时间（毫秒），无后续执行时 undefined */
+  nextRun?: number
+  /** 上次执行时间（毫秒） */
+  lastRun?: number
+  /** 上次耗时毫秒 */
+  lastCost?: number
+  /** 是否正在执行 */
+  running: boolean
+  /** 累计跳过次数（overlap=skip 生效的次数） */
+  skipped: number
+}
+
+/* ────────────────────────────── 内核事件 ────────────────────────────── */
+
+/**
+ * 一次命令处理的结果
+ *
+ * 三个「已完成」事件（命令、发送、渲染）都带 `cost` 与 `ok`：统计插件要算的
+ * 无非「多少次、多久、成功率」，缺任一项都得自己再埋一遍表。
+ */
+export interface CommandDoneInfo {
+  /** 命令所属插件 */
+  plugin: string
+  /** 命令名 */
+  command: string
+  /** 处理耗时毫秒 */
+  cost: number
+  /** 是否正常结束（抛错为假） */
+  ok: boolean
+  /** 出错时的可读信息 */
+  error?: string
+}
+
+/** 一次消息发送的结果 */
+export interface MessageSentInfo {
+  /** 发出该消息的账号记录 id */
+  accountId: string
+  /** 适配器 id */
+  adapterId: string
+  /** 平台标识 */
+  platform: string
+  /** 发送目标 */
+  target: SendTarget
+  /** 消息段数 */
+  segments: number
+  /** 各类型段的计数，如 `{ text: 1, image: 2 }` */
+  kinds: Record<string, number>
+  /** 发送耗时毫秒 */
+  cost: number
+  /** 平台是否接收 */
+  ok: boolean
+}
+
+/** 一次渲染的结果 */
+export interface RenderDoneInfo {
+  /** 实际出图的渲染器 id */
+  renderer: string
+  /** 模板标识 */
+  template: string
+  /** 出图张数 */
+  images: number
+  /** 产物总字节数 */
+  bytes: number
+  /** 渲染耗时毫秒 */
+  cost: number
+  /** 是否成功 */
+  ok: boolean
+  /** 失败原因 */
+  error?: string
+}
+
+/** `ctx.on` 可监听的内核事件与其参数 */
+export interface CoreEventMap {
+  /** 全部插件加载完成、服务已就绪 */
+  "app/ready": []
+  /** 开始停机，插件应在此保存状态 */
+  "app/stopping": []
+  /** 某账号上线 */
+  "bot/online": [bot: BotApi]
+  /** 某账号下线 */
+  "bot/offline": [bot: BotApi, reason: string | undefined]
+  /** 收到消息（在命令路由之后触发，便于做统计） */
+  message: [e: MessageEvent]
+  /** 收到通知 */
+  notice: [e: NoticeEvent]
+  /** 收到请求 */
+  request: [e: RequestEvent]
+  /** 收到元事件 */
+  meta: [e: MetaEvent]
+  /** 某插件加载完成 */
+  "plugin/loaded": [name: string]
+  /** 某插件已卸载 */
+  "plugin/unloaded": [name: string]
+  /** 某插件加载失败 */
+  "plugin/error": [name: string, err: unknown]
+  /** 某配置发生变更 */
+  "config/changed": [owner: string, paths: string[]]
+  /** 事件处理中抛出未捕获错误 */
+  "pipeline/error": [e: AnyEvent, err: unknown]
+  /**
+   * 一条命令处理完毕（成功或抛错都会触发）
+   *
+   * 与 `message` 的分工：`message` 说明「收到了一条消息」，本事件说明
+   * 「某条命令跑完了、花了多久」。统计「命令调用次数与耗时」要的是后者 ——
+   * 一条消息可能命中零条或多条命令。
+   */
+  "command/done": [e: MessageEvent, info: CommandDoneInfo]
+  /**
+   * 一条消息已发出
+   *
+   * 在 `BotApi.sendMessage` 的出口触发，因此 `e.reply()`、`ctx.render()` 之后的
+   * 发送、定时任务里的主动推送都在其中 —— 埋在 `reply()` 上会漏掉后两者。
+   */
+  "message/sent": [info: MessageSentInfo]
+  /** 一次渲染结束（成功或全部渲染器失败） */
+  "render/done": [info: RenderDoneInfo]
+}
+
+/* ────────────────────────────── 应用视图 ────────────────────────────── */
+
+/** 账号管理视图 */
+export interface AccountsView {
+  /**
+   * 列出全部账号及其状态
+   * @returns 状态快照数组
+   */
+  list(): AccountState[]
+
+  /**
+   * 按记录 id 取账号状态
+   * @param id 账号记录 id
+   * @returns 状态快照，不存在时 undefined
+   */
+  get(id: string): AccountState | undefined
+}
+
+/** 插件运行状态 */
+export type PluginStatus = "loaded" | "disabled" | "error"
+
+/** 插件状态快照 */
+export interface PluginState {
+  /** 插件名 */
+  name: string
+  /** 版本 */
+  version: string
+  /** 说明 */
+  description?: string
+  /** 作者 */
+  author?: string
+  /**
+   * 仓库或主页地址
+   *
+   * 取自插件 `package.json` 的 `homepage`，或 `definePlugin` 的同名字段。
+   * **取不到时本字段不出现**，面板据此决定是否显示「访问仓库」——
+   * 按钮在而点了没反应，比按钮不在更糟。
+   */
+  homepage?: string
+  /** 安装目录 */
+  root: string
+  /** 当前状态 */
+  status: PluginStatus
+  /** 出错时的信息 */
+  error?: string
+  /** 加载耗时毫秒 */
+  loadCost: number
+  /** 注册的命令数 */
+  commands: number
+  /** 注册的定时任务数 */
+  tasks: number
+  /** 注册的中间件数 */
+  middlewares: number
+  /**
+   * 是否位于随发行版预置的插件目录
+   *
+   * 内核自身不预置任何插件，该标记仅在宿主显式传入 `builtinDirs` 时为真，
+   * 用于区分"由发行版放置"与"由用户或插件市场安装"。
+   */
+  builtin: boolean
+  /**
+   * 是否声明了配置 schema
+   *
+   * 为真时存在一份与插件同名的配置文件，面板据此决定是否展示配置入口。
+   * 加载失败的插件此项恒为假：其 `setup` 未执行，配置未被声明。
+   */
+  configured: boolean
+}
+
+/** 插件管理视图 */
+export interface PluginsView {
+  /**
+   * 列出全部插件
+   * @returns 状态快照数组
+   */
+  list(): PluginState[]
+
+  /**
+   * 按名取插件
+   * @param name 插件名
+   * @returns 状态快照，未安装时 undefined
+   */
+  get(name: string): PluginState | undefined
+
+  /**
+   * 列出全部命令
+   * @returns 命令描述数组
+   */
+  commands(): CommandInfo[]
+
+  /**
+   * 列出全部定时任务
+   * @returns 任务描述数组
+   */
+  tasks(): TaskInfo[]
+
+  /**
+   * 列出全部中间件，顺序即实际的执行顺序
+   * @returns 中间件描述数组
+   */
+  middlewares(): MiddlewareInfo[]
+}
+
+/**
+ * 应用只读视图
+ *
+ * 插件通过 `ctx.app` 观察全局，但不能通过它改全局——想改就得走各自的
+ * 具名 API（`ctx.config.patch` 等），便于审计。
+ */
+export interface AppView {
+  /** 内核版本 */
+  readonly version: string
+  /** 启动时间（毫秒时间戳） */
+  readonly startedAt: number
+  /** 目录布局 */
+  readonly paths: RuntimePaths
+  /** 环境信息 */
+  readonly platform: PlatformInfo
+  /** 适配器注册表 */
+  readonly adapters: AdapterRegistryView
+  /** 在线 Bot 注册表 */
+  readonly bots: BotRegistryView
+  /** 账号 */
+  readonly accounts: AccountsView
+  /** 插件 */
+  readonly plugins: PluginsView
+  /** 主人等策略 */
+  readonly policy: PolicyView
+  /** HTTP 服务器信息 */
+  readonly server: ServerInfo
+
+  /**
+   * 采样当前资源占用
+   * @returns 资源占用快照
+   */
+  usage(): ResourceUsage
+}
+
+/* ────────────────────────────── 插件上下文 ────────────────────────────── */
+
+/**
+ * 插件上下文
+ *
+ * 插件能做的一切都在这里。没有全局变量、没有 `require("../../lib/...")`，
+ * 因此内核可以精确知道每个插件占用了哪些资源，卸载时全部归还。
+ */
+export interface PluginContext<C = unknown> {
+  /** 插件名 */
+  readonly name: string
+  /** 插件版本 */
+  readonly version: string
+  /** 插件安装目录（绝对路径） */
+  readonly root: string
+  /** 本插件专属的数据目录（绝对路径，已创建） */
+  readonly dataDir: string
+  /** 本插件专属日志器 */
+  readonly logger: Logger
+  /** 本插件专属 KV 命名空间 */
+  readonly kv: KvNamespace
+  /** 本插件的配置句柄；未声明 `configSchema` 时 `get()` 返回空对象 */
+  readonly config: ConfigHandle<C>
+  /** 应用只读视图 */
+  readonly app: AppView
+  /** HTTP 客户端（已带全局代理与超时默认值） */
+  readonly http: HttpClient
+  /** 插件卸载时 abort，可直接传给 fetch / 循环判断 */
+  readonly signal: AbortSignal
+
+  /**
+   * 声明一条命令
+   * @param pattern 触发模式
+   * @param opts 命令选项
+   * @returns 链式构造器
+   */
+  command(pattern: CommandPattern, opts?: CommandOptions): CommandBuilder
+
+  /**
+   * 注册中间件
+   * @param fn 中间件函数
+   * @param opts 注册选项
+   * @returns 注销句柄
+   */
+  middleware(fn: Middleware, opts?: MiddlewareOptions): Disposer
+
+  /**
+   * 监听内核事件
+   * @param event 事件名
+   * @param handler 处理函数
+   * @returns 注销句柄
+   */
+  on<K extends keyof CoreEventMap>(
+    event: K,
+    handler: (...args: CoreEventMap[K]) => Awaitable<void>
+  ): Disposer
+
+  /**
+   * 注册 cron 定时任务
+   * @param expression 5 或 6 段 cron 表达式（支持秒）
+   * @param fn 任务体
+   * @param opts 任务选项
+   * @returns 注销句柄
+   */
+  cron(expression: string, fn: TaskFn, opts?: TaskOptions): Disposer
+
+  /**
+   * 注册固定间隔任务
+   * @param interval 间隔
+   * @param fn 任务体
+   * @param opts 任务选项
+   * @returns 注销句柄
+   */
+  every(interval: DurationLike, fn: TaskFn, opts?: TaskOptions): Disposer
+
+  /**
+   * 对外提供服务，供其他插件 `inject` 取用
+   *
+   * 插件间协作的唯一入口：mhy-game-plugin 提供 `"mihoyo.api"`，其他插件按需取，
+   * 内核只维护一张键到值的表，对表里装的是什么毫无认知。
+   * @param key 服务键，建议 `"<插件域>.<能力>"`
+   * @param value 服务实例
+   * @returns 注销句柄
+   */
+  provide<T>(key: string, value: T): Disposer
+
+  /**
+   * 取用其他插件提供的服务
+   * @param key 服务键
+   * @returns 服务实例，未提供时 undefined
+   */
+  inject<T>(key: string): T | undefined
+
+  /**
+   * 取用服务，缺失即抛错
+   * @param key 服务键
+   * @returns 服务实例
+   * @throws 服务未注册时抛出
+   */
+  require<T>(key: string): T
+
+  /**
+   * 等待某服务就绪
+   *
+   * 用于弱依赖：插件 A 想用插件 B 的能力，但不想因为 B 没装就整体失败。
+   * @param key 服务键
+   * @param timeout 等待超时，缺省 30s
+   * @returns 服务实例；超时返回 undefined
+   */
+  waitFor<T>(key: string, timeout?: DurationLike): Promise<T | undefined>
+
+  /**
+   * 注册 HTTP 路由
+   * @param method HTTP 方法
+   * @param path 路径，会被挂到 `/plugin/<插件名>` 之下
+   * @param handler 处理函数
+   * @param opts 选项
+   * @returns 注销句柄
+   */
+  route(method: HttpMethod, path: string, handler: RouteHandler, opts?: RouteOptions): Disposer
+
+  /**
+   * 注册 WebSocket 路径
+   * @param path 路径，会被挂到 `/plugin/<插件名>` 之下
+   * @param handler 每个连接调用一次
+   * @param opts 选项
+   * @returns 注销句柄
+   */
+  websocket(path: string, handler: WebSocketHandler, opts?: WebSocketOptions): Disposer
+
+  /**
+   * 挂载静态目录（WebUI 扩展页面用）
+   * @param urlPath URL 前缀
+   * @param dir 本地目录绝对路径
+   * @returns 注销句柄
+   */
+  static(urlPath: string, dir: string): Disposer
+
+  /**
+   * 接管站点根路径，以本插件提供的单页应用替换内置面板
+   *
+   * 与 `static()` 的区别在于挂载位置：`static()` 挂在 `/plugin/<插件名>` 之下，
+   * 本方法挂在 `/`。内核自带的面板是**兜底实现**，仅在根路径无人接管时才挂载，
+   * 因此调用本方法即可整体替换面板前端，无需修改内核。
+   *
+   * 同一时刻只允许一个插件接管：根路径已被占用时抛错，而不是静默覆盖 ——
+   * 静默覆盖会使"面板显示的是哪个插件的页面"变得无法判定。
+   * @param dir 单页应用产物目录（绝对路径，需含 index.html）
+   * @returns 注销句柄；注销后内置面板不会自动补挂，需重启进程
+   */
+  panel(dir: string): Disposer
+
+  /**
+   * 注册适配器
+   * @param provider 适配器实现
+   * @returns 注销句柄；注销时内核会先断开该适配器的全部账号
+   */
+  registerAdapter(provider: AdapterProvider): Disposer
+
+  /**
+   * 注册渲染器
+   * @param provider 渲染器实现
+   * @returns 注销句柄
+   */
+  registerRenderer(provider: RendererProvider): Disposer
+
+  /**
+   * 注册 KV 驱动（如 Redis）
+   * @param driver 驱动实现
+   * @returns 注销句柄
+   */
+  registerKvDriver(driver: KvDriver): Disposer
+
+  /**
+   * 渲染 TSX 页面为图片段
+   *
+   * 页面由 `@yunzai-ng/jsx` 的 `defineTemplate()` 产出：组件在插件进程内即求值完毕，
+   * 因此模板数据的类型在调用处便已检查。
+   * @param page 已渲染好的页面
+   * @param opts 渲染选项
+   * @returns 图片段（分页时为数组）
+   * @throws 无可用渲染器或渲染失败时抛出
+   */
+  render(page: RenderablePage, opts?: RenderOptions): Promise<RenderedImage>
+
+  /**
+   * 渲染字符串模板为图片段
+   * @param template 模板路径，相对本插件的 `templates` 目录
+   * @param data 模板数据
+   * @param opts 渲染选项
+   * @returns 图片段（分页时为数组）
+   * @throws 无可用渲染器或渲染失败时抛出
+   */
+  render(template: string, data?: Record<string, unknown>, opts?: RenderOptions): Promise<RenderedImage>
+
+  /**
+   * 打开本插件专属的 SQLite 库
+   * @param name 库名，缺省 `"main"`
+   * @returns SQL 句柄，随插件卸载自动关闭
+   */
+  sql(name?: string): Promise<SqlHandle>
+
+  /**
+   * 创建 LRU + TTL 缓存
+   * @param opts 缓存参数
+   * @returns 缓存实例，随插件卸载自动清空
+   */
+  cache<V>(opts: ContactCacheOptions): ContactCache<V>
+
+  /**
+   * 拼出插件内资源的绝对路径
+   * @param parts 相对插件根的路径片段
+   * @returns 绝对路径
+   */
+  resource(...parts: string[]): string
+
+  /**
+   * 注册清理回调
+   *
+   * 卸载时按注册的逆序执行。凡是 ctx 之外自己开的资源（socket、子进程、
+   * 第三方库的 watcher）都必须在这里登记。
+   * @param fn 清理函数
+   */
+  onDispose(fn: Disposer): void
+
+  /**
+   * 主动向某个会话发消息（推送任务用）
+   * @param bot 目标账号；传 undefined 时用第一个在线账号
+   * @returns 该账号的 Bot；无可用账号时 undefined
+   */
+  pickBot(bot?: string): BotApi | undefined
+}
+
+/* ────────────────────────────── 插件定义 ────────────────────────────── */
+
+/** 插件元信息 */
+export interface PluginMeta {
+  /** 插件名，必须全局唯一；同时作为 KV 命名空间与配置文件名 */
+  name: string
+  /** 版本号 */
+  version?: string
+  /** 一句话说明 */
+  description?: string
+  /** 作者 */
+  author?: string
+  /** 主页 */
+  homepage?: string
+  /**
+   * 依赖的其他插件名
+   *
+   * 内核据此排序加载。缺失依赖时本插件跳过加载并记警告，**不影响内核启动**。
+   */
+  dependencies?: string[]
+  /** 声明本插件会 `provide` 的服务键，供依赖检查与文档生成 */
+  provides?: string[]
+  /** 加载优先级，小者先加载，缺省 100 */
+  priority?: number
+}
+
+/**
+ * 插件定义
+ *
+ * `setup` 可返回一个 Disposer 作为清理函数（等价于在里面调 `ctx.onDispose`）。
+ */
+export interface PluginDefinition<C = unknown> extends PluginMeta {
+  /**
+   * 配置 schema
+   *
+   * 实际类型是 `@yunzai-ng/core` 的 `Schema`（由 `s.object({...})` 构造）。
+   * 类型包不依赖任何工作区包以保持叶子，故此处只能是 `unknown`；
+   * 真正的类型推导由 core 的 `definePlugin` 完成 —— 这也是插件必须用
+   * `definePlugin` 而不是手写对象字面量的原因。
+   */
+  configSchema?: unknown
+
+  /**
+   * 插件入口
+   * @param ctx 注入的上下文
+   * @returns 可选的清理函数
+   */
+  setup(ctx: PluginContext<C>): Awaitable<void | Disposer>
+}

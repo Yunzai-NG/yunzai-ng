@@ -1,0 +1,86 @@
+# 框架仓库的持续集成
+#
+# 与本地 `pnpm run verify` 的唯一差别：registry 覆盖为官方源。仓库内 .npmrc 固定为
+# registry.npmmirror.com（国内网络环境所需），而 runner 位于境外，走镜像反而更慢且
+# 偶发解析失败。此处以环境变量覆盖，不修改 .npmrc，本地开发不受影响。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支上新的推送取消尚未完成的旧运行：CI 的价值在于对最新提交的判定
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - uses: actions/setup-node@v4
+        with:
+          # 与 package.json 的 engines.node（>=20.11.0）保持一致
+          node-version: "20.11"
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建内核、CLI 与 JSX 运行时
+        run: pnpm run build
+
+      - name: 分层门禁
+        run: pnpm run check:layering
+
+      - name: 首次启动门禁
+        run: pnpm run check:firstrun
+
+      - name: 类型检查（测试代码）
+        run: pnpm run typecheck:test
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: 单元测试
+        run: pnpm run test
+
+  # Windows 与 Termux 均在支持范围内，而路径处理、junction 与原生模块加载
+  # 是三处最容易只在 POSIX 上通过的地方，因此单开一个 Windows 作业。
+  # 只跑 build 与 test：lint 与分层门禁的结果与平台无关，无须重复。
+  verify-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.11"
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建
+        run: pnpm run build
+
+      - name: 首次启动门禁
+        run: pnpm run check:firstrun
+
+      - name: 单元测试
+        run: pnpm run test

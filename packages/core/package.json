@@ -1,0 +1,44 @@
+{
+  "name": "@yunzai-ng/core",
+  "version": "0.1.0",
+  "description": "Yunzai NG 内核：插件宿主、统一事件模型、中间件管线、存储与渲染抽象",
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@fastify/static": "^8.0.4",
+    "@fastify/websocket": "^11.0.2",
+    "@yunzai-ng/types": "workspace:*",
+    "croner": "^9.0.0",
+    "fastify": "^5.2.1",
+    "pino": "^9.6.0",
+    "undici": "^7.3.0",
+    "yaml": "^2.7.0"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.8.1",
+    "classic-level": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12"
+  }
+}

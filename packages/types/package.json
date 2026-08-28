@@ -1,0 +1,20 @@
+{
+  "name": "@yunzai-ng/types",
+  "version": "0.1.0",
+  "description": "Yunzai NG 公共类型契约（纯类型，零运行时依赖）",
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc -b"
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "@yunzai-ng/jsx",
+  "version": "0.1.0",
+  "description": "Yunzai NG 模板用 JSX 运行时（字符串直出，无虚拟 DOM）",
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./jsx-runtime": {
+      "types": "./dist/jsx-runtime.d.ts",
+      "import": "./dist/jsx-runtime.js"
+    },
+    "./jsx-dev-runtime": {
+      "types": "./dist/jsx-runtime.d.ts",
+      "import": "./dist/jsx-runtime.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@yunzai-ng/types": "workspace:*"
+  }
+}

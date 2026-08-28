@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "files": [],
+  "references": [
+    { "path": "packages/types" },
+    { "path": "packages/jsx" },
+    { "path": "packages/core" },
+    { "path": "packages/cli" }
+  ]
+}

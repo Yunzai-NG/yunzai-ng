@@ -1,0 +1,22 @@
+# 统一换行：仓库内一律存 LF，检出时不改写。
+# 缺少此文件时，Windows 贡献者的下一次提交会把每个文件都算成改动。
+* text=auto eol=lf
+
+# 二进制：不做换行转换，也不参与 diff
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.node binary
+
+# 锁文件与产物：diff 噪音大且无审阅价值
+pnpm-lock.yaml -diff linguist-generated

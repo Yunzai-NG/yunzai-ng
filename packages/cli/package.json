@@ -1,0 +1,28 @@
+{
+  "name": "@yunzai-ng/cli",
+  "version": "0.1.0",
+  "description": "Yunzai NG 命令行：init / start / dev / doctor / plugin",
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "yzng": "./dist/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@yunzai-ng/core": "workspace:*",
+    "@yunzai-ng/jsx": "workspace:*",
+    "@yunzai-ng/types": "workspace:*"
+  }
+}

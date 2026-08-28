@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 运行期数据目录（由 yzng 生成）
+data/
+logs/
+temp/
+config/*.yaml
+!config/*.example.yaml
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
