@@ -7,6 +7,11 @@
 # 第一条成功第二条失败不会当场暴露，而 @yunzai-ng/cli 对 core 是钉死版本号的硬依赖，
 # 只发成功一边，另一边的 cli 就装不上。
 #
+# 各包独立版本号：只有改动过的包升版本，未改动的留在原处。tag 因此不代表
+# 「四个包都是这个号」，只是这次发布的编号（取自根 package.json）。哪些包真的发出去，
+# 由「先查后发」逐包按 registry 上有没有这个版本决定 —— 版本号本身就是唯一的判据，
+# 不必另记一份「本次要发哪些」的清单。
+#
 # 重跑是安全的，两边各有各的理由：npmjs 那步逐包先 `npm view` 再决定发不发，
 # GitHub Packages 那步由 `pnpm -r publish` 自行跳过已存在的版本。所以某一边失败后
 # 可以从同一个 tag 上重新 dispatch，已经发成功的那边不会被动到。
@@ -58,20 +63,25 @@ jobs:
       - name: 全量校验
         run: pnpm run verify
 
-      # tag 与 manifest 的版本号对不上时，发出去的是 manifest 里那个数字，而 Release
-      # 和 tag 指着另一个 —— 之后谁都对不上账。宁可在这里失败。
-      - name: 校验 tag 与四个包的版本号一致
+      # 各包独立版本号：未改动的包留在旧版本，由后面「先查后发」逐包跳过。
+      # tag 因此不代表「四个包都是这个号」，而只是**这次发布的编号**，取自根
+      # package.json（它是 private，不发布，正好适合充当这个编号）。
+      #
+      # 校验它与 tag 一致：对不上的话 Release 指着一个号、发出去的是另一批内容，
+      # 之后谁都对不上账。宁可在这里失败。
+      - name: 校验 tag 与发布编号一致
         if: github.ref_type == 'tag'
         run: |
           tag="${GITHUB_REF_NAME#v}"
+          root=$(node -p "require('./package.json').version")
+          if [ "$root" != "$tag" ]; then
+            echo "::error::tag 为 $tag，但根 package.json 的发布编号是 $root"
+            exit 1
+          fi
+          echo "本次发布编号 $tag，各包版本："
           for p in types core jsx cli; do
-            got=$(node -p "require('./packages/$p/package.json').version")
-            if [ "$got" != "$tag" ]; then
-              echo "::error::tag 为 $tag，但 packages/$p 的版本是 $got"
-              exit 1
-            fi
+            echo "  @yunzai-ng/$p  $(node -p "require('./packages/$p/package.json').version")"
           done
-          echo "四个包均为 $tag"
 
       # 凭据按 registry 主机名分别写入，不走 setup-node 的 registry-url：
       # 这里要同时对两个 registry 认证，一个 registry-url 表达不了。
@@ -114,15 +124,24 @@ jobs:
       # 那会让「某一边失败后从同一个 tag 重跑」这条不再成立。
       - name: 发布到 npmjs（带 provenance）
         run: |
+          : > .tarballs/published.txt
           for p in types core jsx cli; do
             v=$(node -p "require('./packages/$p/package.json').version")
-            tgz=$(ls .tarballs/yunzai-ng-$p-$v.tgz)
             if npm view "@yunzai-ng/$p@$v" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
-              echo "@yunzai-ng/$p@$v 已存在，跳过"
+              echo "@yunzai-ng/$p@$v 已在 npmjs 上，跳过"
               continue
             fi
-            npm publish "$tgz" --access public --provenance --registry=https://registry.npmjs.org/
+            npm publish ".tarballs/yunzai-ng-$p-$v.tgz" --access public --provenance --registry=https://registry.npmjs.org/
+            echo "$p $v" >> .tarballs/published.txt
           done
+          # 一个包都没发不算失败：从同一个 tag 重跑（例如上次只有 GitHub Packages 挂了）
+          # 时本步骤本就无事可做
+          if [ -s .tarballs/published.txt ]; then
+            echo "本次发往 npmjs 的是："
+            cat .tarballs/published.txt
+          else
+            echo "本次没有需要发往 npmjs 的包"
+          fi
 
       - name: 发布到 GitHub Packages
         run: >
@@ -140,10 +159,16 @@ jobs:
       # 放在最后、且真的会让作业变红：0.1.1 那次「步骤全绿而 attestation 不存在」
       # 是这个文件里最值得防的一种失败 —— 绿灯本身成了误导。此处失败不影响已发出的
       # 包，它只是把「provenance 没挂上」这件事变成看得见的。
+      #
+      # 只核对**本次发出**的包：未改动的包留在旧版本，而 0.1.1 及更早是从本机发的，
+      # 本来就没有 attestation，拿它们来核对只会得到一条必然失败的断言。
       - name: 核对 provenance 真的挂上了
         run: |
-          for p in types core jsx cli; do
-            v=$(node -p "require('./packages/$p/package.json').version")
+          if [ ! -s .tarballs/published.txt ]; then
+            echo "本次没有发出任何包，无需核对"
+            exit 0
+          fi
+          while read -r p v; do
             url="https://registry.npmjs.org/-/npm/v1/attestations/@yunzai-ng%2F$p@$v"
             code=000
             # registry 有短暂的传播延迟，重试几次再判定
@@ -157,4 +182,4 @@ jobs:
               exit 1
             fi
             echo "@yunzai-ng/$p@$v provenance 已挂上"
-          done
+          done < .tarballs/published.txt
