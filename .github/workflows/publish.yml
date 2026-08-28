@@ -1,0 +1,105 @@
+# 发布：把四个包同时推到 npmjs 与 GitHub Packages
+#
+# 由 tag 触发而非分支推送 —— 发布不可撤销（版本号一旦发出，即便 unpublish 也永久
+# 不可复用），必须是一个明确的动作，不能是「往 main 推了一下」的副作用。
+#
+# 两个 registry 由同一次运行发出，是这个文件存在的唯一理由：手工跑两条命令时，
+# 第一条成功第二条失败不会当场暴露，而 @yunzai-ng/cli 对 core 是钉死版本号的硬依赖，
+# 只发成功一边，另一边的 cli 就装不上。
+#
+# 重跑是安全的：`pnpm -r publish` 遇到 registry 上已存在的版本会跳过并打印
+# 「There are no new packages that should be published」，不是报错。所以某一边失败后
+# 可以从同一个 tag 上重新 dispatch，已经发成功的那边不会被动到。
+name: 发布
+
+on:
+  push:
+    tags: ["v*"]
+  # 供某一个 registry 失败后，从同一个 tag 上重跑
+  workflow_dispatch:
+
+# 不设 cancel-in-progress：取消一次进行中的发布，可能正停在
+# 「npmjs 发了、GitHub Packages 没发」这个最难收拾的状态上
+concurrency:
+  group: publish-${{ github.ref }}
+
+permissions:
+  contents: write # 建 Release
+  id-token: write # npmjs provenance 的 OIDC 凭据
+  packages: write # GitHub Packages
+
+env:
+  # 仓库内 .npmrc 固定为 npmmirror（国内网络所需），而 runner 在境外。
+  # 两个 publish 步骤另各自显式带 --registry，不依赖这一条。
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.11"
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+      # 发布前跑满门禁：构建、分层、首次启动、类型检查、lint、604 个用例。
+      # 发出去的包改不回来，这是最后一道拦得住的地方。
+      - name: 全量校验
+        run: pnpm run verify
+
+      # tag 与 manifest 的版本号对不上时，发出去的是 manifest 里那个数字，而 Release
+      # 和 tag 指着另一个 —— 之后谁都对不上账。宁可在这里失败。
+      - name: 校验 tag 与四个包的版本号一致
+        if: github.ref_type == 'tag'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          for p in types core jsx cli; do
+            got=$(node -p "require('./packages/$p/package.json').version")
+            if [ "$got" != "$tag" ]; then
+              echo "::error::tag 为 $tag，但 packages/$p 的版本是 $got"
+              exit 1
+            fi
+          done
+          echo "四个包均为 $tag"
+
+      # 凭据按 registry 主机名分别写入，不走 setup-node 的 registry-url：
+      # 这里要同时对两个 registry 认证，一个 registry-url 表达不了。
+      # 两个 token 都不要回显，~/.npmrc 也不要 cat。
+      - name: 写入两个 registry 的凭据
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> ~/.npmrc
+          echo "//npm.pkg.github.com/:_authToken=${GH_PACKAGES_TOKEN}" >> ~/.npmrc
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GH_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # --provenance 依赖上面的 id-token 权限：npmjs 页面因此出现
+      # 「Built and signed on GitHub Actions」，并链到本次运行与具体 commit。
+      # 从本机发布拿不到这个标记，这是把发布搬到 CI 的附带收益。
+      #
+      # --no-git-checks 是必需的：tag 上是 detached HEAD，pnpm 默认的分支检查会直接拒。
+      - name: 发布到 npmjs
+        run: >
+          pnpm -r --filter "./packages/*" publish
+          --access public --provenance --no-git-checks
+          --registry=https://registry.npmjs.org/
+
+      - name: 发布到 GitHub Packages
+        run: >
+          pnpm -r --filter "./packages/*" publish
+          --access public --no-git-checks
+          --registry=https://npm.pkg.github.com/
+
+      # 放在两次 publish 之后：Release 是给人看的公告，它不该早于包真的可装
+      - name: 建 Release
+        if: github.ref_type == 'tag'
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
