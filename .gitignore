@@ -3,11 +3,17 @@ dist/
 *.tsbuildinfo
 
 # 运行期数据目录（由 yzng 生成）
+# 主目录默认为当前目录，故在仓库根 `pnpm start` 会把这一套建在这里
 data/
 logs/
 temp/
+cache/
+plugins/
 config/*.yaml
 !config/*.example.yaml
+
+# 发布时 pnpm pack 的产物（见 .github/workflows/publish.yml）
+.tarballs/
 
 # 编辑器 / 系统
 .DS_Store
