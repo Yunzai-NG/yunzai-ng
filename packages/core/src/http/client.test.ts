@@ -15,7 +15,7 @@ import { readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
-import { AbortError } from "../util/defer.js"
+import { AbortError, sleep } from "../util/defer.js"
 import { HttpError, createHttpClient, sanitizeHeaders, sanitizeUrl, type ManagedHttpClient } from "./client.js"
 
 /** 服务器实例 */
@@ -564,5 +564,79 @@ describe("脱敏", () => {
 
     expect(err.message).not.toContain("ABCDEFGHIJKLMNOP")
     expect(err.url).not.toContain("ABCDEFGHIJKLMNOP")
+  })
+})
+
+describe("close 不被在途请求拖住", () => {
+  // 用 3 秒而非线上那个 15 秒：被测的是「close 不等在途请求」，请求超时具体多长与此无关，
+  // 而用例本身要等它最终落地（见下），15 秒会让这一个用例占满 CI 的耐心
+  it(
+    "在途请求远未超时，close 仍在宽限内返回",
+    async () => {
+      const http = makeClient()
+      // 服务端永不响应。undici 的 close() 是优雅关闭，会一直等在途请求跑完 —— 若不掐断，
+      // 停机就要陪着这个请求等满它的超时（国内网络下拉 GitHub 索引正是此情形）
+      const pending = http.get(`${base}/slow`, { timeout: 3000 })
+      // 等 socket 真的建立起来，否则关的是一个还没有在途请求的空池子，用例就测不到东西
+      await sleep(80)
+
+      const started = Date.now()
+      await http.close()
+      const spent = Date.now() - started
+
+      // 宽限 500ms，留足余量判定；关键是它远小于那个 3 秒
+      expect(spent).toBeLessThan(1500)
+
+      // destroy() 释放的是连接池，它并不代拒那个已经发出的 Promise —— 后者仍按自己的超时落地。
+      // 此处等它结束只为不把一个悬空的 Promise 留给下一个用例，不是在断言时序
+      await expect(pending).rejects.toThrow()
+    },
+    15_000
+  )
+})
+
+describe("默认信号", () => {
+  it("extend 带的信号一触发，经它发出的请求随之中止", async () => {
+    const http = makeClient()
+    const abort = new AbortController()
+    // 插件上下文正是这样拿到自己的 http：extend({ signal: 卸载信号 })
+    const scoped = http.extend({ signal: abort.signal })
+    const pending = scoped.get(`${base}/slow`, { timeout: 5000 })
+    setTimeout(() => abort.abort(), 30)
+
+    await expect(pending).rejects.toBeInstanceOf(AbortError)
+  })
+
+  it("默认信号与单次请求的信号是并集，任一触发即中止", async () => {
+    const http = makeClient()
+    const outer = new AbortController()
+    const scoped = http.extend({ signal: outer.signal })
+    const inner = new AbortController()
+    // 只触发单次请求那一个：合并不能把调用方自己的信号吃掉
+    const pending = scoped.get(`${base}/slow`, { signal: inner.signal, timeout: 5000 })
+    setTimeout(() => inner.abort(), 30)
+
+    await expect(pending).rejects.toBeInstanceOf(AbortError)
+  })
+
+  it("默认信号已经中止时，请求不再发出", async () => {
+    const http = makeClient()
+    const abort = new AbortController()
+    abort.abort()
+    const scoped = http.extend({ signal: abort.signal })
+
+    // 插件已卸载之后才被调用的代码路径：不该再打出一个注定没人接收的请求
+    await expect(scoped.get(`${base}/json`)).rejects.toBeInstanceOf(AbortError)
+  })
+
+  it("根客户端不受派生客户端的信号影响", async () => {
+    const http = makeClient()
+    const abort = new AbortController()
+    const scoped = http.extend({ signal: abort.signal })
+    abort.abort()
+
+    // 一个插件被卸载不能让内核自己的请求跟着废掉 —— 两者共享连接池，但信号必须各自独立
+    await expect(scoped.get(`${base}/json`)).rejects.toBeInstanceOf(AbortError)
+    await expect(http.get(`${base}/json`)).resolves.toMatchObject({ ok: true })
   })
 })

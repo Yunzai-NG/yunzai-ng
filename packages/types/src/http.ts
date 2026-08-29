@@ -82,6 +82,14 @@ export interface HttpDefaults {
   retry?: number | HttpRetryOptions
   /** 默认代理 */
   proxy?: string | false
+  /**
+   * 默认中止信号
+   *
+   * 由此派生出的客户端所发的每个请求都跟随它 —— 插件的 `ctx.http` 即绑在插件的
+   * 卸载信号上，插件卸载时其在途请求随之中止，不必由插件逐个请求传 `signal`。
+   * 单次请求另传 `signal` 时两者取并集：任一触发即中止。
+   */
+  signal?: AbortSignal
 }
 
 /** HTTP 客户端 */

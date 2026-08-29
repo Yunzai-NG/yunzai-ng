@@ -53,6 +53,13 @@ const RETRY_STATUSES: readonly number[] = [408, 429, 500, 502, 503, 504]
 /** 重试等待的上限（毫秒）：`Retry-After` 说等一小时也不真等 */
 const MAX_RETRY_DELAY = 30_000
 
+/**
+ * `close()` 等待在途请求的宽限（毫秒）
+ *
+ * 取一个小值：够正在收尾的响应写完，又不至于让使用者在停机时干等。
+ */
+const CLOSE_GRACE_MS = 500
+
 /** 查询串里需要打码的键（小写比对） */
 const SECRET_QUERY_KEYS: readonly string[] = [
   "authkey",
@@ -206,6 +213,22 @@ export function sanitizeHeaders(headers: Record<string, string>): Record<string,
     safe[key] = SECRET_HEADER_KEYS.includes(key.toLowerCase()) ? maskSecret(value) : value
   }
   return safe
+}
+
+/**
+ * 合并两个中止信号
+ *
+ * 用于把「客户端默认信号」（如插件的卸载信号）与「单次请求的信号」并成一个：
+ * 任一触发即中止。两者都缺省时返回 undefined，此时不给 undici 传 signal。
+ * @param a 一个信号
+ * @param b 另一个信号
+ * @returns 合并后的信号；都没有时 undefined
+ */
+function mergeSignals(a: AbortSignal | undefined, b: AbortSignal | undefined): AbortSignal | undefined {
+  const list = [a, b].filter((s): s is AbortSignal => s !== undefined)
+  if (list.length === 0) return undefined
+  if (list.length === 1) return list[0]
+  return AbortSignal.any(list)
 }
 
 /**
@@ -530,7 +553,7 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
         proxy: proxyChoice,
         redirections: follow ? MAX_REDIRECTIONS : 0,
         throwOnError: options.throwOnError ?? true,
-        signal: options.signal
+        signal: mergeSignals(defaults.signal, options.signal)
       }
     }
 
@@ -758,9 +781,23 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
       close: async (): Promise<void> => {
         closed = true
         dispatchers.clear()
-        const closing = [...agents.values()].map(agent => agent.close().catch(() => undefined))
+        const pool = [...agents.values()]
         agents.clear()
-        await Promise.all(closing)
+
+        // 先给一小段宽限让正在收尾的请求写完，到点未完的一律掐断。
+        // undici 的 close() 是优雅关闭 —— 它会一直等在途请求跑完，于是一个 15 秒超时的
+        // 请求能把停机拖满 15 秒。停机走到这一步时插件已卸载、服务器已关闭，还在途的
+        // 必然是没人接收结果的孤儿请求，等它们没有意义。
+        const graceful = Promise.all(pool.map(agent => agent.close().catch(() => undefined)))
+        const timer = new Promise<"timeout">(res => {
+          const t = setTimeout(() => res("timeout"), CLOSE_GRACE_MS)
+          // unref：这个定时器自己不该成为进程退不出的原因
+          t.unref()
+        })
+        if ((await Promise.race([graceful.then(() => "done" as const), timer])) === "timeout") {
+          logger?.debug(`连接池未在 ${CLOSE_GRACE_MS}ms 内关闭，中止在途请求`)
+          await Promise.all(pool.map(agent => agent.destroy().catch(() => undefined)))
+        }
       }
     }
     return client

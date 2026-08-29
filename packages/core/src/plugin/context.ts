@@ -346,7 +346,12 @@ class Context implements PluginContext<unknown> {
     this.kv = deps.kv
     this.config = deps.config
     this.app = deps.app
-    this.http = deps.http
+    // 把卸载信号并进 HTTP 客户端的默认值：插件卸载后它发出的请求随即中止，
+    // 不必依赖每个插件作者都记得手动传 `ctx.signal`。忘记传就漏一个，
+    // 而漏掉的表现是「插件已卸载，它的请求还在跑」——
+    // 停机时那些孤儿请求还会把关闭连接池的一步拖满整个超时。
+    // extend() 与根客户端共享连接池，只是多一层默认值，没有额外开销。
+    this.http = deps.http.extend({ signal: deps.signal })
     this.signal = deps.signal
   }
 
