@@ -19,7 +19,7 @@ import type {
 } from "@yunzai-ng/types"
 import { createEventBus } from "./events.js"
 import { createServiceRegistry } from "./services.js"
-import { createPluginContext } from "./context.js"
+import { createPluginContext, splitRenderArgs } from "./context.js"
 import { DisposalRegistry } from "../util/dispose.js"
 import { fakeAppView, fakeHttp, fakeLogger, recordingHooks } from "../testing/fake.js"
 
@@ -317,6 +317,34 @@ describe("ctx.render", () => {
     }
 
     await expect(ctx.render("t")).rejects.toThrow(/没有产出图片/)
+  })
+
+  it("页面声明的 tailwind 传到渲染请求上", async () => {
+    const { ctx, recorded } = setup()
+    await ctx.render({ name: "card", html: "<html></html>", tailwind: true })
+    expect(recorded.renders[0]).toMatchObject({ template: "card", html: "<html></html>", tailwind: true })
+  })
+})
+
+describe("splitRenderArgs", () => {
+  it("字符串通路不带 html 与 tailwind", () => {
+    expect(splitRenderArgs("t", { uid: 1 })).toEqual({ template: "t", data: { uid: 1 }, opts: {} })
+  })
+
+  it("页面未声明 tailwind 时不写入该键", () => {
+    // 显式的 undefined 会盖掉渲染器一侧的缺省判定，故必须是"键不存在"而非"值为 undefined"
+    const call = splitRenderArgs({ name: "p", html: "<i>" })
+    expect("tailwind" in call.opts).toBe(false)
+  })
+
+  it("页面声明 false 时同样传下去", () => {
+    // false 是一次明确的"不要编译"，不可与未声明混为一谈
+    expect(splitRenderArgs({ name: "p", html: "<i>", tailwind: false }).opts).toEqual({ tailwind: false })
+  })
+
+  it("调用点覆盖页面声明", () => {
+    const call = splitRenderArgs({ name: "p", html: "<i>", tailwind: true }, { tailwind: false })
+    expect(call.opts).toEqual({ tailwind: false })
   })
 })
 

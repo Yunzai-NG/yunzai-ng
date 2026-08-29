@@ -276,6 +276,9 @@ export interface RenderCall {
  * `render()` 有两种形态：`render(page, opts)` 与 `render(template, data, opts)`。
  * 以第一参是否为字符串判别 —— `RenderablePage` 是对象，二者不可能混淆。
  * 判别只做这一处，两个调用点（`ctx.render` 与 `e.render`）共用同一份语义。
+ *
+ * 页面上的 `tailwind` 声明在此并入选项，且**调用点显式给出者优先**：声明是模板的常态，
+ * 而调用点是对某一次渲染的临时覆盖，后者压过前者才合乎「越局部越优先」。
  * @param first 页面或模板相对路径
  * @param second 模板数据（字符串通路）或渲染选项（TSX 通路）
  * @param third 渲染选项（字符串通路）
@@ -289,7 +292,15 @@ export function splitRenderArgs(
   if (typeof first === "string") {
     return { template: first, data: (second as Record<string, unknown> | undefined) ?? {}, opts: third ?? {} }
   }
-  return { template: first.name, data: {}, html: first.html, opts: (second as RenderOptions | undefined) ?? {} }
+  const given = (second as RenderOptions | undefined) ?? {}
+  return {
+    template: first.name,
+    data: {},
+    html: first.html,
+    // 展开顺序即优先级：页面声明在前，调用点在后覆盖之。
+    // 页面未声明时不写入该键 —— 显式的 undefined 会盖掉渲染器一侧的缺省判定
+    opts: first.tailwind === undefined ? given : { tailwind: first.tailwind, ...given }
+  }
 }
 
 /**

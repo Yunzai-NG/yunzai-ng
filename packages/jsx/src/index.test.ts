@@ -167,4 +167,18 @@ describe("defineTemplate", () => {
     const Page = defineTemplate("demo", (props: { uid: string }) => jsx("html", { children: props.uid }))
     expect(Page({ uid: "1" })).toEqual({ name: "demo", html: "<!DOCTYPE html><html>1</html>" })
   })
+
+  it("未声明 tailwind 时不带该键", () => {
+    // 与「声明了 false」必须在结构上可区分：下游以 `!== undefined` 判定是否为一次明确声明，
+    // 带上 `tailwind: undefined` 会让"未声明"被当作"声明不编译"，从而盖掉渲染器的配置
+    const Page = defineTemplate("demo", () => jsx("html"))
+    expect("tailwind" in Page({})).toBe(false)
+  })
+
+  it("声明 tailwind 后直通页面对象", () => {
+    const On = defineTemplate("on", () => jsx("html"), { tailwind: true })
+    const Off = defineTemplate("off", () => jsx("html"), { tailwind: false })
+    expect(On({}).tailwind).toBe(true)
+    expect(Off({}).tailwind).toBe(false)
+  })
 })

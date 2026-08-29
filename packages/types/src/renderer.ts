@@ -52,6 +52,21 @@ export interface RenderRequest {
    */
   html?: string
 
+  /**
+   * 本次渲染是否需要编译 Tailwind 工具类
+   *
+   * **由发起方声明，而非由渲染器揣度。** 渲染器无从判断一段 HTML 里的 `class` 是工具类
+   * 还是模板自定义的类名：`flex` 既可能出自 Tailwind，也可能是模板自己写的一条 CSS 规则。
+   * 猜错的代价是不对称的 —— 该编译而未编译只是少了样式，不该编译而编译了则会引入
+   * preflight，把现存模板的边距与字号一并重置。
+   *
+   * 缺省（undefined）时由渲染器自身的配置决定，而那一项缺省关闭 —— **不声明即不编译**。
+   * 于是不用工具类的插件不必装 `tailwindcss`，也不会收到与它无关的编译告警。
+   * 声明 `false` 与不声明的效果相同，只是把「不用工具类」写成了明文。
+   * 仅在 `html` 通路生效：字符串模板一律不编译工具类。
+   */
+  tailwind?: boolean
+
   /** 截图元素选择器，缺省 `#container` 回落 `body` */
   selector?: string
   /** 输出格式，缺省 jpeg */
@@ -135,6 +150,14 @@ export interface RenderablePage {
   readonly name: string
   /** 完整 HTML 文本 */
   readonly html: string
+  /**
+   * 该页面是否使用 Tailwind 工具类
+   *
+   * 由 `defineTemplate()` 的第三参声明，直通 {@link RenderRequest.tailwind}。
+   * 写在页面上而非每个调用点上：用不用工具类是模板自身的属性，
+   * 让每处 `render()` 各自重复一遍，迟早会有一处与模板不符。
+   */
+  readonly tailwind?: boolean
 }
 
 /**
