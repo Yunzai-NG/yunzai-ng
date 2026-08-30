@@ -554,20 +554,32 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
    * @param name 插件名
    * @param load 安装后是否立即加载
    * @param replace 目标已存在时是否覆盖
+   * @param dependencies 是否顺带装依赖并跑索引声明的装后步骤
    * @returns 安装结果，附本次加载成功的插件名
    * @throws 安装失败时以 400 结束请求
    */
   const installFromMarket = async (
     name: string,
     load: boolean,
-    replace: boolean
+    replace: boolean,
+    dependencies: boolean
   ): Promise<Record<string, unknown>> => {
     const instance = market()
     let unloaded = false
     try {
       if (replace && deps.plugins.get(name) !== undefined) unloaded = await deps.plugins.unload(name)
-      const result = replace ? await instance.update(name) : await instance.install(name)
-      const loaded = load ? [...(await deps.plugins.loadAll()).loaded] : []
+      const result = replace
+        ? await instance.update(name, { dependencies })
+        : await instance.install(name, { dependencies })
+      /*
+       * 缺依赖或装后步骤失败时不加载
+       *
+       * 两者都注定让加载失败，而报出来的错离原因很远：缺依赖报的是「找不到某个包」，
+       * 缺产物（`build` 挂了）报的是「找不到 dist/index.js」。两条错误里后一条更
+       * 显眼而更没用 —— 使用者会去查那个文件为什么不在，而真正该看的是上一条。
+       */
+      const skip = result.setupError !== undefined || result.dependencyError !== undefined || result.needsDependencies
+      const loaded = load && !skip ? [...(await deps.plugins.loadAll()).loaded] : []
       return { ...result, unloaded, loaded }
     } catch (err) {
       throw fail(400, err instanceof Error ? err.message : String(err))
@@ -580,18 +592,66 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
 
   add("POST", "market/refresh", () => market().list(true))
 
+  /*
+   * 装依赖缺省为真
+   *
+   * 与面板商店那侧一致。缺省关掉会让「装完却跑不起来」成为常态，而那条提示（「请到
+   * 目录内自行执行 pnpm install」）对着的是一个多数人不会去开的终端。请求方仍可显式
+   * 传 false —— 离线部署、或依赖已随镜像预置好时用得上。
+   */
   add("POST", "market/install", async req => {
     requireWritable()
     const body = objectOf(req.body)
     const name = requireString(body, "name")
-    return installFromMarket(name, optionalBoolean(body, "load") ?? true, false)
+    return installFromMarket(
+      name,
+      optionalBoolean(body, "load") ?? true,
+      false,
+      optionalBoolean(body, "dependencies") ?? true
+    )
   })
 
   add("POST", "market/:name/update", async req => {
     requireWritable()
     const name = req.params.name ?? ""
     const body = req.body === undefined ? {} : objectOf(req.body)
-    return installFromMarket(name, optionalBoolean(body, "load") ?? true, true)
+    return installFromMarket(
+      name,
+      optionalBoolean(body, "load") ?? true,
+      true,
+      optionalBoolean(body, "dependencies") ?? true
+    )
+  })
+
+  /*
+   * 单独重跑装依赖与装后步骤，不重新取源
+   *
+   * 三种情形要用到：手工放进插件目录的插件（没有安装动作可挂）、装的时候这一步失败过、
+   * 以及使用者自己 `git pull` 过而产物已旧。与安装那条路共用 `PluginMarket.setup()`，
+   * 故「装什么、跑什么」只有一处定义。
+   */
+  add("POST", "market/:name/setup", async req => {
+    requireWritable()
+    const name = req.params.name ?? ""
+    const body = req.body === undefined ? {} : objectOf(req.body)
+    const load = optionalBoolean(body, "load") ?? true
+    /*
+     * 先卸载，再跑 —— 次序有意义
+     *
+     * `build` 会覆盖 `dist/`，而旧模块此刻还在内存里、它注册的命令仍在响应。跑完再卸载
+     * 意味着中间有一段时间里「磁盘上是新代码、正在响应的是旧代码」，那种不一致比一次
+     * 失败的重载难查得多。
+     */
+    const unloaded = deps.plugins.get(name) === undefined ? false : await deps.plugins.unload(name)
+    try {
+      const result = await market().setup(name)
+      // 判据与 installFromMarket 一致：缺依赖或缺产物时加载注定失败，见那里的注释
+      const skip = result.setupError !== undefined || result.needsDependencies
+      const loaded = load && !skip ? [...(await deps.plugins.loadAll()).loaded] : []
+      return { ...result, unloaded, loaded }
+    } catch (err) {
+      throw fail(400, err instanceof Error ? err.message : String(err))
+    }
   })
 
   add("DELETE", "market/:name", async req => {

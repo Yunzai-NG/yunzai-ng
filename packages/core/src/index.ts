@@ -29,6 +29,7 @@ export * from "./plugin/events.js"
 export * from "./plugin/services.js"
 export * from "./plugin/discover.js"
 export * from "./plugin/market.js"
+export * from "./plugin/pm.js"
 export * from "./plugin/tar.js"
 
 /* ────────────────────────────── 消息 ────────────────────────────── */

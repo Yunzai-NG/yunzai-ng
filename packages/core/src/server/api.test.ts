@@ -123,6 +123,8 @@ interface Spies {
     install: ReturnType<typeof vi.fn>
     /** 更新 */
     update: ReturnType<typeof vi.fn>
+    /** 单独重跑装依赖与装后步骤 */
+    setup: ReturnType<typeof vi.fn>
     /** 卸载 */
     remove: ReturnType<typeof vi.fn>
   }
@@ -261,6 +263,15 @@ describe("面板 API", () => {
           via: "tarball",
           version: "2.0.0",
           needsDependencies: false
+        })),
+        setup: vi.fn(async (name: string) => ({
+          name,
+          dir: join(dir, "plugins", name),
+          version: "1.0.0",
+          needsDependencies: false,
+          installedDeps: true,
+          packageManager: "pnpm",
+          ranScripts: ["build"]
         })),
         remove: vi.fn(async (name: string) => name === "demo")
       },
@@ -721,10 +732,69 @@ describe("面板 API", () => {
     it("安装后默认立即加载，并把本次加载的插件名带回来", async () => {
       const res = await call("POST", "market/install", { name: "fresh" })
       expect(res.statusCode).toBe(200)
-      expect(spies.market.install).toHaveBeenCalledWith("fresh")
+      expect(spies.market.install).toHaveBeenCalledWith("fresh", { dependencies: true })
       expect(spies.plugins.loadAll).toHaveBeenCalled()
       expect(res.json().loaded).toEqual(["fresh"])
       expect(res.json().version).toBe("1.0.0")
+    })
+
+    /*
+     * 缺省装依赖，这一条只能由用例固定
+     *
+     * 缺省若翻回 false，表现是「装完却跑不起来」重新成为常态，而那条「请自行执行
+     * pnpm install」的提示对着的是一个多数人不会去开的终端 —— 从接口的返回值上
+     * 看不出缺省变过，故此处钉住。
+     */
+    it("装依赖缺省为真，显式传 false 才不装", async () => {
+      await call("POST", "market/install", { name: "fresh", dependencies: false })
+      expect(spies.market.install).toHaveBeenLastCalledWith("fresh", { dependencies: false })
+
+      await call("POST", "market/demo/update", { dependencies: false })
+      expect(spies.market.update).toHaveBeenLastCalledWith("demo", { dependencies: false })
+    })
+
+    /*
+     * 装后步骤失败时不许加载
+     *
+     * `build` 挂了就没有 `dist/`，此时加载只会再报一条「找不到模块」—— 两条错误里
+     * 后一条更显眼而更没用，使用者会去查模块解析，而真正的原因在上一条里。
+     */
+    it("装后步骤失败时不加载，原因原样带回", async () => {
+      spies.market.install.mockResolvedValueOnce({
+        name: "fresh",
+        dir: join(dir, "plugins", "fresh"),
+        via: "git",
+        version: "1.0.0",
+        needsDependencies: false,
+        installedDeps: true,
+        packageManager: "pnpm",
+        ranScripts: [],
+        setupError: "build：tsc 退出码 2"
+      })
+      const res = await call("POST", "market/install", { name: "fresh" })
+      expect(res.statusCode).toBe(200)
+      expect(spies.plugins.loadAll).not.toHaveBeenCalled()
+      expect(res.json().loaded).toEqual([])
+      expect(String(res.json().setupError)).toContain("tsc 退出码 2")
+    })
+
+    it("单独重跑装依赖与编译：先卸载再跑，跑完才加载", async () => {
+      const res = await call("POST", "market/demo/setup", {})
+      expect(res.statusCode).toBe(200)
+      expect(spies.market.setup).toHaveBeenCalledWith("demo")
+      // 顺序即正确性：build 会覆盖 dist，旧模块还在内存里就会响应刚被覆盖掉的代码
+      expect(spies.plugins.unload.mock.invocationCallOrder[0]).toBeLessThan(
+        spies.market.setup.mock.invocationCallOrder[0] ?? 0
+      )
+      expect(res.json().ranScripts).toEqual(["build"])
+      expect(res.json().loaded).toEqual(["fresh"])
+    })
+
+    it("重跑装依赖失败时回 400", async () => {
+      spies.market.setup.mockRejectedValueOnce(new Error("插件目录 无名 不存在"))
+      const res = await call("POST", "market/无名/setup", {})
+      expect(res.statusCode).toBe(400)
+      expect(String(res.json().error)).toContain("不存在")
     })
 
     it("load 为 false 时只落盘不加载", async () => {
@@ -747,7 +817,7 @@ describe("面板 API", () => {
       const res = await call("POST", "market/demo/update", {})
       expect(res.statusCode).toBe(200)
       expect(spies.plugins.unload).toHaveBeenCalledWith("demo")
-      expect(spies.market.update).toHaveBeenCalledWith("demo")
+      expect(spies.market.update).toHaveBeenCalledWith("demo", { dependencies: true })
       expect(res.json().unloaded).toBe(true)
       expect(res.json().version).toBe("2.0.0")
     })
