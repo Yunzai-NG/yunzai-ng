@@ -13,14 +13,20 @@
  *          Windows 上使用 junction 而非 symlink：目录 symlink 需要开发者模式或
  *          管理员权限，junction 无此要求，而对 Node 的解析行为两者等价。
  *
- *          已存在的链接一律不作改动，仅替换**指向已消失目标**的那一类（框架被移动或
- *          重装后会出现该情形）。绝不覆盖真实目录：开发时主目录可能即为仓库本身，
- *          其中的 `node_modules/@yunzai-ng` 由 pnpm 建立，改动它将破坏开发环境。
+ *          已存在的链接按其**指向**决定去留：指向当前这一份框架的保留，其余一律重建 ——
+ *          既包括目标已消失的（框架被移动或重装），也包括仍指着升级前旧版本的。
+ *          仅判断"目标是否还在"是不够的：pnpm 的虚拟存储 `node_modules/.pnpm/` 中留着
+ *          历史版本，框架升级后旧目录依然在盘上，于是一条指向 `types@0.1.1` 的链接看上去
+ *          完好无损，而内核已换成 0.3.0。其后果是插件**编译于旧类型、运行于新内核**：
+ *          症状为 `RenderRequest` 这类接口凭空缺字段，且报错只指向 `.pnpm/` 里的路径，
+ *          与"链接过期"毫无字面联系。
+ *
+ *          绝不覆盖真实目录：开发时主目录可能即为仓库本身，其中的 `node_modules/@yunzai-ng`
+ *          由 pnpm 建立，改动它将破坏开发环境。
  */
-import { lstat, mkdir, readlink, rm, symlink } from "node:fs/promises"
-import { dirname, join, resolve } from "node:path"
+import { lstat, mkdir, realpath, rmdir, symlink, unlink } from "node:fs/promises"
+import { dirname, join } from "node:path"
 import { createRequire } from "node:module"
-import { existsSync } from "node:fs"
 
 /**
  * 需要暴露给插件的框架包
@@ -60,18 +66,38 @@ function packageDir(name: string): string | undefined {
 }
 
 /**
- * 判断一个已存在的路径是否需要重建
- * @param path 链接路径
- * @returns 需要重建时 true
+ * 判断一条已存在的链接是否指向 `expected`
+ *
+ * 比对真实路径而非 `readlink` 的原文：junction 的原文可能带 `\\?\` 前缀，而
+ * `createRequire().resolve()` 给出的已是解析过符号链接的路径，两者字面并不相等。
+ * 目标已消失时 `realpath` 抛错，按"不指向"处理，链接随即重建。
+ * @param link 链接路径
+ * @param expected 期望指向的目录
+ * @returns 指向一致时 true
  */
-async function isBrokenLink(path: string): Promise<boolean> {
-  const stat = await lstat(path)
-  if (!stat.isSymbolicLink()) return false
+async function pointsTo(link: string, expected: string): Promise<boolean> {
   try {
-    const target = await readlink(path)
-    return !existsSync(resolve(dirname(path), target))
+    const [actual, want] = await Promise.all([realpath(link), realpath(expected)])
+    // Windows 与 macOS 的文件系统不区分大小写，仅 Linux/Android 区分
+    return process.platform === "linux" ? actual === want : actual.toLowerCase() === want.toLowerCase()
   } catch {
-    return true
+    return false
+  }
+}
+
+/**
+ * 摘除一条链接本体
+ *
+ * 不用 `rm({ recursive: true })`：一旦它把 junction 当作目录递归进去，删掉的将是链接
+ * 所指的那一份框架包本身。`unlink` 只作用于链接本体；Windows 上对目录 junction 的
+ * unlink 会以 EPERM 失败，此时改用 `rmdir` —— 它同样只摘除重解析点，不动目标。
+ * @param link 链接路径
+ */
+async function unlinkLink(link: string): Promise<void> {
+  try {
+    await unlink(link)
+  } catch {
+    await rmdir(link)
   }
 }
 
@@ -99,12 +125,15 @@ export async function linkFramework(home: string): Promise<LinkReport> {
     }
 
     try {
-      if (existsSync(link)) {
-        if (!(await isBrokenLink(link))) {
+      // lstat 而非 existsSync：后者跟随链接，对一条目标已消失的链接给出 false，
+      // 于是既不会摘除它，随后的 symlink 又因它仍在盘上而以 EEXIST 失败
+      const existing = await lstat(link).catch(() => undefined)
+      if (existing !== undefined) {
+        if (!existing.isSymbolicLink() || (await pointsTo(link, target))) {
           kept.push(name)
           continue
         }
-        await rm(link, { recursive: true, force: true })
+        await unlinkLink(link)
       }
       await symlink(target, link, "junction")
       linked.push(name)
