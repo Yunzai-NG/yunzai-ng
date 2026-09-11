@@ -976,11 +976,17 @@ function tags(): Schema<string[]> {
 }
 
 /**
- * id 列表（QQ 号 / 群号，允许写单个值）
+ * 平台 id 列表（用户 id / 群 id，允许写单个值）
+ *
+ * **不限于纯数字**：QQ 号与群号是纯数字，但 QQ 官方机器人下发的是 32 位十六进制
+ * openid（形如 `FF23DED2F67B06F46C7A23AE9BB7C5AE`），频道场景的 id 还带适配器加的
+ * `qg_` 前缀（形如 `qg_2492083538938174755`）。曾收窄为纯数字，后果是这类账号连主人
+ * 都加不上 —— 而 id 的具体形态属于适配器的知识，内核不逐个平台枚举，只把「不像任何
+ * 平台 id 的输入」挡在外面（含空格、中文、@ 之类多半是把昵称当 id 填了）。
  * @returns id 数组 schema
  */
 function ids(): Schema<string[]> {
-  return array(string().pattern(/^\d{1,20}$/, "应为纯数字 id"))
+  return array(string().pattern(/^[A-Za-z0-9_-]{1,64}$/, "应为字母、数字、下划线或连字符组成的 id，最长 64 位"))
     .widget("tags")
     .single()
 }

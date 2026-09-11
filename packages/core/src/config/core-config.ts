@@ -28,7 +28,10 @@ export const coreConfigSchema = s.object({
         .ids()
         .default([])
         .title("主人账号")
-        .desc("拥有全部权限的用户 id。留空则首次通过 WebUI 绑定。"),
+        .desc(
+          "拥有全部权限的用户 id。留空则首次通过 WebUI 绑定。" +
+            "填适配器给出的原始 id：QQ 号为纯数字，QQ 官方机器人为 32 位 openid，频道用户带 qg_ 前缀。"
+        ),
       prefix: s
         .tags()
         .default(["#", "*", "%"])

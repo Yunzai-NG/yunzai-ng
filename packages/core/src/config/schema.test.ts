@@ -48,6 +48,21 @@ describe("schema 构造器", () => {
     expect(conf.parse({ masterQQ: ["10086", "10010"] })).toEqual({ masterQQ: ["10086", "10010"] })
   })
 
+  it("id 列表收非数字形态的平台 id：openid 与带 qg_ 前缀的频道 id", () => {
+    const conf = s.object({ masterQQ: s.ids().default([]) })
+    // QQ 官方机器人的两种 id：32 位十六进制 openid、频道用户（qg_ 前缀防丢精度）
+    const masters = ["FF23DED2F67B06F46C7A23AE9BB7C5AE", "qg_2492083538938174755", "10086"]
+    expect(conf.parse({ masterQQ: masters })).toEqual({ masterQQ: masters })
+  })
+
+  it("id 列表仍拦下明显不是 id 的输入", () => {
+    const conf = s.object({ masterQQ: s.ids().default([]) })
+    // 昵称当 id 填是最常见的误用，含空格/中文/@ 一律挡在外面
+    for (const bad of ["张三", "10086 10010", "@某人", ""]) {
+      expect(conf.safeParse({ masterQQ: [bad] }).ok, bad).toBe(false)
+    }
+  })
+
   it("未识别的键保留并给出 warn，而不是静默丢弃", () => {
     const conf = s.object({ port: s.port().default(3000) })
     const result = conf.safeParse({ port: 3000, prot: 3001 })
