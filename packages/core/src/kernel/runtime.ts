@@ -56,6 +56,22 @@ const KV_ACCOUNTS = "accounts"
  */
 const FALLBACK_SEND_TIMEOUT = 30_000
 
+/**
+ * 重连间隔读不出来时的兜底毫秒
+ *
+ * 与 `adapter.reconnectInterval` 的 schema 默认值 `"2s"` 对应。同 `FALLBACK_SEND_TIMEOUT`：
+ * schema 加载时已校验格式，这个兜底走不到，留着是因为 0 的后果远比偏差几秒严重 ——
+ * 0 意味着「不等待、立刻重试」，那是一个把日志刷满且对端还没缓过来的死循环。
+ */
+const FALLBACK_RECONNECT_INTERVAL = 2_000
+
+/**
+ * 重连间隔上限读不出来时的兜底毫秒
+ *
+ * 与 `adapter.reconnectMaxInterval` 的 schema 默认值 `"1m"` 对应。
+ */
+const FALLBACK_RECONNECT_MAX_INTERVAL = 60_000
+
 /** 装配运行期子系统所需的依赖 */
 export interface RuntimeDeps {
   /** 根日志器；各子系统自行派生 child */
@@ -172,6 +188,9 @@ function sendPolicyOf(config: CoreConfigHandle): SendPolicyView {
  * 与 `sendPolicyOf` 同一个道理，用 getter 而非快照：面板上把上限从 10 改成 0（一直重连），
  * 下一次失败就按新值判 —— 缓存成快照的话得重启才生效，而使用者调这一项往往正是因为
  * 眼前某个账号已经放弃重连了。
+ *
+ * 这四项是**全局缺省**；单个账号在 `AccountRecord.retry` 里填过的项优先，见
+ * `AccountManager.#policyOf`。
  * @param config 内核配置句柄
  * @returns 重连策略视图
  */
@@ -179,6 +198,15 @@ function retryPolicyOf(config: CoreConfigHandle): RetryPolicyView {
   return {
     get maxRetries(): number {
       return config.get().adapter.reconnectLimit
+    },
+    get interval(): number {
+      return parseDuration(config.get().adapter.reconnectInterval, FALLBACK_RECONNECT_INTERVAL)
+    },
+    get maxInterval(): number {
+      return parseDuration(config.get().adapter.reconnectMaxInterval, FALLBACK_RECONNECT_MAX_INTERVAL)
+    },
+    get factor(): number {
+      return config.get().adapter.reconnectFactor
     }
   }
 }

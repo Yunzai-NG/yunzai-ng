@@ -639,7 +639,48 @@ describe("面板 API", () => {
       const res = await call("POST", "accounts", { adapterId: "napcat", config: { mode: "ws" }, label: "主号" })
       expect(res.statusCode).toBe(201)
       expect(res.json().id).toBe("a2")
-      expect(spies.accounts.create).toHaveBeenCalledWith("napcat", { mode: "ws" }, "主号", true)
+      // 第五个参数是每账号的重连覆盖：没填就是 undefined，即四项全跟随全局配置
+      expect(spies.accounts.create).toHaveBeenCalledWith("napcat", { mode: "ws" }, "主号", true, undefined)
+    })
+
+    /*
+     * 重连覆盖那一组的用例，钉住三件事：逐字段可缺、边界校验、以及 null 表示清空
+     *
+     * 「逐字段可缺」是这块唯一容易写错的语义 —— 补齐缺省值会把「跟随全局」偷换成
+     * 「此刻的全局值」，而后者此后不跟着全局改动走，症状是「我改了全局间隔，这个号却不听」。
+     */
+    it("建号时可只给重连覆盖里的一项，其余留空跟随全局", async () => {
+      const res = await call("POST", "accounts", {
+        adapterId: "napcat",
+        config: { mode: "ws" },
+        retry: { limit: 5 }
+      })
+      expect(res.statusCode).toBe(201)
+      expect(spies.accounts.create).toHaveBeenCalledWith("napcat", { mode: "ws" }, undefined, true, { limit: 5 })
+    })
+
+    it("重连覆盖收时长字符串与毫秒数字两种写法", async () => {
+      await call("PATCH", "accounts/a1", { retry: { interval: "5s", maxInterval: 120_000, factor: 1.5 } })
+      expect(spies.accounts.update).toHaveBeenLastCalledWith("a1", {
+        retry: { interval: "5s", maxInterval: 120_000, factor: 1.5 }
+      })
+    })
+
+    it("重连覆盖越界、单位写错、负数一律 400", async () => {
+      // 上限与全局 schema 同区间：-1 会让「0 为不限」这个判据静默失效
+      expect((await call("PATCH", "accounts/a1", { retry: { limit: -1 } })).statusCode).toBe(400)
+      expect((await call("PATCH", "accounts/a1", { retry: { factor: 0.5 } })).statusCode).toBe(400)
+      // "5秒" 解析不出来，收下它等于悄悄按兜底值跑
+      const res = await call("PATCH", "accounts/a1", { retry: { interval: "5秒" } })
+      expect(res.statusCode).toBe(400)
+      expect(String(res.json().error)).toContain("retry.interval")
+      expect((await call("PATCH", "accounts/a1", { retry: { interval: "-2s" } })).statusCode).toBe(400)
+      expect(spies.accounts.update).not.toHaveBeenCalled()
+    })
+
+    it("retry 为 null 表示清掉覆盖、回去跟随全局", async () => {
+      await call("PATCH", "accounts/a1", { retry: null })
+      expect(spies.accounts.update).toHaveBeenLastCalledWith("a1", { retry: null })
     })
 
     it("缺 adapterId 回 400，配置校验失败也回 400", async () => {

@@ -21,6 +21,7 @@
  */
 import type {
   AccountRecord,
+  AccountRetryOverride,
   AccountState,
   AccountStatus,
   AccountsView,
@@ -33,6 +34,7 @@ import type {
 import type { CoreEventBus } from "../plugin/events.js"
 import { backoffDelay } from "../util/defer.js"
 import { DisposalRegistry } from "../util/dispose.js"
+import { parseDuration } from "../util/duration.js"
 import { uuid } from "../util/id.js"
 import type { AdapterEntry, AdapterRegistry } from "./registry.js"
 import type { BotFacade, BotRegistry, SendPolicyView } from "./bots.js"
@@ -42,8 +44,26 @@ import type { AdapterHostFactory, AdapterHostHandle } from "./host.js"
 /** KV 里存账号记录的键前缀 */
 const RECORD_PREFIX = "account:"
 
-/** 重连退避参数：最长每 1 分钟一次，既可较快恢复又不至于对对端造成过载 */
-const RECONNECT_BACKOFF = { baseDelay: 2_000, maxDelay: 60_000, factor: 2, jitter: 0.25 } as const
+/**
+ * 退避的抖动比例
+ *
+ * 不做成配置项：它存在的理由是**多个账号别同时敲对端的门**（同一时刻掉线的几个号若步调
+ * 一致，重连会挤在同一秒），那是一条内部实现约定，调它没有可说清的收益。其余三个数
+ * （起始、上限、倍率）才是使用者真正会想改的。
+ */
+const RECONNECT_JITTER = 0.25
+
+/**
+ * 重连策略的兜底值，仅在调用方不给 `retryPolicy` 时生效
+ *
+ * 与配置 schema 里 `adapter.*` 的四个默认值刻意一致，但**不是**同一处定义 —— 这里是
+ * 「没人给策略时用什么」，那里是「使用者没改过配置时是什么」。两者数值相同只是因为
+ * 都该等于旧行为（无限重连、2 秒起、60 秒顶、2 倍）。
+ *
+ * 取「一直重连」而非某个具体次数：改默认行为得是使用者自己在配置里选的，
+ * 不该由一个可选参数悄悄决定。
+ */
+const RETRY_FALLBACK: RetryPolicyView = { maxRetries: 0, interval: 2_000, maxInterval: 60_000, factor: 2 }
 
 /** 每多少次失败落一条 warn（其余落 debug），避免日志刷屏 */
 const WARN_EVERY = 10
@@ -53,10 +73,36 @@ const WARN_EVERY = 10
  *
  * 与 `SendPolicyView` 同一形制：取 getter 而非快照值，故配置改了立刻生效，
  * 不必重连账号。缓存下来的话，把上限从 0 调成 5 得重启才算数。
+ *
+ * 这四项是**全局缺省**；单个账号可在 `AccountRecord.retry` 里逐项覆盖，见 `#policyOf`。
  */
 export interface RetryPolicyView {
   /** 连续失败多少次后放弃；`0` 表示一直重连 */
   readonly maxRetries: number
+  /** 首次重试前等待的毫秒 */
+  readonly interval: number
+  /** 退避的等待上限毫秒 */
+  readonly maxInterval: number
+  /** 退避倍率 */
+  readonly factor: number
+}
+
+/**
+ * 一个账号此刻实际生效的重连策略
+ *
+ * 与 `RetryPolicyView` 分开一个类型：那个是**全局缺省的活视图**（getter，配置改了就变），
+ * 这个是**某账号某一刻算出来的四个数**。混用一个类型会让「这是全局的还是这个号的」在
+ * 调用点上看不出来，而那正是这块代码唯一容易搞错的地方。
+ */
+interface EffectiveRetry {
+  /** 连续失败多少次后放弃；`0` 为一直重连 */
+  readonly limit: number
+  /** 首次重试前等待的毫秒 */
+  readonly interval: number
+  /** 退避的等待上限毫秒 */
+  readonly maxInterval: number
+  /** 退避倍率 */
+  readonly factor: number
 }
 
 /** 单个账号的运行时状态 */
@@ -106,10 +152,12 @@ export interface AccountManagerOptions {
   /** 发送策略视图，透传给每个 Bot 门面 */
   readonly sendPolicy: SendPolicyView
   /**
-   * 重连策略视图；不给则一直重连（旧行为）
+   * 重连策略的全局缺省；不给则一直重连、按 2s → 60s 退避（旧行为）
    *
-   * 可选是为了不打断既有调用方（测试里大多不关心重连上限）。缺省取「一直重连」
-   * 而非某个具体次数：改默认行为得是使用者自己在配置里选的，不该由一个可选参数悄悄决定。
+   * 可选是为了不打断既有调用方（测试里大多不关心重连）。上限缺省取「一直重连」而非某个
+   * 具体次数：改默认行为得是使用者自己在配置里选的，不该由一个可选参数悄悄决定。
+   *
+   * 单个账号可在 `AccountRecord.retry` 里逐项覆盖这四项，见 `#policyOf`。
    */
   readonly retryPolicy?: RetryPolicyView
 }
@@ -165,12 +213,12 @@ export class AccountManager implements AccountsView {
     this.#events = opts.events
     this.#sendPolicy = opts.sendPolicy
     /*
-     * 重连策略缺省为「一直重连」
+     * 重连策略可选而非必填
      *
-     * 可选而非必填：内嵌用法与既有测试都不给这一项，而它缺席时的正确行为恰是旧行为
-     * （无限重连）—— 要求必填只会让每个调用点抄一遍同样的默认值。
+     * 内嵌用法与既有测试都不给这一项，而它缺席时的正确行为恰是旧行为（无限重连、
+     * 2 秒起、60 秒顶、2 倍）—— 要求必填只会让每个调用点抄一遍同样的四个数。
      */
-    this.#retryPolicy = opts.retryPolicy ?? { maxRetries: 0 }
+    this.#retryPolicy = opts.retryPolicy ?? RETRY_FALLBACK
 
     // 适配器热插拔（文件头第 4 点）：卸载即下线，重新注册即连回来。
     // 在构造函数中自行装配，而不交由 kernel/runtime.ts 装配：遗漏的后果是
@@ -270,10 +318,17 @@ export class AccountManager implements AccountsView {
    * @param config 账号配置（WebUI 提交的原始对象）
    * @param label 备注名
    * @param enabled 是否立即启用并连接，缺省 true
+   * @param retry 这个号自己的重连覆盖；不给则整套跟随全局配置
    * @returns 新建的记录
    * @throws 适配器未注册或配置校验失败时
    */
-  async create(adapterId: string, config: unknown, label?: string, enabled = true): Promise<AccountRecord> {
+  async create(
+    adapterId: string,
+    config: unknown,
+    label?: string,
+    enabled = true,
+    retry?: AccountRetryOverride
+  ): Promise<AccountRecord> {
     const provider = this.#requireAdapter(adapterId)
     const normalized = this.#validate(provider, config)
 
@@ -287,6 +342,14 @@ export class AccountManager implements AccountsView {
       updatedAt: now
     }
     if (label !== undefined && label !== "") record.label = label
+    /*
+     * 空对象不落盘
+     *
+     * `{}` 与「没填」在行为上完全一样（四项都回落全局），但落进 KV 之后它会让
+     * `record.retry !== undefined` 成真 —— 而放弃重连那条日志正是据此判断该提示
+     * 「改全局配置」还是「改这个号的设置」，于是提示会指错地方。
+     */
+    if (retry !== undefined && Object.keys(retry).length > 0) record.retry = retry
 
     await this.#persist(record)
     this.#runtimes.set(record.id, {
@@ -314,12 +377,19 @@ export class AccountManager implements AccountsView {
    *
    * 改完必须重连：连接参数（地址、token）变了而 socket 还是旧的，
    * 用户会以为"改了没生效"。
+   *
+   * **只改备注或重连策略时不重连。** 那两项都不参与建连：`label` 纯展示，`retry` 只在下一次
+   * 失败之后才被读到（`#policyOf` 每次现算）。为它们把一个正在线的号踢下线，代价是那期间的
+   * 消息全丢 —— 而使用者做的只是把上限从 5 改成 10。
    * @param id 账号记录 id
-   * @param patch 要改的字段
+   * @param patch 要改的字段；`retry` 传 `null` 表示清掉覆盖、回到跟随全局
    * @returns 更新后的记录
    * @throws 账号不存在或配置校验失败时
    */
-  async update(id: string, patch: { config?: unknown; label?: string; enabled?: boolean }): Promise<AccountRecord> {
+  async update(
+    id: string,
+    patch: { config?: unknown; label?: string; enabled?: boolean; retry?: AccountRetryOverride | null }
+  ): Promise<AccountRecord> {
     const rt = this.#require(id)
     const provider = this.#requireAdapter(rt.record.adapterId)
 
@@ -327,9 +397,27 @@ export class AccountManager implements AccountsView {
     if (patch.config !== undefined) next.config = this.#validate(provider, patch.config)
     if (patch.label !== undefined) next.label = patch.label
     if (patch.enabled !== undefined) next.enabled = patch.enabled
+    /*
+     * `null` 与 `undefined` 在这里意思不同，故不能合并判断
+     *
+     * `undefined` 是「这次没提这一项」（保持原样），`null` 是「明确要清掉」。少了 `null`
+     * 这条路，一个填过覆盖的账号就没法回到「跟随全局」—— 只能删号重建。
+     */
+    if (patch.retry === null) delete next.retry
+    else if (patch.retry !== undefined) next.retry = patch.retry
 
     await this.#persist(next)
     rt.record = next
+
+    /*
+     * 判「这次改动要不要重连」：只动了 label / retry 就不动连接
+     *
+     * 判据取「有没有提 config 或 enabled」而非比对新旧值：`config` 是任意结构的对象，
+     * 深比对既要处理嵌套又要处理键序，而算错的后果是「改了地址却没重连」—— 那正是这个
+     * 方法开头那句注释要防的事。宁可在「提交了同样的 config」这种情形下多重连一次。
+     */
+    const touchesConnection = patch.config !== undefined || patch.enabled !== undefined
+    if (!touchesConnection) return next
 
     // 与 `reconnect()` 同一个道理：改地址、改 token 正是为了让它连上，
     // 不该被上一套配置攒下的失败次数挡在门外（见 `reconnect` 的注释）
@@ -672,11 +760,43 @@ export class AccountManager implements AccountsView {
   }
 
   /**
+   * 算出一个账号此刻实际生效的重连策略
+   *
+   * **逐字段回落，不是「填了就整套接管」。** 真实诉求多半是「这一个号连不上就别再试了」，
+   * 若因此迫使人把退避那三个数一并抄进记录里，抄来的那份此后不会跟着全局改动走 ——
+   * 而没人记得自己抄过，症状是「我改了全局间隔，这个号却不听」。
+   *
+   * 每次调用现算而不缓存：全局那侧是活视图（getter），缓存下来会让「改配置立刻生效」失效。
+   * 这个方法只在一次连接失败之后跑，算四个数的代价可以忽略。
+   * @param record 账号记录
+   * @returns 四项都已定值的策略
+   */
+  #policyOf(record: AccountRecord): EffectiveRetry {
+    const own: AccountRetryOverride = record.retry ?? {}
+    const global = this.#retryPolicy
+    /*
+     * `interval` / `maxInterval` 收的是 `DurationLike`（`"5s"` 或毫秒数），故过一遍
+     * `parseDuration`；解析不出来时回落到全局值而不是 0 —— 0 会变成「不等待、立刻重试」，
+     * 那是一个把日志刷满、且对端还没缓过来的死循环，而它的起因只是配置里写错了一个单位。
+     */
+    return {
+      limit: own.limit ?? global.maxRetries,
+      interval: own.interval === undefined ? global.interval : parseDuration(own.interval, global.interval),
+      maxInterval:
+        own.maxInterval === undefined ? global.maxInterval : parseDuration(own.maxInterval, global.maxInterval),
+      factor: own.factor ?? global.factor
+    }
+  }
+
+  /**
    * 安排一次重连
    *
    * 达到上限即停手，**并把状态留在 error 上**（不改成别的状态）：使用者在面板上看到的仍是
-   * 「这个账号连不上，最后一次的错误是什么」，只是不再自动重试。`retryPolicy.maxRetries`
-   * 为 0 表示一直重连 —— 那是此前唯一的行为，故取 0 为「不限」而非「不重连」。
+   * 「这个账号连不上，最后一次的错误是什么」，只是不再自动重试。上限为 0 表示一直重连 ——
+   * 那是此前唯一的行为，故取 0 为「不限」而非「不重连」。
+   *
+   * 四个数取自 `#policyOf`：账号自己填了的用它的，没填的用全局配置。**不在这里读全局值**，
+   * 否则「某个号单独设上限」这件事就得在两处判断，而两处迟早分叉。
    *
    * 手动「重连」按钮走 `reconnect()`，那里**显式**把 `retries` 归零（`connect()` 自己不归零，
    * 它同时被重连定时器调用，在那里归零等于把上限抹掉），故放弃之后仍能一键从头再来 ——
@@ -690,18 +810,32 @@ export class AccountManager implements AccountsView {
 
     rt.retries++
 
-    const limit = this.#retryPolicy.maxRetries
+    const policy = this.#policyOf(rt.record)
+    const limit = policy.limit
     if (limit > 0 && rt.retries > limit) {
-      // 这一条恒为 warn 而不跟随 WARN_EVERY 降级：它是「此后再也不会自动重试了」的唯一告知，
-      // 落进 debug 就等于没说 —— 而使用者看到的现象会是「账号一直离线、日志里也没动静」
+      /*
+       * 这一条恒为 warn 而不跟随 WARN_EVERY 降级：它是「此后再也不会自动重试了」的唯一告知，
+       * 落进 debug 就等于没说 —— 而使用者看到的现象会是「账号一直离线、日志里也没动静」。
+       *
+       * 提示按上限的来源分开写：这个号自己填了上限时，让他去改全局配置只会白改一次。
+       */
+      const where =
+        rt.record.retry?.limit === undefined
+          ? "把配置项 adapter.reconnectLimit 调大（0 为一直重连）"
+          : "把这个账号的「重连次数上限」调大（0 为一直重连）"
       this.#logger.warn(
         `账号 ${this.#describe(rt.record)} 连接失败已达 ${limit} 次，停止自动重连：${errText(err)}。` +
-          `如需继续重试请在面板点「重连」，或把配置项 adapter.reconnectLimit 调大（0 为一直重连）`
+          `如需继续重试请在面板点「重连」，或${where}`
       )
       return
     }
 
-    const delay = backoffDelay(rt.retries, RECONNECT_BACKOFF)
+    const delay = backoffDelay(rt.retries, {
+      baseDelay: policy.interval,
+      maxDelay: policy.maxInterval,
+      factor: policy.factor,
+      jitter: RECONNECT_JITTER
+    })
     const suffix = limit > 0 ? `（第 ${rt.retries}/${limit} 次）` : `（第 ${rt.retries} 次）`
     const text = `账号 ${this.#describe(rt.record)} 连接失败${suffix}：${errText(err)}；${Math.round(delay / 1000)} 秒后重试`
     // 对端长期不在线时不刷屏：首次与每 10 次一条 warn，其余降级到 debug

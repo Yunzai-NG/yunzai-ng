@@ -374,6 +374,63 @@ describe("适配器生命周期", () => {
     expect(app.config.get().adapter.reconnectLimit).toBe(0)
   })
 
+  it("退避三项也有缺省值，且与 accounts.ts 的兜底一致", async () => {
+    const { app } = await boot()
+    const { adapter } = app.config.get()
+    expect(adapter.reconnectInterval).toBe("2s")
+    expect(adapter.reconnectMaxInterval).toBe("1m")
+    expect(adapter.reconnectFactor).toBe(2)
+  })
+
+  /*
+   * 逐账号覆盖的三条用例
+   *
+   * 全局设 0（一直重连），只有这个账号自己填了上限 —— 于是「放弃」那条日志只可能来自
+   * 账号那一层。反过来写（全局设上限、账号设 0）测不出优先级：日志里同样只有一条，
+   * 而它究竟来自哪一层看不出来。
+   */
+  it("账号自己填的上限优先于全局配置", async () => {
+    const { app } = await boot("adapter:\n  reconnectLimit: 0\n  reconnectInterval: 60ms\n", {
+      failConnect: "Mock 就是不让连"
+    })
+    await app.runtime.accounts.create("mock", { selfId: "10000" }, undefined, true, { limit: 1 })
+
+    const gaveUp = (): string | undefined =>
+      app.loggerHub.tail({ level: "warn" }).find(r => r.msg.includes("停止自动重连"))?.msg
+
+    await vi.waitFor(() => expect(gaveUp()).toBeDefined(), { timeout: 10_000, interval: 50 })
+    expect(gaveUp() ?? "").toContain("已达 1 次")
+    // 提示要指向账号那一项，而不是让人去改一个改了也没用的全局配置
+    expect(gaveUp() ?? "").toContain("这个账号")
+    expect(gaveUp() ?? "").not.toContain("adapter.reconnectLimit")
+  }, 15_000)
+
+  it("账号只填上限时，退避三项仍跟随全局 —— 逐字段回落而非整套接管", async () => {
+    /*
+     * 全局把首次间隔设成 60ms，账号只填 limit。若回落是「整套二选一」，这个账号会用回
+     * 内置的 2 秒起步，于是三次失败要等 6 秒以上，这条用例会超时 —— 那正是判据。
+     */
+    const { app } = await boot("adapter:\n  reconnectInterval: 60ms\n  reconnectFactor: 1\n", {
+      failConnect: "Mock 就是不让连"
+    })
+    const record = await app.runtime.accounts.create("mock", { selfId: "10000" }, undefined, true, { limit: 3 })
+
+    await vi.waitFor(() => expect(app.runtime.accounts.get(record.id)?.retries ?? 0).toBeGreaterThan(3), {
+      timeout: 3_000,
+      interval: 20
+    })
+  }, 10_000)
+
+  it("清掉账号的覆盖（retry: null）之后回到跟随全局", async () => {
+    const { app } = await boot("adapter:\n  reconnectInterval: 60ms\n", { failConnect: "Mock 就是不让连" })
+    const record = await app.runtime.accounts.create("mock", { selfId: "10000" }, undefined, false, { limit: 1 })
+    expect(record.retry).toEqual({ limit: 1 })
+
+    const cleared = await app.runtime.accounts.update(record.id, { retry: null })
+    // 字段整个消失而非留一个空对象：留着的话「有没有覆盖」得靠看里面有几个键来判断
+    expect(cleared.retry).toBeUndefined()
+  })
+
   it("账号被 disable 后事件不再进管线", async () => {
     const { app, mock } = await boot()
     const id = await login(app)

@@ -33,12 +33,45 @@ export interface AccountRecord {
   enabled: boolean
   /** 适配器自定义的账号配置，结构由 `AdapterProvider.accountSchema` 描述 */
   config: Record<string, unknown>
+  /**
+   * 这个账号自己的重连策略；缺省沿用全局配置 `adapter.*`
+   *
+   * **与 `config` 分开，因为拥有者不同。** `config` 里的字段由适配器的 `accountSchema`
+   * 声明（「这个号的 WS 地址与 token 是什么」），内核不认识其中任何一个；重连是内核**替
+   * 所有适配器统一做的事**（见 `AccountManager.#scheduleReconnect`），适配器根本不参与。
+   * 塞进 `config` 就得要求每个适配器作者各自声明一遍这些字段，于是同一件事有 N 份声明、
+   * N 套校验，且哪个适配器忘了写，它的账号就没有这个能力。
+   *
+   * 逐字段可缺，缺的那一项各自回落到全局值 —— 不是「填了就整套接管」：多数人只想给某个
+   * 号单独设个上限，不该因此被迫把退避的三个数也抄一遍。
+   */
+  retry?: AccountRetryOverride
   /** 已知的平台账号 id，首次连接成功后回填 */
   selfId?: string
   /** 创建时间（毫秒） */
   createdAt: number
   /** 最后修改时间（毫秒） */
   updatedAt: number
+}
+
+/**
+ * 单个账号对重连策略的覆盖
+ *
+ * 四项逐个可缺，缺的回落到全局配置 `adapter.*` 的同名项。**取「逐字段回落」而非「整套
+ * 二选一」**：真实诉求多半是「这一个号连不上就别再试了」，而那不该迫使人把退避的三个数
+ * 一并抄进来 —— 抄进来的那份此后不会跟着全局改动走，而没人记得自己抄过。
+ *
+ * 单位与全局配置一致：`interval` / `maxInterval` 收毫秒数或 `"2s"` 这类时长表达式。
+ */
+export interface AccountRetryOverride {
+  /** 连续失败多少次后放弃；`0` 为一直重连 */
+  limit?: number
+  /** 首次重试前等多久 */
+  interval?: DurationLike
+  /** 退避的等待上限 */
+  maxInterval?: DurationLike
+  /** 退避倍率：每失败一次把等待乘上这个数，直到 `maxInterval` */
+  factor?: number
 }
 
 /** 账号运行状态 */

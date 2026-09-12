@@ -17,6 +17,7 @@
  *          历史缺一段而无人察觉。
  */
 import type {
+  AccountRetryOverride,
   AccountState,
   AdapterRegistryView,
   BotRegistryView,
@@ -49,6 +50,7 @@ import type { PluginHost } from "../plugin/host.js"
 import type { PluginMarket } from "../plugin/market.js"
 import type { SystemInfo } from "../platform/system.js"
 import type { ServerSink } from "../plugin/hooks.js"
+import { isDurationLike, parseDuration } from "../util/duration.js"
 import { isLoopbackAddress } from "./auth.js"
 import { browseDirectory } from "./browse.js"
 import type { ManagedServer } from "./index.js"
@@ -336,6 +338,75 @@ function optionalBoolean(obj: Record<string, unknown>, key: string): boolean | u
   if (value === undefined || value === null) return undefined
   if (typeof value !== "boolean") throw fail(400, `字段 ${key} 必须是布尔值`)
   return value
+}
+
+/**
+ * 从对象里取可选数字
+ * @param obj 请求体
+ * @param key 字段名
+ * @param range 允许区间（含两端）
+ * @returns 数字；缺失时 undefined
+ * @throws 存在但不是有限数字、或越界时抛 400
+ */
+function optionalNumber(
+  obj: Record<string, unknown>,
+  key: string,
+  range: { min: number; max: number }
+): number | undefined {
+  const value = obj[key]
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== "number" || !Number.isFinite(value)) throw fail(400, `字段 ${key} 必须是数字`)
+  if (value < range.min || value > range.max) {
+    throw fail(400, `字段 ${key} 必须在 ${range.min} 到 ${range.max} 之间，收到 ${value}`)
+  }
+  return value
+}
+
+/**
+ * 解析请求体里的每账号重连覆盖
+ *
+ * **四项逐个可缺**，缺的那项由内核回落到全局配置（见 `AccountManager.#policyOf`）；
+ * 故此处不填任何默认值 —— 填了就等于把「跟随全局」偷换成「此刻的全局值」，而后者
+ * 不会再跟着全局改动走。
+ *
+ * `retry: null` 是「清掉这个号的覆盖，改回跟随全局」，与 `retry` 整个缺席（「这次不动它」）
+ * 不同：PATCH 语义下没有这条路，取消覆盖就只能删账号重建。
+ *
+ * 时长两项收数字毫秒或 `"2s"` 这类字符串，与全局配置同一形制；字符串的格式不在这里校验，
+ * 由内核 `parseDuration` 解析、解析不出来时回落到全局值 —— 在这里拒绝会让「填错单位」
+ * 从一次可恢复的回落变成一次改不进去的 400。
+ * @param body 请求体
+ * @returns 覆盖对象；`retry` 缺席时 undefined，`retry: null` 时 null（表示清空）
+ * @throws 类型不对或越界时抛 400
+ */
+function retryOverrideOf(body: Record<string, unknown>): AccountRetryOverride | null | undefined {
+  const raw = body.retry
+  if (raw === undefined) return undefined
+  if (raw === null) return null
+  const obj = objectOf(raw)
+  const override: AccountRetryOverride = {}
+  // 上限与全局 schema 同区间：越界在这里挡住，否则一个 -1 会让「0 为不限」的判据静默失效
+  const limit = optionalNumber(obj, "limit", { min: 0, max: 1000 })
+  if (limit !== undefined) override.limit = Math.trunc(limit)
+  const factor = optionalNumber(obj, "factor", { min: 1, max: 10 })
+  if (factor !== undefined) override.factor = factor
+  /*
+   * 两项时长走 `isDurationLike` 而非自备一条正则：判据必须与 `parseDuration` 同一条，
+   * 否则会收下一个它解析不了的值，而那时内核悄悄回落到全局值 —— 使用者看到的是
+   * 「我明明填了 5 秒，它却按一分钟退避」。
+   *
+   * 负数单独挡掉：`"-2s"` 合乎格式却会让 `setTimeout` 立刻触发，退避形同不存在。
+   */
+  for (const key of ["interval", "maxInterval"] as const) {
+    const value = obj[key]
+    if (value === undefined || value === null) continue
+    if (!isDurationLike(value)) {
+      throw fail(400, `字段 retry.${key} 必须是毫秒数字或形如 "2s" 的时长字符串`)
+    }
+    if (parseDuration(value, -1) < 0) throw fail(400, `字段 retry.${key} 不能是负数`)
+    override[key] = value
+  }
+  return override
 }
 
 /**
@@ -769,10 +840,18 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     const config = body.config === undefined ? {} : objectOf(body.config)
     const label = optionalString(body, "label")
     const enabled = optionalBoolean(body, "enabled") ?? true
+    /*
+     * 建号时给 `retry` 是允许的，但**不必给** —— 不给即四项全跟随全局配置，那是绝大多数
+     * 账号该有的样子。`null` 在建号这里没有意义（本来就没有可清的覆盖），当 undefined 处理。
+     *
+     * 一次 `create()` 带上它，不走「先建号再 PATCH」两步：`update()` 会 `disconnect()` 再
+     * `connect()`，那样建一个号会当场多一次断开重连 —— 使用者看到的是刚建好的账号闪一下离线。
+     */
+    const retry = retryOverrideOf(body) ?? undefined
     // create() 的失败几乎都是用户输入问题（适配器没装、配置字段填错），
     // 而 validateAccount 的错误信息按契约就是给用户看的 —— 一律 400
     try {
-      return { status: 201, body: await deps.accounts.create(adapterId, config, label, enabled) }
+      return { status: 201, body: await deps.accounts.create(adapterId, config, label, enabled, retry) }
     } catch (err) {
       if (err instanceof SchemaError) throw err
       throw fail(400, messageOf(err))
@@ -783,12 +862,20 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     requireWritable()
     const state = accountOf(req.params.id)
     const body = objectOf(req.body)
-    const patch: { config?: unknown; label?: string; enabled?: boolean } = {}
+    const patch: { config?: unknown; label?: string; enabled?: boolean; retry?: AccountRetryOverride | null } = {}
     if (body.config !== undefined) patch.config = objectOf(body.config)
     const label = optionalString(body, "label")
     if (label !== undefined) patch.label = label
     const enabled = optionalBoolean(body, "enabled")
     if (enabled !== undefined) patch.enabled = enabled
+    /*
+     * `retry: null` 与不传是两件事，故这里区分三态
+     *
+     * 不传即「这次不动它」，`null` 即「清掉覆盖、改回跟随全局」。少了后者，一个填过上限的
+     * 账号就再没有回到全局缺省的途径 —— 面板上那个「跟随全局」的选项会变成假的。
+     */
+    const retry = retryOverrideOf(body)
+    if (retry !== undefined) patch.retry = retry
     try {
       return await deps.accounts.update(state.record.id, patch)
     } catch (err) {

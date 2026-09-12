@@ -19,6 +19,24 @@ const UNIT_MS: Record<string, number> = {
 const DURATION_RE = /^(-?\d+(?:\.\d+)?)(ms|s|m|h|d)$/
 
 /**
+ * 判断一个值是否为合法的时长表达式
+ *
+ * 存在的理由是**边界上要收窄类型**：`DurationLike` 是模板字面量类型（`` `${number}s` `` 一类），
+ * 而 HTTP 请求体里来的是任意 `string`，直接赋值编译不过。写在这里而不是各调用点自备一条
+ * 正则：判据与 `parseDuration` 必须同一条 —— 分开写的症状是「这个值收下了却解析成兜底值」。
+ *
+ * 纯数字串（`"5000"`）算合法：`parseDuration` 按毫秒收它，YAML 里读出来的正是这种。
+ * @param value 待判断的值
+ * @returns 是否可作 `DurationLike` 使用
+ */
+export function isDurationLike(value: unknown): value is DurationLike {
+  if (typeof value === "number") return Number.isFinite(value)
+  if (typeof value !== "string") return false
+  const trimmed = value.trim()
+  return /^-?\d+$/.test(trimmed) || DURATION_RE.test(trimmed)
+}
+
+/**
  * 把时长表达式解析为毫秒
  * @param value 毫秒数字，或形如 `"5s"` / `"30d"` 的字符串
  * @param fallback 无法解析时返回的默认值，缺省 0
