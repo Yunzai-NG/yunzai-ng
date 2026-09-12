@@ -384,17 +384,27 @@ export class AccountManager implements AccountsView {
    * @param id 账号记录 id
    * @param patch 要改的字段；`retry` 传 `null` 表示清掉覆盖、回到跟随全局
    * @returns 更新后的记录
-   * @throws 账号不存在或配置校验失败时
+   * @throws 账号不存在时；给了 `config` 而适配器未注册或该份配置校验不过时
    */
   async update(
     id: string,
     patch: { config?: unknown; label?: string; enabled?: boolean; retry?: AccountRetryOverride | null }
   ): Promise<AccountRecord> {
     const rt = this.#require(id)
-    const provider = this.#requireAdapter(rt.record.adapterId)
 
     const next: AccountRecord = { ...rt.record, updatedAt: Date.now() }
-    if (patch.config !== undefined) next.config = this.#validate(provider, patch.config)
+    /*
+     * 适配器只在要校验 `config` 时才取，**不在方法开头无条件取**
+     *
+     * 另外三项（`label` / `enabled` / `retry`）都归内核自己所有，校验它们用不到适配器。
+     * 原先在开头就 `#requireAdapter`，于是适配器插件一被卸载，它名下账号的备注与重连策略
+     * 就都改不动了，而报的是「适配器 X 未注册」—— 与使用者想做的事毫无字面联系。
+     * 账号记录在适配器卸载后是**刻意**留着的（装回来就能自动连上），那条承诺此前只兑现
+     * 了一半：记录在，却动不了。
+     */
+    if (patch.config !== undefined) {
+      next.config = this.#validate(this.#requireAdapter(rt.record.adapterId), patch.config)
+    }
     if (patch.label !== undefined) next.label = patch.label
     if (patch.enabled !== undefined) next.enabled = patch.enabled
     /*

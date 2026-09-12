@@ -301,6 +301,27 @@ describe("适配器生命周期", () => {
     expect(app.runtime.accounts.list()).toHaveLength(1)
   })
 
+  /*
+   * 承接上一条：记录留着，就得真的动得了
+   *
+   * `update()` 原先在方法开头无条件取适配器，于是插件一卸载，这个号的备注与重连策略
+   * 也一并锁死，而报的是「适配器 mock 未注册」—— 与使用者想做的事毫无字面联系。
+   * 面板的账号编辑框正是据此写着「备注与重连策略不经适配器」。
+   */
+  it("适配器插件卸载后，备注与重连策略仍改得动，config 仍拒绝", async () => {
+    const { app } = await boot()
+    const record = await app.runtime.accounts.create("mock", { selfId: "10000" }, "原备注", false)
+    await app.plugins.unload(PLUGIN)
+
+    const next = await app.runtime.accounts.update(record.id, { label: "改过的", retry: { limit: 3 } })
+    expect(next.label).toBe("改过的")
+    expect(next.retry).toEqual({ limit: 3 })
+
+    // config 仍须经适配器校验：没有 accountSchema 就无从判断填进来的东西对不对，
+    // 收下它等于把一份没人看过的配置写进记录里
+    await expect(app.runtime.accounts.update(record.id, { config: { selfId: "10001" } })).rejects.toThrow("未注册")
+  })
+
   it("适配器报告下线时走完整下线流程", async () => {
     const { app, mock } = await boot()
     const id = await login(app)
