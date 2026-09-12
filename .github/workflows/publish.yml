@@ -83,6 +83,38 @@ jobs:
             echo "  @yunzai-ng/$p  $(node -p "require('./packages/$p/package.json').version")"
           done
 
+      # 「装 cli 就唯一确定另外三个」这条不变量，得靠一道门禁守住
+      #
+      # `pnpm pack` 把 `workspace:*` 改写成**精确**版本号（下面那步核对的正是这件事），
+      # 于是 cli 0.4.0 的依赖里写着 `"@yunzai-ng/core": "0.5.0"` 这个死数。只发 core
+      # 不发 cli 的后果是：新的 core 躺在 npm 上而谁都到不了 —— `yzng update` 只升 cli，
+      # 装到的还是老 cli，它又把 core 钉在旧版本上，四个包一个都不动，而命令报的是
+      # 「已是 latest 对应的版本」。0.5.1 就是这么发出去一个装不到的版本。
+      #
+      # 故：另外三个包里**任一个**要发新版，cli 必须跟着抬一个号，哪怕它只是重新钉一遍
+      # 依赖 —— 那个重新钉过的依赖表就是它这一版的全部内容，也确实是内容。
+      #
+      # 反过来「只发 cli」是允许的（修 CLI 自身的缺陷），故判据是单向的。
+      - name: 校验 cli 跟着一起发
+        run: |
+          need=""
+          for p in types core jsx; do
+            v=$(node -p "require('./packages/$p/package.json').version")
+            if ! npm view "@yunzai-ng/$p@$v" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
+              need="$need @yunzai-ng/$p@$v"
+            fi
+          done
+          cliv=$(node -p "require('./packages/cli/package.json').version")
+          if npm view "@yunzai-ng/cli@$cliv" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
+            if [ -n "$need" ]; then
+              echo "::error::本次要发$need，但 @yunzai-ng/cli@$cliv 已在 npm 上。cli 对这几个包是钉死版本号的依赖，不一并抬 cli 的话新版本装不到（yzng update 会报「已是最新」）。请把 packages/cli/package.json 的版本号加一个 patch，根 package.json 的发布编号与 tag 一并跟上"
+              exit 1
+            fi
+            echo "本次无需发 cli（$cliv 已在 npm 上，且另外三个包也都没有新版本）"
+          else
+            echo "cli 将发出 $cliv，带上$need"
+          fi
+
       # 凭据按 registry 主机名分别写入，不走 setup-node 的 registry-url：
       # 这里要同时对两个 registry 认证，一个 registry-url 表达不了。
       # 两个 token 都不要回显，~/.npmrc 也不要 cat。
