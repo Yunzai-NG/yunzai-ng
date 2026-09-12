@@ -20,8 +20,22 @@
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 
-/** 自动生成令牌的字节数：24 字节 → base64url 32 字符，既可抵御爆破又便于人工转录 */
-const TOKEN_BYTES = 24
+/**
+ * 自动生成令牌的字符数
+ *
+ * 取 16 位而非更长：这串东西使用者要从日志里抄进浏览器（面板首次打开即要求它），
+ * 而 16 位已远超爆破所需 —— 字符集 62 个，16 位约 95 bit 熵。
+ */
+const TOKEN_CHARS = 16
+
+/**
+ * 令牌的字符集
+ *
+ * 刻意不用 base64url：`-` 与 `_` 在「从日志里抄一串字符」这件事上是纯粹的负担，
+ * 而人工转录正是这串东西的主要用法。也不剔除 `0O1lI` 一类形近字符 —— 剔除会削减
+ * 每位的熵，而使用者多半是复制粘贴，真手抄时字体等宽（日志与输入框都是）。
+ */
+const TOKEN_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 /** 令牌请求头（`Authorization: Bearer` 之外的简易写法） */
 const TOKEN_HEADER = "x-yunzai-token"
@@ -47,10 +61,25 @@ const UNSAFE_METHODS = ["POST", "PUT", "PATCH", "DELETE"]
  * 用 `randomBytes` 而**不是** `util/id.ts` 的 `randomId()`：后者对随机字节取模
  * 引入了可忽略但真实存在的分布偏差，其文档里也写明"不用于密码学场景"。
  * 令牌正是密码学场景。
- * @returns base64url 编码的 32 字符令牌
+ *
+ * **取字符时同样不能取模**（`byte % 62`）—— 那正是 `randomId()` 被弃用的那个偏差：
+ * 256 不是 62 的整数倍，`0..255` 取模后前 8 个字符各命中 5 个字节、其余各 4 个，
+ * 即前 8 个字符的概率高出 25%。故用拒绝采样：落在 `62 * 4 = 248` 之外的字节
+ * 直接丢弃重取，代价是平均多取 3% 的字节。
+ * @returns 16 字符的令牌，字符集为大小写字母与数字
  */
 export function generateToken(): string {
-  return randomBytes(TOKEN_BYTES).toString("base64url")
+  const limit = Math.floor(256 / TOKEN_ALPHABET.length) * TOKEN_ALPHABET.length
+  let out = ""
+  while (out.length < TOKEN_CHARS) {
+    // 一次多取一些，省去逐字节调用系统随机源的开销；不够时循环会再取一批
+    for (const byte of randomBytes(TOKEN_CHARS)) {
+      if (byte >= limit) continue
+      out += TOKEN_ALPHABET[byte % TOKEN_ALPHABET.length]
+      if (out.length === TOKEN_CHARS) break
+    }
+  }
+  return out
 }
 
 /**
@@ -84,8 +113,11 @@ export function isLoopbackAddress(address: string): boolean {
 /**
  * 判断配置中填写的监听地址是否仅对本机可见
  *
- * `ensureToken()` 据此决定是否强制生成令牌：仅监听本机时不生成，
- * 以免单机部署的使用者被一串随机字符阻挡在面板之外。
+ * **内核自身已不再据此放宽任何东西。** 早先 `ensureToken()` 用它决定「只监听本机就不生成
+ * 令牌」，那条已去掉（理由见那个方法）—— 令牌恒生成，与监听地址无关。
+ *
+ * 保留本函数是因为它已随 `export *` 成为对外 API，且「这个地址是否只对本机可见」本身
+ * 是插件会问的问题（如决定要不要在日志里提醒使用者暴露风险）。
  * @param host 监听地址
  * @returns 是否只对本机可见
  */

@@ -124,6 +124,20 @@ export interface MarketEntry {
 export interface MarketListing extends MarketEntry {
   /** 插件目录下是否已存在同名目录 */
   readonly installed: boolean
+  /**
+   * 已装那份的版本，取自安装目录的 `package.json`
+   *
+   * 已装但读不到时本字段不出现（没有 package.json，或它没写 version）——
+   * 那与「0.0.0」不是一回事，后者会让面板显示一个磁盘上并不存在的数字。
+   */
+  readonly installedVersion?: string
+  /**
+   * 索引声明的版本是否高于已装那份
+   *
+   * **两侧任一读不到版本时恒为假**：那时无从比较，而标成可更新会让人点一次更新
+   * 去换一个同样的东西。判据与面板商店那侧同一个 `compareVersion`。
+   */
+  readonly updatable: boolean
 }
 
 /** 一次索引获取的结果 */
@@ -241,6 +255,37 @@ export interface InstallResult extends SetupOutcome {
    * 故在装完就说出来 —— 而不是等使用者问「为什么我的更新比别人慢」。
    */
   readonly updatable: "pull" | "reinstall"
+  /**
+   * 本次是否暂存过本地改动，仅暂存了才出现
+   *
+   * 那份改动此刻只在 `git stash` 里，不说一句使用者无从知道要去 `pop` —— 而他看到的
+   * 现象是「我改的东西不见了」。仅在 `via` 为 `pull` 且调用方同意暂存的那一路为真。
+   */
+  readonly stashed?: boolean
+}
+
+/**
+ * 一次更新前的探测结果
+ *
+ * 存在的理由是**「要不要暂存」这一问必须在动手之前问出来**。此前 `#tryPull` 撞上改动即
+ * 自动 `stash`，那是替使用者做了他没同意的决定；改为中止之后，面板需要一个只读的途径
+ * 先问清楚，否则它只能先发一次注定失败的更新、再靠错误文本反推 —— 那是把一条可预料的
+ * 分支做成了异常流程。
+ */
+export interface UpdateProbe {
+  /**
+   * 这次更新会不会走就地拉取
+   *
+   * 为假即整目录重装那条路。**那条路根本不碰 git**，目录连同改动一起被替换掉 ——
+   * 那正是「重装」这个词的意思，故此时无所谓暂存，面板也不必多问一次。
+   */
+  readonly willPull: boolean
+  /**
+   * 目录里有没有未提交的改动（含未跟踪文件）
+   *
+   * **`willPull` 为假时恒为假**：报一个「有改动」却给不出「可以暂存」的选项只会让人困惑。
+   */
+  readonly dirty: boolean
 }
 
 /** 市场行为的可配置项，由内核配置提供 */
@@ -579,7 +624,27 @@ export class PluginMarket {
     if (force || !fresh) await this.#refresh(force)
     const plugins: MarketListing[] = []
     for (const entry of this.#entries) {
-      plugins.push({ ...entry, installed: await this.#isInstalled(entry.name) })
+      const installed = await this.#isInstalled(entry.name)
+      /*
+       * 已装那份的版本要从磁盘读，不能沿用索引里那个
+       *
+       * 索引说的是「现在最新是多少」，磁盘上那份可能是几个月前装的。面板据此显示
+       * 「0.3.0 → 0.4.0」并标出「可更新」—— 这一对事实以前只有 `installed` 一个
+       * 布尔值，故市场页判不出可更新，那是面板那侧长期缺一个页签的原因。
+       *
+       * 只对已装的读：未装的目录不存在，一次注定失败的读只是白付一次系统调用。
+       */
+      const dir = installed ? joinWithin(this.#deps.pluginsDir, entry.name) : undefined
+      const version = dir === undefined ? undefined : (await this.#manifest(dir))?.version
+      plugins.push({
+        ...entry,
+        installed,
+        ...(version === undefined ? {} : { installedVersion: version }),
+        updatable:
+          installed && version !== undefined && entry.version !== undefined
+            ? compareVersion(entry.version, version) > 0
+            : false
+      })
     }
     plugins.sort((a, b) => a.name.localeCompare(b.name))
     return { fetchedAt: this.#fetchedAt, cached, sources: [...this.#sources], plugins }
@@ -890,14 +955,60 @@ export class PluginMarket {
   }
 
   /**
+   * 探一下就地拉取会不会撞上本地改动
+   *
+   * **单独一个只读动作，先于 `update()` 调用。** 从前 `#tryPull` 遇到改动就自动 `stash`，
+   * 那是替使用者做了他没同意的决定 —— 他可能刚改完一处硬编码地址正在用，而「更新」这个
+   * 动作本身并不含「把我的改动收走」的意思。现在把这个事实交回去，由面板问一句。
+   *
+   * 判据与 `#tryPull` 里那一条完全相同（`status --porcelain` 非空），但**不能靠调用方
+   * 自己去跑 git**：那样两处判据迟早分叉，症状是「问都没问就暂存了」或「问了却没有改动」。
+   *
+   * 只读：除 `status` 之外一个命令都不发。故它可以在确认框之前调用，而使用者点「取消」时
+   * 目录仍是原样。
+   * @param name 插件名
+   * @returns 就地拉取会不会走成、以及目录里有没有未提交的改动
+   * @throws 名称不合法时
+   */
+  async inspectUpdate(name: string): Promise<UpdateProbe> {
+    assertPluginName(name)
+    const dir = joinWithin(this.#deps.pluginsDir, name)
+    /*
+     * 判「会不会就地拉取」用的是与 `#tryPull` 同一串前置条件
+     *
+     * 任一条不满足就是整目录重装那条路 —— 那条路根本不碰 git，也就无所谓暂存，
+     * 故此时 `dirty` 恒为假：报一个「有改动」却给不出「可以暂存」的选项只会让人困惑。
+     */
+    if (!(await isDirectory(join(dir, ".git")))) return { willPull: false, dirty: false }
+    const entry = await this.entry(name)
+    if (entry === undefined || entry.install.type !== "git") return { willPull: false, dirty: false }
+    if (!(await this.#hasGit())) return { willPull: false, dirty: false }
+    const dirty = await this.#isDirty(dir)
+    return { willPull: true, dirty }
+  }
+
+  /**
+   * 目录里有没有未提交的改动
+   *
+   * 抽成一处是因为**探测与执行必须用同一个判据**：分两处写迟早分叉，而症状是
+   * 「面板问都没问就暂存了」——那正是这次改动要消除的行为。
+   * @param dir 插件目录
+   * @returns 是否有改动（含未跟踪文件）
+   */
+  async #isDirty(dir: string): Promise<boolean> {
+    return (await this.#git(["status", "--porcelain"], dir, GIT_LOCAL_TIMEOUT_MS)).trim() !== ""
+  }
+
+  /**
    * 更新一个插件：目录已是 git 仓库时就地拉取，否则退回重新安装
    * @param name 插件名
    * @param opts 可选参数
    * @param opts.dependencies 更新完之后跑包管理器装依赖，并按索引声明跑装后步骤
+   * @param opts.stash 撞上本地改动时是否暂存
    * @returns 安装结果
-   * @throws 与 `install` 相同；就地拉取失败时抛出 git 的错误
+   * @throws 与 `install` 相同；就地拉取失败时抛出 git 的错误；有改动而 `stash` 未置真时
    */
-  async update(name: string, opts: { dependencies?: boolean } = {}): Promise<InstallResult> {
+  async update(name: string, opts: { dependencies?: boolean; stash?: boolean } = {}): Promise<InstallResult> {
     /*
      * 优先就地拉取，因为重新安装会删掉目录里那份 `node_modules`
      *
@@ -910,7 +1021,7 @@ export class PluginMarket {
      */
     assertPluginName(name)
     const target = joinWithin(this.#deps.pluginsDir, name)
-    const pulled = await this.#tryPull(name, target, opts.dependencies === true)
+    const pulled = await this.#tryPull(name, target, opts.dependencies === true, opts.stash === true)
     return pulled ?? this.install(name, { replace: true, ...opts })
   }
 
@@ -919,13 +1030,14 @@ export class PluginMarket {
    * @param name 插件名
    * @param dir 插件安装目录
    * @param dependencies 拉完之后按需装依赖、跑装后步骤
+   * @param stash 撞上本地改动时是否暂存；为假则整次更新中止
    * @returns 拉取结果；不具备就地拉取条件（无 git、目录不是仓库、来源不是 git）时 undefined
    * @throws 拉取过程本身失败时 —— 那意味着网络或仓库状态有问题，此时退回重新安装会把一次
-   *         可修复的失败变成一次目录删除
+   *         可修复的失败变成一次目录删除；有改动而 `stash` 为假时同样抛出，见下
    */
-  async #tryPull(name: string, dir: string, dependencies: boolean): Promise<InstallResult | undefined> {
+  async #tryPull(name: string, dir: string, dependencies: boolean, stash: boolean): Promise<InstallResult | undefined> {
     /*
-     * 两处刻意的做法
+     * 三处刻意的做法
      *
      * **`fetch` + `reset --hard` 而非 `pull`。** `pull` 会试图合并，而目录里的改动多半不是
      * 有意维护的分叉（编辑器留下的文件、上次安装的残留）；一次合并冲突会让目录停在半新半旧
@@ -935,6 +1047,11 @@ export class PluginMarket {
      * **改动先 stash 再 reset，顺序即安全性。** 那些改动有时是刻意为之（改了一处硬编码的
      * 地址），故留一份可取回的副本并在日志里说明取回办法 —— 直接丢掉等于替使用者做了他没
      * 同意的决定。反过来先 reset 后 stash 就是数据丢失。
+     *
+     * **`stash` 未置真时撞上改动即中止，不再默认暂存。** 从前这里无条件暂存，理由是「留了
+     * 副本，可取回」—— 但取回要懂 `git stash pop`，而不懂的人只看到自己改的东西不见了。
+     * 决定权交回调用方：面板据此弹一个必须回答的问句。**中止发生在 `reset` 之前**，故目录
+     * 停在原样，重来一次没有代价。
      */
     if (!(await isDirectory(join(dir, ".git")))) return undefined
     const entry = await this.entry(name)
@@ -949,12 +1066,29 @@ export class PluginMarket {
     const head = async (): Promise<string> => (await this.#git(["rev-parse", "HEAD"], dir, GIT_LOCAL_TIMEOUT_MS)).trim()
     const wasAt = await head()
 
-    // 使用者改过的文件先暂存。`--include-untracked` 一并收进去：新增的文件同样会被
-    // reset 之后的 checkout 撞上，而它更可能是使用者自己放的东西
-    const dirty = (await this.#git(["status", "--porcelain"], dir, GIT_LOCAL_TIMEOUT_MS)).trim() !== ""
+    /*
+     * 撞上改动：要么按调用方的同意暂存，要么原地中止
+     *
+     * `--include-untracked` 一并收进去：新增的文件同样会被 reset 之后的 checkout 撞上，
+     * 而它更可能是使用者自己放的东西。
+     *
+     * 中止那一路抛的是**给人看的一句话** —— 它会一路折成 400 显示在面板上，故写明「有改动」
+     * 与「怎么继续」两件事，而不是一句 git 的原文。
+     */
+    const dirty = await this.#isDirty(dir)
+    if (dirty && !stash) {
+      throw new Error(
+        `插件 ${name} 的目录内有未提交的改动。更新会把目录重置到远端最新提交，` +
+          `那些改动须先暂存（面板会问你一次）或自行处理：在该目录执行 git stash push 或 git checkout .`
+      )
+    }
     if (dirty) {
-      await this.#git(["stash", "push", "--include-untracked", "-m", `yunzai-ng 更新前自动暂存 ${new Date().toISOString()}`], dir, GIT_LOCAL_TIMEOUT_MS)
-      this.#deps.logger.warn(`插件 ${name} 目录内有未提交的改动，已暂存。如需取回：在该目录执行 git stash pop`)
+      await this.#git(
+        ["stash", "push", "--include-untracked", "-m", `yunzai-ng 更新前暂存 ${new Date().toISOString()}`],
+        dir,
+        GIT_LOCAL_TIMEOUT_MS
+      )
+      this.#deps.logger.warn(`插件 ${name} 目录内有未提交的改动，已按你的选择暂存。如需取回：在该目录执行 git stash pop`)
     }
 
     const { mirror } = this.#deps.settings()
@@ -998,6 +1132,8 @@ export class PluginMarket {
       changed,
       // 就地拉取过一次，说明目录确实是 git 仓库，此后照旧走这条路
       updatable: "pull",
+      // 暂存过就说出来：那份改动此刻只在 stash 里，不说一句使用者无从知道要去 pop
+      ...(dirty ? { stashed: true } : {}),
       ...(before === undefined ? {} : { fromVersion: before }),
       ...done
     }

@@ -48,6 +48,17 @@ const RECONNECT_BACKOFF = { baseDelay: 2_000, maxDelay: 60_000, factor: 2, jitte
 /** 每多少次失败落一条 warn（其余落 debug），避免日志刷屏 */
 const WARN_EVERY = 10
 
+/**
+ * 重连策略的只读视图
+ *
+ * 与 `SendPolicyView` 同一形制：取 getter 而非快照值，故配置改了立刻生效，
+ * 不必重连账号。缓存下来的话，把上限从 0 调成 5 得重启才算数。
+ */
+export interface RetryPolicyView {
+  /** 连续失败多少次后放弃；`0` 表示一直重连 */
+  readonly maxRetries: number
+}
+
 /** 单个账号的运行时状态 */
 interface AccountRuntime {
   /** 持久化记录 */
@@ -94,6 +105,13 @@ export interface AccountManagerOptions {
   readonly events: CoreEventBus
   /** 发送策略视图，透传给每个 Bot 门面 */
   readonly sendPolicy: SendPolicyView
+  /**
+   * 重连策略视图；不给则一直重连（旧行为）
+   *
+   * 可选是为了不打断既有调用方（测试里大多不关心重连上限）。缺省取「一直重连」
+   * 而非某个具体次数：改默认行为得是使用者自己在配置里选的，不该由一个可选参数悄悄决定。
+   */
+  readonly retryPolicy?: RetryPolicyView
 }
 
 /**
@@ -126,6 +144,8 @@ export class AccountManager implements AccountsView {
   readonly #events: CoreEventBus
   /** 发送策略视图 */
   readonly #sendPolicy: SendPolicyView
+  /** 重连策略视图 */
+  readonly #retryPolicy: RetryPolicyView
   /** 账号 id → 运行时 */
   readonly #runtimes = new Map<string, AccountRuntime>()
   /** 适配器注册表的监听句柄，停机时摘除 */
@@ -144,6 +164,13 @@ export class AccountManager implements AccountsView {
     this.#createHost = opts.createHost
     this.#events = opts.events
     this.#sendPolicy = opts.sendPolicy
+    /*
+     * 重连策略缺省为「一直重连」
+     *
+     * 可选而非必填：内嵌用法与既有测试都不给这一项，而它缺席时的正确行为恰是旧行为
+     * （无限重连）—— 要求必填只会让每个调用点抄一遍同样的默认值。
+     */
+    this.#retryPolicy = opts.retryPolicy ?? { maxRetries: 0 }
 
     // 适配器热插拔（文件头第 4 点）：卸载即下线，重新注册即连回来。
     // 在构造函数中自行装配，而不交由 kernel/runtime.ts 装配：遗漏的后果是
@@ -304,6 +331,9 @@ export class AccountManager implements AccountsView {
     await this.#persist(next)
     rt.record = next
 
+    // 与 `reconnect()` 同一个道理：改地址、改 token 正是为了让它连上，
+    // 不该被上一套配置攒下的失败次数挡在门外（见 `reconnect` 的注释）
+    rt.retries = 0
     await this.disconnect(id, "配置已修改")
     if (next.enabled) await this.connect(id)
     else this.#setStatus(rt, "disabled", undefined)
@@ -387,6 +417,19 @@ export class AccountManager implements AccountsView {
    * @param id 账号记录 id
    */
   async reconnect(id: string): Promise<void> {
+    const rt = this.#runtimes.get(id)
+    /*
+     * 手动重连把失败计数归零
+     *
+     * **少了这一句，「重连」在达到上限之后就是个点了没反应的按钮。** `retries` 只在连接
+     * 成功那一刻才归零（见 `#doConnect`），故放弃重连后它停在上限值上：不归零的话这次
+     * 手动连接一旦仍失败，`#scheduleReconnect` 立刻又判超限、又放弃，而使用者刚刚才
+     * 明确要求「再试一次」—— 那句「点重连即可恢复」也就成了空话。
+     *
+     * 只在手动入口归零，不在 `connect()` 里：后者也被重连定时器调用，在那里归零等于
+     * 把上限抹掉（每次重试都从 0 开始数，永远到不了上限）。
+     */
+    if (rt !== undefined) rt.retries = 0
     await this.disconnect(id, "手动重连")
     await this.connect(id)
   }
@@ -630,6 +673,14 @@ export class AccountManager implements AccountsView {
 
   /**
    * 安排一次重连
+   *
+   * 达到上限即停手，**并把状态留在 error 上**（不改成别的状态）：使用者在面板上看到的仍是
+   * 「这个账号连不上，最后一次的错误是什么」，只是不再自动重试。`retryPolicy.maxRetries`
+   * 为 0 表示一直重连 —— 那是此前唯一的行为，故取 0 为「不限」而非「不重连」。
+   *
+   * 手动「重连」按钮走 `reconnect()`，那里**显式**把 `retries` 归零（`connect()` 自己不归零，
+   * 它同时被重连定时器调用，在那里归零等于把上限抹掉），故放弃之后仍能一键从头再来 ——
+   * 少了那条出路，上限一到就只能重启进程。
    * @param rt 账号运行时
    * @param err 触发重连的错误
    */
@@ -638,8 +689,21 @@ export class AccountManager implements AccountsView {
     this.#clearTimer(rt)
 
     rt.retries++
+
+    const limit = this.#retryPolicy.maxRetries
+    if (limit > 0 && rt.retries > limit) {
+      // 这一条恒为 warn 而不跟随 WARN_EVERY 降级：它是「此后再也不会自动重试了」的唯一告知，
+      // 落进 debug 就等于没说 —— 而使用者看到的现象会是「账号一直离线、日志里也没动静」
+      this.#logger.warn(
+        `账号 ${this.#describe(rt.record)} 连接失败已达 ${limit} 次，停止自动重连：${errText(err)}。` +
+          `如需继续重试请在面板点「重连」，或把配置项 adapter.reconnectLimit 调大（0 为一直重连）`
+      )
+      return
+    }
+
     const delay = backoffDelay(rt.retries, RECONNECT_BACKOFF)
-    const text = `账号 ${this.#describe(rt.record)} 连接失败（第 ${rt.retries} 次）：${errText(err)}；${Math.round(delay / 1000)} 秒后重试`
+    const suffix = limit > 0 ? `（第 ${rt.retries}/${limit} 次）` : `（第 ${rt.retries} 次）`
+    const text = `账号 ${this.#describe(rt.record)} 连接失败${suffix}：${errText(err)}；${Math.round(delay / 1000)} 秒后重试`
     // 对端长期不在线时不刷屏：首次与每 10 次一条 warn，其余降级到 debug
     if (rt.retries === 1 || rt.retries % WARN_EVERY === 0) this.#logger.warn(text)
     else this.#logger.debug(text)

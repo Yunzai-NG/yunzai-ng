@@ -49,6 +49,7 @@ import type { PluginHost } from "../plugin/host.js"
 import type { PluginMarket } from "../plugin/market.js"
 import type { SystemInfo } from "../platform/system.js"
 import type { ServerSink } from "../plugin/hooks.js"
+import { isLoopbackAddress } from "./auth.js"
 import { browseDirectory } from "./browse.js"
 import type { ManagedServer } from "./index.js"
 
@@ -66,6 +67,19 @@ const WRITE_SOURCE = "webui"
 
 /** 合法的日志级别，用于校验查询参数 */
 const LOG_LEVELS: readonly string[] = ["trace", "debug", "info", "warn", "error", "fatal", "silent"]
+
+/**
+ * 两次「把令牌打进日志」之间的最小间隔
+ *
+ * 这个端点是 `auth: false` 的，而 `auth: false` 在服务器那一层**同时**跳过了
+ * `checkAuth` 与 `checkForgeableBody`（见 `index.ts` 的 `#gate`）—— 于是一个跨站页面
+ * 可以向它发表单类 POST。响应体不带令牌（那是这个端点的第 3 条约定），故拿不到权限，
+ * 但不加节流就能靠反复请求把日志刷满、把真正有用的记录顶出滚动窗口。
+ *
+ * 10 秒：使用者点一下要等这么久是不合理的，故按钮那侧不受此限 —— 界面上点一次只发一次，
+ * 而人不会在 10 秒内需要两次。
+ */
+const REVEAL_COOLDOWN_MS = 10_000
 
 /** 一条面板 HTTP 端点的描述 */
 export interface ApiRoute {
@@ -378,6 +392,14 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
   const routes: ApiRoute[] = []
   const websockets: ApiWebSocket[] = []
 
+  /**
+   * 上一次把令牌打进日志的时刻，用于节流（见 `POST token/reveal`）
+   *
+   * 放在这一层而不是模块级：模块级的可变状态会在同进程内起两台服务器时相互串扰，
+   * 测试里正是这种用法。
+   */
+  let lastReveal = 0
+
   /** 只读模式下拦住写操作，见文件头第 2 条 */
   const requireWritable = (): void => {
     if (deps.config.get().server.readonly) {
@@ -555,6 +577,8 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
    * @param load 安装后是否立即加载
    * @param replace 目标已存在时是否覆盖
    * @param dependencies 是否顺带装依赖并跑索引声明的装后步骤
+   * @param fresh 覆盖时跳过就地拉取，直接整目录重下
+   * @param stash 就地拉取撞上本地改动时是否暂存；为假则那次更新原地中止
    * @returns 安装结果，附本次加载成功的插件名
    * @throws 安装失败时以 400 结束请求
    */
@@ -562,15 +586,27 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     name: string,
     load: boolean,
     replace: boolean,
-    dependencies: boolean
+    dependencies: boolean,
+    fresh = false,
+    stash = false
   ): Promise<Record<string, unknown>> => {
     const instance = market()
     let unloaded = false
     try {
       if (replace && deps.plugins.get(name) !== undefined) unloaded = await deps.plugins.unload(name)
-      const result = replace
-        ? await instance.update(name, { dependencies })
-        : await instance.install(name, { dependencies })
+      /*
+       * `fresh` 那一路直接调 `install(replace)`，绕开 `update()` 的就地拉取
+       *
+       * 目录被改花了、`reset --hard` 收不干净、或产物与源码对不上时要的正是「整份换掉」。
+       * 走 `update()` 达不到：它先试 `#tryPull`，而那条路成功时什么都不会重下。
+       *
+       * `stash` 只对就地拉取那一路有意义：整份重装根本不碰 git，那条路上目录连同改动
+       * 一起被替换掉 —— 那是「重装」这个词本来的意思，故不在此处多问一次。
+       */
+      let result
+      if (!replace) result = await instance.install(name, { dependencies })
+      else if (fresh) result = await instance.install(name, { replace: true, dependencies })
+      else result = await instance.update(name, { dependencies, stash })
       /*
        * 缺依赖或装后步骤失败时不加载
        *
@@ -611,6 +647,36 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     )
   })
 
+  /*
+   * 更新前的探测：会走哪条路、目录里有没有改动
+   *
+   * **GET 且不要求写权限**：它只读 git 的状态，一个字节都不改。只读模式下同样可用 ——
+   * 那时更新本身会被挡下，但「我这个目录到底改过没有」仍是个能回答的问题。
+   *
+   * 面板据此决定要不要弹那个必须回答的问句。**判据与执行同源**（`PluginMarket` 里的
+   * `#isDirty`），故不会出现「探测说干净、执行时却撞上改动」那种自相矛盾。
+   */
+  add("GET", "market/:name/update-probe", async req => {
+    const name = req.params.name ?? ""
+    try {
+      return await market().inspectUpdate(name)
+    } catch (err) {
+      throw fail(400, err instanceof Error ? err.message : String(err))
+    }
+  })
+
+  /*
+   * 更新，或整份重装
+   *
+   * 同一条路由而非两个端点：两者都是「把这个插件换成索引里那一份」，差别只在**允不允许
+   * 就地拉取**。`fresh` 为真时跳过拉取直接重下 —— 目录被改花了、或产物与源码对不上时
+   * 要的正是这个，而 `update()` 走得通拉取时永远不会重下。
+   *
+   * 缺省为假：就地拉取保住目录里那份 `node_modules`（动辄几十兆），是绝大多数更新该走的路。
+   *
+   * `stash` 缺省为假，故**不作答就撞不动改动过的目录** —— 从前这里无条件暂存，理由是
+   * 「留了副本」，但取回要懂 `git stash pop`，不懂的人只看到自己改的东西不见了。
+   */
   add("POST", "market/:name/update", async req => {
     requireWritable()
     const name = req.params.name ?? ""
@@ -619,7 +685,9 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
       name,
       optionalBoolean(body, "load") ?? true,
       true,
-      optionalBoolean(body, "dependencies") ?? true
+      optionalBoolean(body, "dependencies") ?? true,
+      optionalBoolean(body, "fresh") ?? false,
+      optionalBoolean(body, "stash") ?? false
     )
   })
 
@@ -818,6 +886,53 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     if (keyword !== undefined && keyword !== "") query.keyword = keyword
     return { file: deps.loggerHub.file, level: deps.loggerHub.level, records: deps.loggerHub.tail(query) }
   })
+
+  /*
+   * 把当前令牌打进日志
+   *
+   * 为「首次打开面板、令牌抄丢了」这一种处境而存在：令牌恒被生成（见 `ensureToken`），
+   * 而使用者此刻正被令牌页挡在外面，无从用面板里的任何功能去查看它。
+   *
+   * 三条约定，缺一条这个端点就成了漏洞：
+   *
+   * 1. **`auth: false`** —— 需要它的人恰恰是没有令牌的人。带令牌才能调等于没有这个功能。
+   * 2. **只放行回环对端**，判据与 `checkAuth` 无令牌那一路同一个 `isLoopbackAddress`，
+   *    且服务器强制 `trustProxy: false`，故 `X-Forwarded-For` 伪造不了。
+   * 3. **响应体一个字节都不带令牌。** 这是与「显示到界面上」的分界：`auth: false` 意味着
+   *    使用者浏览器里的任何页面都能发出这个请求（跨站也可，它不触发预检），若响应里带着
+   *    令牌，那个页面就取到了面板的全部写权限。写进日志则读日志本身另需权限（终端或文件
+   *    系统），跨站脚本读不到。
+   *
+   * 因此它是 POST 而非 GET：语义上这是「产生一条日志」的动作，不是读取。
+   *
+   * **另加一道节流。** `auth: false` 不只跳过 `checkAuth`，也跳过 `checkForgeableBody`
+   * （见 `ManagedServer` 的路由前置钩子）—— 于是一个跨站页面能向这里发不触发预检的表单
+   * POST。它读不到响应、也拿不到令牌，但能把日志刷满一串令牌行。节流后最坏情形是每
+   * `REVEAL_COOLDOWN_MS` 多一行，而使用者手动点两次的间隔本就远大于此。
+   */
+  add(
+    "POST",
+    "token/reveal",
+    req => {
+      if (!isLoopbackAddress(req.ip)) {
+        return { status: 403, body: { error: "只有本机可以请求把令牌打进日志" } }
+      }
+      const now = Date.now()
+      if (now - lastReveal < REVEAL_COOLDOWN_MS) {
+        return { status: 429, body: { error: "刚刚已经打过一次，请查看日志；稍后可再试" } }
+      }
+      lastReveal = now
+      const token = deps.config.get().server.token
+      if (token === undefined || token === "") {
+        deps.logger.warn("面板请求显示访问令牌，但当前未设置令牌 —— 此时无需令牌即可进入")
+        return { ok: true, hasToken: false }
+      }
+      deps.logger.warn(`面板访问令牌：${token}`)
+      deps.logger.warn("这一行由「发送到日志」按钮打出。令牌亦存于配置项 server.token")
+      return { ok: true, hasToken: true }
+    },
+    { auth: false }
+  )
 
   // 实时日志：只推此后新产生的记录，历史请走 GET logs（见文件头第 4 条）。
   // 过滤条件放在握手的查询串里而不是靠客户端发一帧配置过来 —— 后者存在

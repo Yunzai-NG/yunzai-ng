@@ -534,16 +534,23 @@ describe("ManagedServer", () => {
   })
 
   describe("生命周期", () => {
-    it("非本机监听时自动生成并落盘令牌，本机则不生成", async () => {
+    // 本机也生成：早先只在监听地址对外时生成，那让本机部署处在没有门的状态 ——
+    // 使用者浏览器里的任何页面都能向 127.0.0.1 发请求，而那是面板的全部写权限
+    it("自动生成并落盘令牌，只监听本机时亦然", async () => {
+      expect(config.get().server.host).toBe("127.0.0.1")
       await server.ensureToken()
-      expect(config.get().server.token).toBeUndefined()
 
-      await config.patch({ server: { host: "0.0.0.0" } }, "api")
-      await server.ensureToken()
       const token = config.get().server.token
       expect(typeof token).toBe("string")
-      expect((token ?? "").length).toBeGreaterThanOrEqual(16)
+      // 恰好 16 位字母数字：这串东西要从日志里抄进浏览器，见 generateToken
+      expect(token).toMatch(/^[A-Za-z0-9]{16}$/)
       expect(logger.lines.some(line => line.startsWith("warn") && line.includes(token ?? "!"))).toBe(true)
+    })
+
+    it("已有令牌时不覆盖 —— 使用者自己设的那一个说了算", async () => {
+      await config.patch({ server: { token: "kept-by-the-user" } }, "api")
+      await server.ensureToken()
+      expect(config.get().server.token).toBe("kept-by-the-user")
     })
 
     it("close 幂等，且关闭后不能再注册", async () => {

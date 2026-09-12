@@ -75,6 +75,35 @@ function quietLogger(): Logger {
 }
 
 /**
+ * 会留痕的日志器
+ *
+ * 与 `quietLogger` 分开而不是给后者加个数组：那一个被服务器与配置仓库共用，它们在每个用例里
+ * 都会写好几行，混进来之后「日志里有没有那一行」这类断言得先在一堆无关的行里筛。
+ * @param lines 收集到的行，形如 `warn:内容`
+ * @returns 日志器
+ */
+function recordingLogger(lines: string[]): Logger {
+  const at =
+    (level: string) =>
+    (...args: unknown[]): void => {
+      lines.push(`${level}:${args.map(a => String(a)).join(" ")}`)
+    }
+  const logger: Logger = {
+    level: "trace" as LogLevel,
+    trace: at("trace"),
+    debug: at("debug"),
+    info: at("info"),
+    warn: at("warn"),
+    error: at("error"),
+    fatal: at("fatal"),
+    mark: at("mark"),
+    child: () => logger,
+    isLevelEnabled: () => true
+  }
+  return logger
+}
+
+/**
  * 造一条账号记录
  * @param id 记录 id
  * @returns 记录
@@ -123,6 +152,8 @@ interface Spies {
     install: ReturnType<typeof vi.fn>
     /** 更新 */
     update: ReturnType<typeof vi.fn>
+    /** 更新前的探测：会不会就地拉取、目录里有没有改动 */
+    inspectUpdate: ReturnType<typeof vi.fn>
     /** 单独重跑装依赖与装后步骤 */
     setup: ReturnType<typeof vi.fn>
     /** 卸载 */
@@ -203,9 +234,12 @@ describe("面板 API", () => {
   let spies: Spies
   let deps: ApiDeps
   let off: () => void
+  /** API 自己打出的日志行，供「令牌写进日志」一类断言查看 */
+  let logLines: string[]
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "yzng-api-"))
+    logLines = []
     const logger = quietLogger()
     store = new ConfigStore({ dir, logger, watch: false })
     config = await defineCoreConfig(store)
@@ -273,6 +307,9 @@ describe("面板 API", () => {
           packageManager: "pnpm",
           ranScripts: ["build"]
         })),
+        // 缺省是「会就地拉取、目录干净」：那是绝大多数插件的常态，
+        // 要验有改动那一路的用例自行 mockResolvedValueOnce 覆盖
+        inspectUpdate: vi.fn(async () => ({ willPull: true, dirty: false })),
         remove: vi.fn(async (name: string) => name === "demo")
       },
       accounts: {
@@ -313,7 +350,7 @@ describe("面板 API", () => {
       version: "9.9.9",
       paths: { home: dir, config: dir, data: dir, logs: dir, temp: dir, plugins: dir } as unknown as RuntimePaths,
       platform: detectPlatform(),
-      logger: quietLogger(),
+      logger: recordingLogger(logLines),
       config,
       configStore: store,
       loggerHub: {
@@ -715,6 +752,57 @@ describe("面板 API", () => {
     })
   })
 
+  /*
+   * 这一组钉的是「发送到日志」那枚钮背后的端点，三条约定逐条钉住
+   *
+   * 它是全站唯一一个 `auth: false` 又碰得到令牌的地方，故每一条都得有用例看着：
+   * 少了「响应不带令牌」那条，日后有人为了「让界面显示出来」把它加进响应体，
+   * 而那等于把面板的全部写权限交给使用者浏览器里的任何一个页面。
+   */
+  describe("把令牌打进日志", () => {
+    it("写进日志，但响应体一个字节都不带令牌", async () => {
+      await config.patch({ server: { token: "SecretTokenAbc123" } }, "api")
+
+      const res = await call("POST", "token/reveal")
+      expect(res.statusCode).toBe(200)
+      expect(res.json()).toEqual({ ok: true, hasToken: true })
+      // 整个响应体里都不该出现令牌，连 header 之外的任何字段都不行
+      expect(res.body).not.toContain("SecretTokenAbc123")
+      expect(logLines.some(line => line.startsWith("warn") && line.includes("SecretTokenAbc123"))).toBe(true)
+    })
+
+    it("不带令牌也能调 —— 需要它的人恰恰是没有令牌的那个", async () => {
+      await config.patch({ server: { token: "SecretTokenAbc123" } }, "api")
+      // call() 不带任何鉴权头；若这个端点要求令牌，它就对被挡在门外的人毫无用处
+      expect((await call("POST", "token/reveal")).statusCode).toBe(200)
+    })
+
+    it("非本机对端一律 403", async () => {
+      const res = await server.raw.inject({
+        method: "POST",
+        url: `${API_SCOPE}/token/reveal`,
+        remoteAddress: "10.0.0.9"
+      })
+      expect(res.statusCode).toBe(403)
+      expect(logLines.some(line => line.includes("SecretTokenAbc123"))).toBe(false)
+    })
+
+    it("节流：连着两次的第二次给 429，日志里只多一行", async () => {
+      await config.patch({ server: { token: "SecretTokenAbc123" } }, "api")
+
+      expect((await call("POST", "token/reveal")).statusCode).toBe(200)
+      const again = await call("POST", "token/reveal")
+      expect(again.statusCode).toBe(429)
+      expect(logLines.filter(line => line.includes("SecretTokenAbc123")).length).toBe(1)
+    })
+
+    it("未设令牌时说明「留空即可进入」，而不是假装打了一行", async () => {
+      const res = await call("POST", "token/reveal")
+      expect(res.statusCode).toBe(200)
+      expect(res.json()).toEqual({ ok: true, hasToken: false })
+    })
+  })
+
   describe("插件市场", () => {
     it("列出索引，refresh=1 时强制刷新", async () => {
       const res = await call("GET", "market")
@@ -750,7 +838,7 @@ describe("面板 API", () => {
       expect(spies.market.install).toHaveBeenLastCalledWith("fresh", { dependencies: false })
 
       await call("POST", "market/demo/update", { dependencies: false })
-      expect(spies.market.update).toHaveBeenLastCalledWith("demo", { dependencies: false })
+      expect(spies.market.update).toHaveBeenLastCalledWith("demo", { dependencies: false, stash: false })
     })
 
     /*
@@ -817,9 +905,66 @@ describe("面板 API", () => {
       const res = await call("POST", "market/demo/update", {})
       expect(res.statusCode).toBe(200)
       expect(spies.plugins.unload).toHaveBeenCalledWith("demo")
-      expect(spies.market.update).toHaveBeenCalledWith("demo", { dependencies: true })
+      // stash 缺省为假：撞上本地改动时内核中止并交回决定权，面板据此弹一个必须回答的问句
+      expect(spies.market.update).toHaveBeenCalledWith("demo", { dependencies: true, stash: false })
       expect(res.json().unloaded).toBe(true)
       expect(res.json().version).toBe("2.0.0")
+    })
+
+    /*
+     * `fresh` 走 install(replace) 而非 update()
+     *
+     * 这一条只能由用例钉住：两条路的返回值形状相同，从接口回值上看不出走了哪条。
+     * 而差别是决定性的 —— `update()` 先试就地拉取，那条路成功时一个字节都不会重下，
+     * 于是「重装」在目录被改花、产物与源码对不上时什么都修不了。
+     */
+    it("重装（fresh）跳过就地拉取，直接整目录重下", async () => {
+      const res = await call("POST", "market/demo/update", { fresh: true })
+      expect(res.statusCode).toBe(200)
+      expect(spies.plugins.unload).toHaveBeenCalledWith("demo")
+      expect(spies.market.update).not.toHaveBeenCalled()
+      expect(spies.market.install).toHaveBeenCalledWith("demo", { replace: true, dependencies: true })
+    })
+
+    /*
+     * 同意暂存那一路把 `stash` 原样传下去
+     *
+     * 这一条与上面那条缺省为假的用例是一对：两者合起来钉住「问过才暂存」。少了任一条，
+     * 一次「缺省翻回真」的改动都不会让用例变红，而症状是使用者的改动在他没答应的情况下
+     * 进了 stash —— 那正是这次改动要消除的行为。
+     */
+    it("同意暂存时把 stash 传给内核", async () => {
+      const res = await call("POST", "market/demo/update", { stash: true })
+      expect(res.statusCode).toBe(200)
+      expect(spies.market.update).toHaveBeenCalledWith("demo", { dependencies: true, stash: true })
+    })
+
+    /*
+     * 探测端点：先问「会不会撞上改动」，再决定要不要弹那个问句
+     *
+     * 没有它的话，面板只能无条件先弹一次询问 —— 而绝大多数更新的目录是干净的，
+     * 那一问纯属白问；或者先发一次注定失败的更新，靠错误文本反推，那是把可预料的
+     * 分支做成了异常流程。
+     */
+    it("探测更新前的状况：回「会不会就地拉取」与「有没有改动」", async () => {
+      // 覆盖替身的缺省（干净目录）：这一条要验的正是「有改动」那一项也原样带回
+      spies.market.inspectUpdate.mockResolvedValueOnce({ willPull: true, dirty: true })
+      const res = await call("GET", "market/demo/update-probe")
+      expect(res.statusCode).toBe(200)
+      expect(spies.market.inspectUpdate).toHaveBeenCalledWith("demo")
+      expect(res.json()).toMatchObject({ willPull: true, dirty: true })
+    })
+
+    it("探测不需要写权限 —— 它一个字节都不改", async () => {
+      const res = await call("GET", "market/demo/update-probe")
+      expect(res.statusCode).toBe(200)
+    })
+
+    it("探测失败回 400，原因原样带回", async () => {
+      spies.market.inspectUpdate.mockRejectedValueOnce(new Error("插件名不合法：../x"))
+      const res = await call("GET", "market/..x/update-probe")
+      expect(res.statusCode).toBe(400)
+      expect(String(res.json().error)).toContain("不合法")
     })
 
     it("卸载先摘内存再删目录，目录不存在回 404", async () => {

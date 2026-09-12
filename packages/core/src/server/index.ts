@@ -42,14 +42,7 @@ import type { CoreConfigHandle } from "../config/core-config.js"
 import type { ServerSink } from "../plugin/hooks.js"
 import { createSeqFactory } from "../util/id.js"
 import { formatBytes } from "../util/duration.js"
-import {
-  WS_PROTOCOL,
-  checkAuth,
-  checkForgeableBody,
-  generateToken,
-  isLocalHost,
-  type AuthRequest
-} from "./auth.js"
+import { WS_PROTOCOL, checkAuth, checkForgeableBody, generateToken, type AuthRequest } from "./auth.js"
 import { resolveStaticFile, type StaticMount } from "./files.js"
 import { HTTP_METHODS, PathTable, isHttpMethod, joinPattern, splitSegments, type PathHit } from "./table.js"
 
@@ -749,23 +742,26 @@ export class ManagedServer implements ServerSink {
   }
 
   /**
-   * 非本机监听时确保有访问令牌
+   * 确保有访问令牌，没有就生成一个并落盘
    *
-   * 只监听本机就不生成 —— 单机用户不该为了打开面板先去配置文件里抄一串随机字符。
-   * 一旦监听地址对外，没有令牌等于把配置写权限公开，所以这里**自动生成并落盘**，
-   * 而不是只打一句警告了事。
+   * **不再区分是否只监听本机。** 早先只在监听地址对外时生成，理由是「单机用户不该为了
+   * 打开面板先去抄一串随机字符」。但那让本机部署处在一种没有门的状态：`checkAuth` 在
+   * 无令牌时放行一切回环请求，而「本机」并不等于「可信」—— 使用者浏览器里的任何一个
+   * 页面都能向 `127.0.0.1:2536` 发请求，那正是面板的全部写权限。
+   *
+   * 代价是首次启动多一步：从日志里把令牌抄进面板。故令牌取 16 位字母数字而非 32 位
+   * base64url（见 `generateToken`），且面板的令牌页留了一枚「发送到日志」以便重看。
    * @returns 完成时 resolve
    */
   async ensureToken(): Promise<void> {
     const cfg = this.#config.get().server
     if (cfg.token !== undefined && cfg.token !== "") return
-    if (isLocalHost(cfg.host)) return
 
     const token = generateToken()
     await this.#config.patch({ server: { token } }, "api")
     // 明文输出一次是必要的：使用者此时即需以其登录面板，且它本已写入配置文件
-    this.#logger.warn(`面板监听于 ${cfg.host}，已自动生成访问令牌：${token}`)
-    this.#logger.warn("该令牌已写入配置项 server.token，可随时自行修改")
+    this.#logger.warn(`已自动生成面板访问令牌：${token}`)
+    this.#logger.warn("首次打开面板须填入它。该令牌已写入配置项 server.token，可随时自行修改")
   }
 
   /**

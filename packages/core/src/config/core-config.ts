@@ -276,6 +276,27 @@ export const coreConfigSchema = s.object({
     .group("渲染")
     .order(70),
 
+  adapter: s
+    .object({
+      reconnectLimit: s
+        .number()
+        .int()
+        .min(0)
+        .max(1000)
+        .default(0)
+        .title("重连次数上限")
+        .desc(
+          "账号断线后最多连续重试多少次，超过即停在离线状态，等人工点「重连」。" +
+            "0 为一直重试（此前的行为）。" +
+            "连上一次就归零，故这个数说的是「连续失败多少次」而不是「一生总共重试多少次」。" +
+            "设一个上限的意义在于：号被封、配置填错这类失败重试一万次也是同样的结果，" +
+            "而无休止的重试会让日志里真正要看的东西被刷走。"
+        )
+    })
+    .title("适配器")
+    .group("适配器")
+    .order(75),
+
   net: s
     .object({
       proxy: s

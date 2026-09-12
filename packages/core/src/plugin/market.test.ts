@@ -386,6 +386,50 @@ describe("PluginMarket 索引", () => {
     expect((await h.market.list()).plugins[0]?.installed).toBe(true)
   })
 
+  /*
+   * 「可更新」的三种判法各验一遍
+   *
+   * 面板的市场页据此出一个「可更新」页签。三条里最要紧的是「读不到版本时不算可更新」——
+   * 那时无从比较，而标成可更新会让人点一次更新去换一个同样的东西。
+   */
+  it("已装版本低于索引时标为可更新", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: INDEX } })
+    await mkdir(join(h.pluginsDir, "demo"), { recursive: true })
+    await writeFile(join(h.pluginsDir, "demo", "package.json"), JSON.stringify({ version: "0.9.0" }), "utf8")
+
+    expect((await h.market.list()).plugins[0]).toMatchObject({
+      installed: true,
+      installedVersion: "0.9.0",
+      updatable: true
+    })
+  })
+
+  it("已装版本不低于索引时不算可更新", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: INDEX } })
+    await mkdir(join(h.pluginsDir, "demo"), { recursive: true })
+    await writeFile(join(h.pluginsDir, "demo", "package.json"), JSON.stringify({ version: "1.0.0" }), "utf8")
+
+    expect((await h.market.list()).plugins[0]).toMatchObject({ installedVersion: "1.0.0", updatable: false })
+  })
+
+  it("已装但读不到版本时不给 installedVersion，也不算可更新", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: INDEX } })
+    // 目录在、没有 package.json：手工放进来的插件常是这样
+    await mkdir(join(h.pluginsDir, "demo"), { recursive: true })
+
+    const item = (await h.market.list()).plugins[0]
+    expect(item?.installed).toBe(true)
+    expect(item?.installedVersion).toBeUndefined()
+    expect(item?.updatable).toBe(false)
+  })
+
+  it("未装时不去读版本，updatable 为假", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: INDEX } })
+    const item = (await h.market.list()).plugins[0]
+    expect(item?.installedVersion).toBeUndefined()
+    expect(item?.updatable).toBe(false)
+  })
+
   it("缓存未过期时不再发请求，force 才重新获取", async () => {
     const h = await makeHarness({ "https://example.com/index.json": { json: INDEX } })
 
@@ -699,12 +743,32 @@ describe("PluginMarket 就地拉取", () => {
     expect(h.logger.lines.some(line => line.includes("已就地更新"))).toBe(false)
   })
 
-  it("工作区有改动时先 stash 再 reset，且给出取回办法", async () => {
+  /*
+   * 有改动而未获同意时**原地中止**
+   *
+   * 从前这里无条件暂存，理由是「留了副本，可取回」—— 但取回要懂 `git stash pop`，
+   * 不懂的人只看到自己改的东西不见了。这一条钉住两件事：抛错，且**目录未被动过**
+   * （`reset` 一次都没跑）。后者是「重来一次没有代价」的凭据。
+   */
+  it("有改动而未同意暂存时中止，目录一个字节都没动", async () => {
     const git = stubGit({ status: " M index.js\n?? 我的笔记.txt\n" })
     const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, git.run)
     await makeGitRepo(h.pluginsDir)
 
-    await h.market.update("demo")
+    await expect(h.market.update("demo")).rejects.toThrow("未提交的改动")
+
+    const cmds = git.cmds()
+    expect(cmds).not.toContain("stash")
+    expect(cmds).not.toContain("reset")
+    expect(cmds).not.toContain("fetch")
+  })
+
+  it("同意暂存时先 stash 再 reset，且给出取回办法", async () => {
+    const git = stubGit({ status: " M index.js\n?? 我的笔记.txt\n" })
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, git.run)
+    await makeGitRepo(h.pluginsDir)
+
+    const result = await h.market.update("demo", { stash: true })
 
     const cmds = git.cmds()
     // 次序即安全性：reset --hard 会覆盖工作区，暂存必须发生在它之前
@@ -714,6 +778,43 @@ describe("PluginMarket 就地拉取", () => {
     // 未跟踪的文件更可能是使用者自己放进去的，一并收走
     expect(stash?.args.slice(0, 3)).toEqual(["stash", "push", "--include-untracked"])
     expect(h.logger.lines.some(line => line.includes("git stash pop"))).toBe(true)
+    // 面板据此说「你的改动在 stash 里」—— 日志里那句话多数人不会去看
+    expect(result.stashed).toBe(true)
+  })
+
+  /*
+   * 探测：面板据此决定要不要问
+   *
+   * 与执行**同一个判据**（`#isDirty`）。分两处写迟早分叉，而症状恰是这次要消除的
+   * 那一个：面板问都没问就暂存了。
+   */
+  it("探测给出「会不会就地拉取」与「有没有改动」", async () => {
+    const dirtyGit = stubGit({ status: " M index.js\n" })
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, dirtyGit.run)
+    await makeGitRepo(h.pluginsDir)
+
+    expect(await h.market.inspectUpdate("demo")).toEqual({ willPull: true, dirty: true })
+  })
+
+  it("探测：工作区干净时 dirty 为假", async () => {
+    const git = stubGit({ status: "" })
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, git.run)
+    await makeGitRepo(h.pluginsDir)
+
+    expect(await h.market.inspectUpdate("demo")).toEqual({ willPull: true, dirty: false })
+  })
+
+  /*
+   * 不是 git 仓库时 `dirty` 恒为假
+   *
+   * 那条路是整目录重装，根本不碰 git —— 报「有改动」却给不出「可以暂存」只会让人困惑。
+   */
+  it("探测：目录不是 git 仓库时 willPull 与 dirty 都为假", async () => {
+    const git = stubGit({ status: " M index.js\n" })
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, git.run)
+    await mkdir(join(h.pluginsDir, "demo"), { recursive: true })
+
+    expect(await h.market.inspectUpdate("demo")).toEqual({ willPull: false, dirty: false })
   })
 
   it("工作区干净时不 stash", async () => {

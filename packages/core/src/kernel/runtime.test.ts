@@ -331,6 +331,49 @@ describe("适配器生命周期", () => {
     expect(mock.driver.disconnects).toBe(1)
   })
 
+  it("重连次数达到上限后停止自动重连，并把原因说清", async () => {
+    // 上限取 1：第一次失败排一次重试（退避基数 2 秒），那一次再失败即超限
+    const { app } = await boot("adapter:\n  reconnectLimit: 1\n", { failConnect: "Mock 就是不让连" })
+    const record = await app.runtime.accounts.create("mock", { selfId: "10000" })
+
+    const gaveUp = async (): Promise<string | undefined> =>
+      app.loggerHub.tail({ level: "warn" }).find(r => r.msg.includes("停止自动重连"))?.msg
+
+    // 退避是 2 秒起步带抖动，故给足余量；这里等的是「放弃」那一条日志
+    await vi.waitFor(async () => expect(await gaveUp()).toBeDefined(), { timeout: 10_000, interval: 100 })
+
+    const line = (await gaveUp()) ?? ""
+    // 三样都要有：上限值、最后一次的错误、以及怎么恢复 —— 少了最后一样，
+    // 使用者看到的就是「账号一直离线且日志再无动静」
+    expect(line).toContain("已达 1 次")
+    expect(line).toContain("Mock 就是不让连")
+    expect(line).toContain("adapter.reconnectLimit")
+
+    // 状态留在 error 上，不改成别的：面板上仍要显示「连不上，最后的错误是什么」
+    expect(app.runtime.accounts.get(record.id)?.status).toBe("error")
+    expect(app.runtime.accounts.get(record.id)?.retries).toBeGreaterThan(1)
+  }, 15_000)
+
+  it("手动重连把失败计数归零 —— 否则达到上限后那个按钮点了没反应", async () => {
+    const { app } = await boot("adapter:\n  reconnectLimit: 1\n", { failConnect: "Mock 就是不让连" })
+    const record = await app.runtime.accounts.create("mock", { selfId: "10000" })
+
+    await vi.waitFor(
+      () => expect(app.runtime.accounts.get(record.id)?.retries ?? 0).toBeGreaterThan(1),
+      { timeout: 10_000, interval: 100 }
+    )
+
+    // `retries` 只在连接成功那一刻归零（见 accounts.ts 的 #doConnect），故手动入口必须自己清 ——
+    // 不清的话这次手动连接一失败就又判超限，而使用者刚刚才明确要求「再试一次」
+    await app.runtime.accounts.reconnect(record.id).catch(() => undefined)
+    expect(app.runtime.accounts.get(record.id)?.retries).toBe(1)
+  }, 15_000)
+
+  it("上限缺省为 0，即一直重连（此前唯一的行为）", async () => {
+    const { app } = await boot()
+    expect(app.config.get().adapter.reconnectLimit).toBe(0)
+  })
+
   it("账号被 disable 后事件不再进管线", async () => {
     const { app, mock } = await boot()
     const id = await login(app)

@@ -19,7 +19,7 @@
  *          已写进它的配置说明。
  */
 import type { Disposer, Logger } from "@yunzai-ng/types"
-import { AccountManager } from "../adapter/accounts.js"
+import { AccountManager, type RetryPolicyView } from "../adapter/accounts.js"
 import { BotRegistry, type SendPolicyView } from "../adapter/bots.js"
 import { createAdapterHostFactory } from "../adapter/host.js"
 import { LoginManager } from "../adapter/login.js"
@@ -167,6 +167,23 @@ function sendPolicyOf(config: CoreConfigHandle): SendPolicyView {
 }
 
 /**
+ * 造一份"活的"重连策略视图
+ *
+ * 与 `sendPolicyOf` 同一个道理，用 getter 而非快照：面板上把上限从 10 改成 0（一直重连），
+ * 下一次失败就按新值判 —— 缓存成快照的话得重启才生效，而使用者调这一项往往正是因为
+ * 眼前某个账号已经放弃重连了。
+ * @param config 内核配置句柄
+ * @returns 重连策略视图
+ */
+function retryPolicyOf(config: CoreConfigHandle): RetryPolicyView {
+  return {
+    get maxRetries(): number {
+      return config.get().adapter.reconnectLimit
+    }
+  }
+}
+
+/**
  * 装配全部运行期子系统，并把它们填进内核接缝
  *
  * 构造顺序按依赖来：管线（内层）→ 调度器与渲染（旁挂）→ 适配器与账号（外层，
@@ -230,7 +247,8 @@ export function installRuntime(deps: RuntimeDeps): RuntimeParts {
     bots,
     createHost,
     events,
-    sendPolicy: sendPolicyOf(config)
+    sendPolicy: sendPolicyOf(config),
+    retryPolicy: retryPolicyOf(config)
   })
   const logins = new LoginManager({
     logger,
