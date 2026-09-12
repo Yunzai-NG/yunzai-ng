@@ -251,7 +251,9 @@ describe("面板 API", () => {
           {
             name: "demo",
             version: "1.0.0",
-            root: "/p/demo",
+            // 必须真落在 paths.plugins 底下：市场那几条路由按**目录**认插件（见 api.ts 的
+            // pluginInDir），root 随手写成 /p/demo 的替身会让「该不该卸载」一律判成否
+            root: join(dir, "demo"),
             status: "loaded",
             loadCost: 12,
             commands: 3,
@@ -1018,6 +1020,89 @@ describe("面板 API", () => {
       const missing = await call("DELETE", "market/无名")
       expect(missing.statusCode).toBe(404)
       expect(spies.plugins.unload).not.toHaveBeenCalled()
+    })
+
+    /*
+     * 目录名与声明名不同名时，卸载按**目录**认插件
+     *
+     * 真实例子：中转站签到插件的目录（也是索引条目名）叫 `relay-checkin-plugin`，而它自己
+     * `definePlugin({ name: "relay-checkin" })`。按名字卸载会错向两个相反的方向，且都不报错 ——
+     * 这一条钉住「该卸的卸了」，下一条钉住「不该卸的没卸」。
+     */
+    it("更新时按目录认插件，卸的是目录里那个而非同名那个", async () => {
+      spies.plugins.list.mockReturnValue([
+        { name: "relay-checkin", version: "1.1.0", root: join(dir, "relay-checkin-plugin"), status: "loaded" }
+      ])
+      spies.plugins.get.mockImplementation((name: string) =>
+        name === "relay-checkin" ? { name, status: "loaded" } : undefined
+      )
+
+      const res = await call("POST", "market/relay-checkin-plugin/update", {})
+      expect(res.statusCode).toBe(200)
+      expect(spies.plugins.unload).toHaveBeenCalledWith("relay-checkin")
+      expect(spies.market.update).toHaveBeenCalledWith("relay-checkin-plugin", { dependencies: true, stash: false })
+    })
+
+    /*
+     * 拿声明名请求时早早挡下，且**一个插件都不卸**
+     *
+     * 这是一条真实发生过的缺陷：面板列表显示声明名、管理动作也拿它去请求，于是内核先把
+     * `relay-checkin` 卸掉（那个名字在宿主里恰好存在），再去索引里找 `relay-checkin` 找不到
+     * 而抛错 —— 插件从列表里凭空消失，目录却一个字节都没动，而错误文本说的是「市场里没有
+     * 这个插件」，把人引向「市场是不是坏了」。
+     */
+    it("拿声明名当目录名请求更新：回 400 说该用哪个名字，且不卸载", async () => {
+      spies.plugins.list.mockReturnValue([
+        { name: "relay-checkin", version: "1.1.0", root: join(dir, "relay-checkin-plugin"), status: "loaded" }
+      ])
+
+      const res = await call("POST", "market/relay-checkin/update", {})
+      expect(res.statusCode).toBe(400)
+      expect(String(res.json().error)).toContain("relay-checkin-plugin")
+      expect(spies.plugins.unload).not.toHaveBeenCalled()
+      expect(spies.market.update).not.toHaveBeenCalled()
+    })
+
+    /*
+     * 失败之后把插件装回来
+     *
+     * 卸载发生在动手**之前**，而「有本地改动且未同意暂存」是内核刻意的中止路径 ——
+     * 对使用者的承诺是「目录停在原样」。少了这一手，那句承诺只对了一半：目录确实没动，
+     * 插件却停了，而界面上只有一句关于改动的错误，看不出插件已经不在。
+     */
+    it("更新失败时把先前卸掉的插件装回来", async () => {
+      spies.market.update.mockRejectedValueOnce(new Error("插件 demo 的目录内有未提交的改动"))
+      const res = await call("POST", "market/demo/update", {})
+      expect(res.statusCode).toBe(400)
+      expect(String(res.json().error)).toContain("未提交的改动")
+      expect(spies.plugins.unload).toHaveBeenCalledWith("demo")
+      expect(spies.plugins.reload).toHaveBeenCalledWith("demo")
+    })
+
+    // 安装（replace 为假）压根不卸载，失败时自然也没什么可装回来的
+    it("没卸载过就不必装回来", async () => {
+      spies.market.install.mockRejectedValueOnce(new Error("取源失败"))
+      const res = await call("POST", "market/install", { name: "fresh" })
+      expect(res.statusCode).toBe(400)
+      expect(spies.plugins.reload).not.toHaveBeenCalled()
+    })
+
+    // 另外两条也走同一个目录判据：少改一处的表现是「产物换了而旧模块还在响应命令」
+    it("装依赖并编译、删除目录同样按目录认插件", async () => {
+      spies.plugins.list.mockReturnValue([
+        { name: "relay-checkin", version: "1.1.0", root: join(dir, "relay-checkin-plugin"), status: "loaded" }
+      ])
+      spies.plugins.get.mockImplementation((name: string) =>
+        name === "relay-checkin" ? { name, status: "loaded" } : undefined
+      )
+
+      expect((await call("POST", "market/relay-checkin-plugin/setup", {})).statusCode).toBe(200)
+      expect(spies.plugins.unload).toHaveBeenCalledWith("relay-checkin")
+
+      spies.plugins.unload.mockClear()
+      spies.market.remove.mockResolvedValueOnce(true)
+      expect((await call("DELETE", "market/relay-checkin-plugin")).statusCode).toBe(200)
+      expect(spies.plugins.unload).toHaveBeenCalledWith("relay-checkin")
     })
 
     it("未启用市场的部署一律回 501", async () => {

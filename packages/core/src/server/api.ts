@@ -16,6 +16,7 @@
  *          历史日志与实时日志分两条路。合成一条时「握手瞬间同步发出的那一帧」在部分客户端会丢，
  *          历史缺一段而无人察觉。
  */
+import { basename, dirname, resolve } from "node:path"
 import type {
   AccountRetryOverride,
   AccountState,
@@ -639,12 +640,58 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
   }
 
   /**
+   * 找出装在 `plugins/<dir>` 里的那个插件的**声明名**
+   *
+   * 市场的寻址单位是**安装目录**（`joinWithin(pluginsDir, name)`），插件宿主的寻址单位是
+   * `definePlugin({ name })` 里那个**声明名**。两者常常不同 —— 索引条目 `relay-checkin-plugin`
+   * 取的是仓库名，而插件自己声明 `relay-checkin`。把目录名直接交给 `plugins.unload()`
+   * 会得到两种相反的错，且都不报错：
+   *
+   * - **该卸的没卸**：目录里的代码换掉了，内存里那份旧模块还在响应命令
+   * - **不该卸的被卸**：另一个恰好与目录同名的插件凭空消失
+   *
+   * 按**目录**比对而非按名字，故单文件插件不会被误认 —— 它们的 `root` 就是 `plugins/`
+   * 本身，不是任何一个安装目录。
+   * @param dir 安装目录名
+   * @returns 声明名；该目录下没有已知插件时 undefined
+   */
+  const pluginInDir = (dir: string): string | undefined => {
+    const root = resolve(deps.paths.plugins)
+    const target = resolve(root, dir)
+    // 只认 plugins 的直接子目录：空串、`..` 之类都在此挡下
+    if (dirname(target) !== root) return undefined
+    return deps.plugins.list().find(state => state.root !== "" && resolve(state.root) === target)?.name
+  }
+
+  /**
+   * 失败之后把先前卸掉的那个插件装回来
+   *
+   * 卸载发生在**动手之前**，而失败并不意味着目录变了：索引里没有这个名字、`minCore`
+   * 不满足、以及「有本地改动而未同意暂存」这三种情形下，目录一个字节都没动，把插件
+   * 留在已卸载状态纯属牵连。最后那种尤其要紧 —— 它是刻意设计的中止路径，对使用者的
+   * 承诺是「目录停在原样」，而在此之前插件其实已经停了。
+   *
+   * 取源途中失败（网络断在半路、`reset` 只应用了一部分）时目录可能已变，此时装回来
+   * 同样是最优解：装上的要么是他原有那份、要么是新代码，都好过一个悄无声息消失的插件。
+   *
+   * 装不回来只记日志不改写错误：此刻要报给使用者的是**原本那个失败**，用一句
+   * 「重载失败」盖掉它，等于把人引向错误的方向。
+   * @param name 先前卸掉的插件声明名
+   * @param unloaded 当时是否确实卸掉了
+   */
+  const restore = async (name: string | undefined, unloaded: boolean): Promise<void> => {
+    if (!unloaded || name === undefined) return
+    const back = await deps.plugins.reload(name).catch(() => false)
+    if (!back) deps.logger.warn(`插件 ${name} 在一次失败的市场操作后没能装回来，可在插件页手动重载`)
+  }
+
+  /**
    * 安装或更新一个市场插件，并按需加载
    *
    * 更新前先卸载：旧版本的模块若留在内存中，其注册的命令仍会响应，而磁盘上已是
    * 新版本代码，两者不一致。失败一律折成 400 —— 名称、版本、网络与归档内容的问题
    * 都由请求方的输入或环境决定，不是服务端故障。
-   * @param name 插件名
+   * @param name 插件目录名（与索引条目同名）
    * @param load 安装后是否立即加载
    * @param replace 目标已存在时是否覆盖
    * @param dependencies 是否顺带装依赖并跑索引声明的装后步骤
@@ -662,9 +709,25 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     stash = false
   ): Promise<Record<string, unknown>> => {
     const instance = market()
+    const occupant = replace ? pluginInDir(name) : undefined
+    /*
+     * 拿声明名当目录名了 —— 早于任何动作挡下，并把两个名字都摆出来
+     *
+     * 市场按目录寻址，而插件列表显示的是 `definePlugin({ name })`。两者不同名时（索引条目
+     * `relay-checkin-plugin` 取仓库名，插件自己声明 `relay-checkin`），照声明名请求会撞上
+     * 「插件市场中没有名为 relay-checkin 的插件」—— 而那个插件明明就装在那儿，这句话把人
+     * 引向「市场是不是坏了」。此处改说该用哪个名字。
+     */
+    const mistaken = replace && occupant === undefined ? deps.plugins.list().find(s => s.name === name) : undefined
+    if (mistaken !== undefined && mistaken.root !== "") {
+      const dir = basename(mistaken.root)
+      throw fail(400, `插件 ${name} 装在目录 ${dir} 里。市场按安装目录寻址，请改用 ${dir}`)
+    }
     let unloaded = false
     try {
-      if (replace && deps.plugins.get(name) !== undefined) unloaded = await deps.plugins.unload(name)
+      if (occupant !== undefined && deps.plugins.get(occupant) !== undefined) {
+        unloaded = await deps.plugins.unload(occupant)
+      }
       /*
        * `fresh` 那一路直接调 `install(replace)`，绕开 `update()` 的就地拉取
        *
@@ -689,6 +752,7 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
       const loaded = load && !skip ? [...(await deps.plugins.loadAll()).loaded] : []
       return { ...result, unloaded, loaded }
     } catch (err) {
+      await restore(occupant, unloaded)
       throw fail(400, err instanceof Error ? err.message : String(err))
     }
   }
@@ -780,8 +844,12 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
      * `build` 会覆盖 `dist/`，而旧模块此刻还在内存里、它注册的命令仍在响应。跑完再卸载
      * 意味着中间有一段时间里「磁盘上是新代码、正在响应的是旧代码」，那种不一致比一次
      * 失败的重载难查得多。
+     *
+     * 卸的是**这个目录里装着的那个插件**，不是与目录同名的那个：见 `pluginInDir`。
      */
-    const unloaded = deps.plugins.get(name) === undefined ? false : await deps.plugins.unload(name)
+    const occupant = pluginInDir(name)
+    const unloaded =
+      occupant !== undefined && deps.plugins.get(occupant) !== undefined ? await deps.plugins.unload(occupant) : false
     try {
       const result = await market().setup(name)
       // 判据与 installFromMarket 一致：缺依赖或缺产物时加载注定失败，见那里的注释
@@ -789,6 +857,7 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
       const loaded = load && !skip ? [...(await deps.plugins.loadAll()).loaded] : []
       return { ...result, unloaded, loaded }
     } catch (err) {
+      await restore(occupant, unloaded)
       throw fail(400, err instanceof Error ? err.message : String(err))
     }
   })
@@ -797,15 +866,23 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     requireWritable()
     const name = req.params.name ?? ""
     // 先卸载再删除目录：若目录已删除而插件仍在内存中运行，其命令仍会响应，
-    // 而重启后则不再存在 —— 此类不一致比一次失败的卸载更难排查
-    const unloaded = deps.plugins.get(name) === undefined ? false : await deps.plugins.unload(name)
+    // 而重启后则不再存在 —— 此类不一致比一次失败的卸载更难排查。
+    // 同样按目录定位那个插件，见 `pluginInDir`
+    const occupant = pluginInDir(name)
+    const unloaded =
+      occupant !== undefined && deps.plugins.get(occupant) !== undefined ? await deps.plugins.unload(occupant) : false
     let removed: boolean
     try {
       removed = await market().remove(name)
     } catch (err) {
+      await restore(occupant, unloaded)
       throw fail(400, err instanceof Error ? err.message : String(err))
     }
-    if (!removed) throw fail(404, `插件目录 ${name} 不存在`)
+    // 目录都没删掉就别让插件白白停掉：这一支的典型成因是目录名写错，与插件本身无关
+    if (!removed) {
+      await restore(occupant, unloaded)
+      throw fail(404, `插件目录 ${name} 不存在`)
+    }
     return { name, unloaded, removed }
   })
 
