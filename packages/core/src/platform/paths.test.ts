@@ -105,6 +105,114 @@ describe("主目录探测", () => {
   })
 })
 
+describe("在实例的子目录里启动", () => {
+  /**
+   * 造一个装了 CLI 的实例目录
+   * @param dir 目录
+   * @param extra 额外写进 package.json 的字段
+   */
+  const makeInstall = async (dir: string, extra: object = {}): Promise<void> => {
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      join(dir, "package.json"),
+      JSON.stringify({ dependencies: { "@yunzai-ng/cli": "^0.4.0" }, ...extra }),
+      "utf8"
+    )
+  }
+
+  it("cd 进 plugins 再启动，沿用上层实例而不是在那儿另建一个", async () => {
+    const home = join(base, "我的机器人")
+    await makeInstall(home)
+    const sub = join(home, "plugins")
+    await mkdir(sub)
+    process.chdir(sub)
+
+    // 只看 cwd 的话这里会现建第二个实例：空配置、无账号、面板端口与上层相撞，
+    // 而使用者看到的是「我的账号和插件都没了」
+    expect(resolvePaths().home).toBe(resolve(home))
+  })
+
+  it("插件目录深处也认得出来", async () => {
+    const home = join(base, "机器人乙")
+    await makeInstall(home)
+    const deep = join(home, "plugins", "某插件", "src")
+    await mkdir(deep, { recursive: true })
+    process.chdir(deep)
+
+    expect(resolvePaths().home).toBe(resolve(home))
+  })
+
+  it("插件自己的 package.json 不算实例根 —— 它依赖 core，不依赖 cli", async () => {
+    const home = join(base, "机器人丙")
+    await makeInstall(home)
+    const plugin = join(home, "plugins", "某插件")
+    await mkdir(plugin, { recursive: true })
+    // 插件依赖的是 core 与 types；据「有 package.json」或「有 node_modules」判定
+    // 都会把这里当成实例根，于是数据落进插件目录
+    await writeFile(
+      join(plugin, "package.json"),
+      JSON.stringify({ name: "某插件", dependencies: { "@yunzai-ng/core": "^0.4.0" } }),
+      "utf8"
+    )
+    process.chdir(plugin)
+
+    expect(resolvePaths().home).toBe(resolve(home))
+  })
+
+  it("已 init 过的实例即使没有 package.json 也认得出来 —— 全局安装就是这形状", async () => {
+    const home = join(base, "全局装的实例")
+    await mkdir(join(home, "config"), { recursive: true })
+    await writeFile(join(home, "config", "yunzai.yaml"), "server:\n  port: 2536\n")
+    const sub = join(home, "logs")
+    await mkdir(sub)
+    process.chdir(sub)
+
+    expect(resolvePaths().home).toBe(resolve(home))
+  })
+
+  it("光有 config 目录不算 —— 那是无关项目里极常见的目录名", async () => {
+    const outer = join(base, "别人的仓库")
+    await mkdir(join(outer, "config"), { recursive: true })
+    const cwd = join(outer, "子目录")
+    await mkdir(cwd)
+    process.chdir(cwd)
+
+    // 认宽了的后果是配置与账号全落进别人的仓库里
+    expect(resolvePaths().home).toBe(resolve(cwd))
+  })
+
+  it("上层没有实例时仍落在当前目录 —— 新装不受影响", async () => {
+    const dir = join(base, "新装")
+    await mkdir(dir)
+    process.chdir(dir)
+
+    expect(resolvePaths().home).toBe(resolve(dir))
+  })
+
+  it("嵌套时就近者胜", async () => {
+    const outer = join(base, "外层")
+    await makeInstall(outer)
+    const inner = join(outer, "内层")
+    await makeInstall(inner)
+    const cwd = join(inner, "plugins")
+    await mkdir(cwd)
+    process.chdir(cwd)
+
+    expect(resolvePaths().home).toBe(resolve(inner))
+  })
+
+  it("YZNG_HOME 压过向上查找 —— 要在子目录里另开一个实例得显式说", async () => {
+    const home = join(base, "机器人丁")
+    await makeInstall(home)
+    const sub = join(home, "plugins")
+    await mkdir(sub)
+    process.chdir(sub)
+    process.env["YZNG_HOME"] = sub
+
+    expect(resolvePaths().home).toBe(resolve(sub))
+  })
+})
+
 describe("旧默认位置上的实例", () => {
   /** 在 `dir` 下造出一个看起来已在用的实例 */
   const makeInstance = async (dir: string): Promise<void> => {

@@ -14,17 +14,42 @@
  *          此处**不**为其保留静默回落 —— 那会使「默认在当前目录」在任何装过旧版的机器上
  *          都不成立。改由 {@link legacyInstance} 把旧实例报给 CLI 显式提示：换目录应当是
  *          使用者看得见的一步，而不是内核悄悄替他挑一个。
+ *
+ *          **「当前目录」先向上认已有实例，见 {@link findInstanceRoot}。** 直接取
+ *          `process.cwd()` 的后果是：在实例的子目录里（`plugins/`、`logs/`、某个插件目录内）
+ *          执行 `yzng start`，内核会当场在那里现建第二个实例 —— 空配置、无账号、面板端口
+ *          与上层那个相撞，而使用者看到的是「我的账号和插件都没了」。cd 进 `plugins`
+ *          去看一眼再随手启动是极自然的动作，不该以此为代价。
+ *
+ *          主判据是**`package.json` 里声明了 `@yunzai-ng/cli`**，而非「有没有 `config/`」：
+ *          装 CLI 的唯一理由就是要在这个目录里跑一个实例，故它在**全新安装尚未 init**
+ *          时也成立 —— 那恰是只看配置文件会漏掉的一种情形，且后果一样（在子目录里
+ *          init 出第二个实例）。
  */
 import { homedir } from "node:os"
-import { dirname, isAbsolute, join, resolve } from "node:path"
+import { dirname, isAbsolute, join, parse as parsePath, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { existsSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import type { RuntimePaths } from "@yunzai-ng/types"
 import { ensureDir } from "../util/fs.js"
 import { detectPlatform } from "./detect.js"
 
 /** 便携模式标记文件名 */
 const PORTABLE_MARKER = ".portable"
+
+/**
+ * CLI 的包名 —— 向上找实例根的主判据
+ *
+ * 写成字面量而非 import：core 不依赖 cli（那会成环，且分层门禁会拦）。
+ */
+const CLI_PACKAGE = "@yunzai-ng/cli"
+
+/**
+ * 内核配置的文件名 —— 向上找实例根的次判据
+ *
+ * 与 `CORE_CONFIG_NAME` 对应，同样刻意不 import config 层：platform 是更底的一层。
+ */
+const CORE_CONFIG_FILE = "yunzai.yaml"
 
 /** 应用目录名（系统默认位置下使用） */
 const APP_DIR_NAME = "YunzaiNG"
@@ -106,13 +131,109 @@ function hasInstance(dir: string): boolean {
 }
 
 /**
+ * 一个目录的 `package.json` 是否声明了 CLI
+ *
+ * **这是「此处是一个 Yunzai 实例」最确凿的标记，故向上找实例以它为主。** 装 `@yunzai-ng/cli`
+ * 的唯一理由是要在这个目录里跑一个实例；插件依赖的是 `core` 与 `types`，绝不会依赖 CLI，
+ * 于是一个插件目录不会被误认。三段依赖表都看：源码开发时它可能在 `devDependencies` 里。
+ *
+ * 判据刻意不是「存在 `node_modules/@yunzai-ng/cli`」：那样一个自行 `pnpm add @yunzai-ng/core`
+ * 的插件目录就会被认成实例根，而症状是数据落进那个插件的目录里。
+ * @param dir 待判断的目录
+ * @returns 是否声明了 CLI
+ */
+function declaresCli(dir: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"))
+    if (typeof parsed !== "object" || parsed === null) return false
+    const pkg = parsed as Record<string, unknown>
+    return ["dependencies", "devDependencies", "optionalDependencies"].some(field => {
+      const deps = pkg[field]
+      return typeof deps === "object" && deps !== null && CLI_PACKAGE in (deps as Record<string, unknown>)
+    })
+  } catch {
+    // 读不到、或不是合法 JSON —— 两种情形都只说明「这一级不是实例根」，继续向上
+    return false
+  }
+}
+
+/**
+ * 向上找实例时的次判据：`config/yunzai.yaml`
+ *
+ * 覆盖 CLI 判据照不到的两种布局：全局安装（`pnpm add -g`，实例目录里没有 `package.json`）
+ * 与源码构建（在仓库外另建的实例目录里直接 `node …\bin.js start`）。
+ *
+ * 比 {@link hasInstance} 的「有 `config/` 目录」严格：那一条只用于报告旧位置，认宽了顶多
+ * 多打一行提示；这一条决定**数据往哪写**，认宽了会把一个无关项目的 `config/` 目录当成
+ * Yunzai 实例。而 `config/yunzai.yaml` 由 `ConfigStore` 在初始化时必定落盘，任何跑过一次的
+ * 实例都有它。
+ *
+ * 文件名与 `CORE_CONFIG_NAME` 对应，此处刻意不 import config 层 —— platform 是更底的一层，
+ * 反向依赖会成环。
+ * @param dir 待判断的目录
+ * @returns 是否装着一份内核配置
+ */
+function hasCoreConfig(dir: string): boolean {
+  return existsSync(join(dir, "config", CORE_CONFIG_FILE))
+}
+
+/**
+ * 自 `from` 逐级向上找一个目录
+ * @param from 起点目录
+ * @param match 判据
+ * @returns 命中的目录；一路到盘根都没有时 undefined
+ */
+function walkUp(from: string, match: (dir: string) => boolean): string | undefined {
+  const start = resolve(from)
+  const root = parsePath(start).root
+  let dir = start
+  for (;;) {
+    if (match(dir)) return dir
+    if (dir === root) return undefined
+    const parent = dirname(dir)
+    if (parent === dir) return undefined
+    dir = parent
+  }
+}
+
+/**
+ * 自 `from` 向上找装着 CLI 的那个目录
+ *
+ * 供 `yzng update` 定位「在哪跑包管理器」。与 {@link findInstanceRoot} 分开：升级必须落在
+ * 一个**有 `package.json`** 的目录上，而后者还认只有配置文件的实例（全局安装的情形）——
+ * 在那种目录里跑 `pnpm add` 会凭空造出一份 `package.json`。
+ * @param from 起点目录
+ * @returns 安装目录；找不到时 undefined
+ */
+export function findInstallRoot(from: string): string | undefined {
+  return walkUp(from, declaresCli)
+}
+
+/**
+ * 自 `from` 向上找已有实例的根
+ *
+ * 逐级向上而非只看当前目录：在实例的子目录里执行 `yzng start` 是极自然的动作
+ * （cd 进 `plugins/` 看一眼插件、或在某个插件目录里改完代码），而只看当前目录
+ * 会在那里现建第二个实例 —— 空配置、无账号、面板端口与上层那个相撞，
+ * 使用者看到的却是「我的账号和插件都没了」。
+ *
+ * 两条判据取就近命中者，不分主次：嵌套时离当前目录最近的那个才是使用者所指的。
+ * @param from 起点目录
+ * @returns 实例根目录；一路到盘根都没有时 undefined
+ */
+export function findInstanceRoot(from: string): string | undefined {
+  return walkUp(from, dir => declaresCli(dir) || hasCoreConfig(dir))
+}
+
+/**
  * 未显式指定、也无便携标记时的主目录
  *
- * 见文件头第 2、3 条。
+ * 先向上找已有实例，找不到才用当前目录 —— 后者是「新装」，前者是「已经装过了，
+ * 只是此刻站在它的某个子目录里」。见文件头第 4 条。
  * @returns 绝对路径
  */
 function autoHome(): string {
-  return process.cwd()
+  return findInstanceRoot(process.cwd()) ?? process.cwd()
 }
 
 /**

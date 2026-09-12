@@ -38,7 +38,7 @@ const SHORT: Readonly<Record<string, string>> = {
  * CLI 转而输出帮助，而使用者无从察觉问题所在。清单之外的选项一律为布尔开关；
  * 确需为其传值时应写 `--新选项=值`，等号形式的优先级恒高于本清单。
  */
-const VALUE_FLAGS: ReadonlySet<string> = new Set(["home", "plugins", "port", "host"])
+const VALUE_FLAGS: ReadonlySet<string> = new Set(["home", "plugins", "port", "host", "to"])
 
 /**
  * 解析 `process.argv.slice(2)`

@@ -49,4 +49,11 @@ describe("参数解析", () => {
   it("空串选项值视为未提供，以免 --home= 被解析为空的主目录", () => {
     expect(flagString(parseArgs(["start", "--home="]), "home")).toBeUndefined()
   })
+
+  it("--to 带值 —— 不在清单里的话版本号会落进位置参数，而 update 不读位置参数，于是静默升到 latest", () => {
+    const args = parseArgs(["update", "--to", "0.4.0"])
+    expect(args.command).toBe("update")
+    expect(flagString(args, "to")).toBe("0.4.0")
+    expect(args.positional).toEqual([])
+  })
 })

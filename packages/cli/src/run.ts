@@ -18,6 +18,7 @@ import { runStart } from "./commands/start.js"
 import { runInit } from "./commands/init.js"
 import { runDoctor } from "./commands/doctor.js"
 import { runPluginNew } from "./commands/plugin.js"
+import { runUpdateCommand } from "./commands/update.js"
 
 /**
  * 读取自身版本号
@@ -105,6 +106,12 @@ export async function run(argv: readonly string[]): Promise<number> {
         port: parsed !== undefined && Number.isInteger(parsed) ? parsed : undefined
       })
     }
+
+    case "update":
+      return runUpdateCommand({
+        to: flagString(args, "to"),
+        prune: flagBoolean(args, "prune", true)
+      })
 
     case "plugin": {
       const sub = args.positional[0] ?? ""

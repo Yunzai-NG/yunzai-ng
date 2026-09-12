@@ -1,6 +1,6 @@
 {
   "name": "@yunzai-ng/cli",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Yunzai NG 命令行：init / start / dev / doctor / plugin",
   "type": "module",
   "license": "AGPL-3.0-or-later",
