@@ -353,14 +353,18 @@ describe("适配器生命周期", () => {
   })
 
   it("重连次数达到上限后停止自动重连，并把原因说清", async () => {
-    // 上限取 1：第一次失败排一次重试（退避基数 2 秒），那一次再失败即超限
-    const { app } = await boot("adapter:\n  reconnectLimit: 1\n", { failConnect: "Mock 就是不让连" })
+    // 上限取 1：第一次失败排一次重试，那一次再失败即超限
+    // 间隔显式压到 60ms —— 不写就吃缺省的 5 秒，这条用例便押在「5 秒带抖动仍小于超时」上，
+    // 而它测的是「超限之后说了什么」，与等多久无关
+    const { app } = await boot("adapter:\n  reconnectLimit: 1\n  reconnectInterval: 60ms\n", {
+      failConnect: "Mock 就是不让连"
+    })
     const record = await app.runtime.accounts.create("mock", { selfId: "10000" })
 
     const gaveUp = async (): Promise<string | undefined> =>
       app.loggerHub.tail({ level: "warn" }).find(r => r.msg.includes("停止自动重连"))?.msg
 
-    // 退避是 2 秒起步带抖动，故给足余量；这里等的是「放弃」那一条日志
+    // 间隔带 ±25% 抖动，故给足余量；这里等的是「放弃」那一条日志
     await vi.waitFor(async () => expect(await gaveUp()).toBeDefined(), { timeout: 10_000, interval: 100 })
 
     const line = (await gaveUp()) ?? ""
@@ -376,7 +380,10 @@ describe("适配器生命周期", () => {
   }, 15_000)
 
   it("手动重连把失败计数归零 —— 否则达到上限后那个按钮点了没反应", async () => {
-    const { app } = await boot("adapter:\n  reconnectLimit: 1\n", { failConnect: "Mock 就是不让连" })
+    // 同上，间隔压到 60ms：这条测的是「归零」，不该为了等缺省的 5 秒而多跑五秒
+    const { app } = await boot("adapter:\n  reconnectLimit: 1\n  reconnectInterval: 60ms\n", {
+      failConnect: "Mock 就是不让连"
+    })
     const record = await app.runtime.accounts.create("mock", { selfId: "10000" })
 
     await vi.waitFor(
@@ -390,17 +397,19 @@ describe("适配器生命周期", () => {
     expect(app.runtime.accounts.get(record.id)?.retries).toBe(1)
   }, 15_000)
 
-  it("上限缺省为 0，即一直重连（此前唯一的行为）", async () => {
+  it("上限缺省为 5 次，而不是一直重连", async () => {
     const { app } = await boot()
-    expect(app.config.get().adapter.reconnectLimit).toBe(0)
+    // 0 仍是合法值（一直重连），但不再是缺省 —— 连不上的号该停下来等人看，别把日志刷走
+    expect(app.config.get().adapter.reconnectLimit).toBe(5)
   })
 
-  it("退避三项也有缺省值，且与 accounts.ts 的兜底一致", async () => {
+  it("退避三项的缺省值：5 秒起、1 分顶、不退避", async () => {
     const { app } = await boot()
     const { adapter } = app.config.get()
-    expect(adapter.reconnectInterval).toBe("2s")
+    expect(adapter.reconnectInterval).toBe("5s")
     expect(adapter.reconnectMaxInterval).toBe("1m")
-    expect(adapter.reconnectFactor).toBe(2)
+    // 倍率 1 即每次都等 5 秒。对端多半是本机的 NapCat，几秒就回来，退避只是白等
+    expect(adapter.reconnectFactor).toBe(1)
   })
 
   /*

@@ -59,11 +59,11 @@ const FALLBACK_SEND_TIMEOUT = 30_000
 /**
  * 重连间隔读不出来时的兜底毫秒
  *
- * 与 `adapter.reconnectInterval` 的 schema 默认值 `"2s"` 对应。同 `FALLBACK_SEND_TIMEOUT`：
+ * 与 `adapter.reconnectInterval` 的 schema 默认值 `"5s"` 对应。同 `FALLBACK_SEND_TIMEOUT`：
  * schema 加载时已校验格式，这个兜底走不到，留着是因为 0 的后果远比偏差几秒严重 ——
  * 0 意味着「不等待、立刻重试」，那是一个把日志刷满且对端还没缓过来的死循环。
  */
-const FALLBACK_RECONNECT_INTERVAL = 2_000
+const FALLBACK_RECONNECT_INTERVAL = 5_000
 
 /**
  * 重连间隔上限读不出来时的兜底毫秒

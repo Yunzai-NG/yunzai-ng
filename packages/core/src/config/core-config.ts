@@ -283,11 +283,11 @@ export const coreConfigSchema = s.object({
         .int()
         .min(0)
         .max(1000)
-        .default(0)
+        .default(5)
         .title("重连次数上限")
         .desc(
           "账号断线后最多连续重试多少次，超过即停在离线状态，等人工点「重连」。" +
-            "0 为一直重试（此前的行为）。" +
+            "0 为一直重试。" +
             "连上一次就归零，故这个数说的是「连续失败多少次」而不是「一生总共重试多少次」。" +
             "设一个上限的意义在于：号被封、配置填错这类失败重试一万次也是同样的结果，" +
             "而无休止的重试会让日志里真正要看的东西被刷走。" +
@@ -295,7 +295,7 @@ export const coreConfigSchema = s.object({
         ),
       reconnectInterval: s
         .duration()
-        .default("2s")
+        .default("5s")
         .title("首次重连间隔")
         .desc("第一次失败之后等多久再试。此后每失败一次乘上「退避倍率」，直到「重连间隔上限」。"),
       reconnectMaxInterval: s
@@ -310,11 +310,12 @@ export const coreConfigSchema = s.object({
         .number()
         .min(1)
         .max(10)
-        .default(2)
+        .default(1)
         .title("重连退避倍率")
         .desc(
-          "每失败一次把等待时长乘上这个数。取 1 表示不退避、始终按「首次重连间隔」重试 —— " +
-            "对端就在本机（NapCat 之类）时用得上，那种失败通常几秒内就恢复。"
+          "每失败一次把等待时长乘上这个数。缺省的 1 表示不退避、始终按「首次重连间隔」重试 —— " +
+            "对端多半就在本机（NapCat 之类），那种失败通常几秒内就恢复。" +
+            "对端在公网、可能长时间不在线时才调大，免得反复敲门。"
         )
     })
     .title("适配器")
