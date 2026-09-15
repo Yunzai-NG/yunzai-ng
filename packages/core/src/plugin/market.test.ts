@@ -130,7 +130,7 @@ function stubGit(options: StubGitOptions = {}): StubGit {
     if (cmd === "rev-parse") return `${heads.length > 1 ? heads.shift() : heads[0]}\n`
     if (cmd === "status") return options.status ?? ""
     if (cmd === "--version") return "git version 2.44.0\n"
-    if (cmd === "stash" || cmd === "fetch" || cmd === "reset" || cmd === "clone") return ""
+    if (cmd === "stash" || cmd === "fetch" || cmd === "reset" || cmd === "clone" || cmd === "clean") return ""
     throw new Error(`替身未编程该命令：git ${args.join(" ")}`)
   }
   return { run, calls, cmds: () => calls.map(item => item.args[0] ?? "") }
@@ -780,6 +780,64 @@ describe("PluginMarket 就地拉取", () => {
     expect(h.logger.lines.some(line => line.includes("git stash pop"))).toBe(true)
     // 面板据此说「你的改动在 stash 里」—— 日志里那句话多数人不会去看
     expect(result.stashed).toBe(true)
+    expect(result.discarded).toBeUndefined()
+  })
+
+  /*
+   * 丢弃那一路要 `clean -fd` 补一刀
+   *
+   * `reset --hard` 不动未跟踪的文件，少了 clean，「丢弃改动」这个承诺只对已跟踪的文件
+   * 成立，而使用者自己新放进去的文件正是他选这一项时想清掉的东西。
+   */
+  it("选择丢弃时 reset 之外还 clean，且不 stash", async () => {
+    const git = stubGit({ status: " M index.js\n?? 我的笔记.txt\n" })
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, git.run)
+    await makeGitRepo(h.pluginsDir)
+
+    const result = await h.market.update("demo", { onDirty: "discard" })
+
+    const cmds = git.cmds()
+    expect(cmds).not.toContain("stash")
+    expect(cmds).toContain("clean")
+    const clean = git.calls.find(item => item.args[0] === "clean")
+    expect(clean?.args).toEqual(["clean", "-fd"])
+    expect(result.discarded).toBe(true)
+    // 与 stash 分开报：合成一个字段会让面板对刚丢掉改动的人说「可以 pop 取回」
+    expect(result.stashed).toBeUndefined()
+  })
+
+  /*
+   * 丢弃是不可撤销的，日志里必须说明这一点
+   *
+   * stash 那一路的日志给的是取回办法，而这一路照抄一句「已处理」会让人事后去找一个
+   * 不存在的 stash 条目。
+   */
+  it("丢弃时日志说明改动无法取回", async () => {
+    const git = stubGit({ status: " M index.js\n" })
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, git.run)
+    await makeGitRepo(h.pluginsDir)
+
+    await h.market.update("demo", { onDirty: "discard" })
+
+    expect(h.logger.lines.some(line => line.includes("无法取回"))).toBe(true)
+    expect(h.logger.lines.some(line => line.includes("git stash pop"))).toBe(false)
+  })
+
+  /*
+   * 工作区干净时 `discard` 不该多跑那两条命令
+   *
+   * 它们在干净的目录上是空操作，但每一条都可能失败（仓库状态异常、权限），
+   * 而那会把一次本该成功的更新变成一条错误。
+   */
+  it("工作区干净时选择丢弃也不 clean", async () => {
+    const git = stubGit({ status: "" })
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, git.run)
+    await makeGitRepo(h.pluginsDir)
+
+    const result = await h.market.update("demo", { onDirty: "discard" })
+
+    expect(git.cmds()).not.toContain("clean")
+    expect(result.discarded).toBeUndefined()
   })
 
   /*

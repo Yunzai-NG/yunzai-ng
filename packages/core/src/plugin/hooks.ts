@@ -2,14 +2,12 @@
  * 模块职责：插件上下文与各子系统之间的接缝（sink 接口）
  * 依赖方向：只依赖类型包
  * 生命周期：纯接口 + 一组"子系统不可用"的占位实现
- * 注意事项：`ctx.command` / `ctx.cron` / `ctx.route` / `ctx.render` 的**语义**属于插件上下文，
- *          **实现**属于各子系统。让 context.ts 直接 import 那些子系统会绕成
- *          context → router → context 的环，且没有服务器时上下文就编译不过。
+ * 注意事项：`ctx.command` / `ctx.cron` / `ctx.route` / `ctx.render` 的语义属于插件上下文，实现属于
+ *          各子系统。context.ts 直接 import 那些子系统会绕成 context → router → context 的环。
+ *          故此处定义窄接口，内核启动时把真实子系统插进来。
  *
- *          故此处定义一组窄接口，内核启动时把真实子系统插进来。这有当下的现实需求：
- *          服务器可被用户关掉（`server.enable: false`），渲染器可能没装任何插件 ——
- *          那时 `ctx.route` / `ctx.render` 须给出一句人能看懂的话，而不是
- *          `undefined is not a function`。`unavailable*()` 是这条路径的正式实现，不是临时桩。
+ *          `unavailable*()` 是正式实现而非临时桩：服务器可被用户关掉（`server.enable: false`）、
+ *          渲染器可能没装任何插件，那时须给出一句人能看懂的话而不是 `undefined is not a function`。
  */
 import type {
   AdapterProvider,
@@ -171,8 +169,7 @@ export interface ServerSink {
   /**
    * 查询某路径当前由谁提供
    *
-   * 内置面板据此判断根路径是否已被插件接管：内核自带面板是兜底实现，
-   * 已有提供方时不再挂载，避免重复注册直接抛错。
+   * 内核自带面板是兜底实现，据此判断根路径是否已被插件接管。
    * @param path URL 路径，如 `/`
    * @returns 提供方标识；无人提供时 undefined
    */
@@ -238,9 +235,8 @@ export interface SqlSink {
   /**
    * 关闭某插件打开的全部库
    *
-   * `SqlHandle` 上刻意没有 `close()`：句柄会被插件到处传递，谁都能关就意味着
-   * 谁都可能在别人还在用时关掉。连接的生死由存储层按插件归属统一管理，
-   * 插件卸载时由上下文调用这里。
+   * `SqlHandle` 上刻意没有 `close()`：句柄会被插件到处传递，谁都能关就意味着谁都可能
+   * 在别人还在用时关掉。连接的生死由存储层按插件归属统一管理。
    * @param plugin 插件名
    */
   close(plugin: string): Promise<void>
@@ -287,8 +283,7 @@ export interface KernelHooks {
 /**
  * 子系统不可用的统一错误
  *
- * 信息中必须写明"为何不可用"与"如何使其可用"，因为看到该错误的通常是插件使用者
- * 而非插件作者。
+ * 信息里要写明「为何不可用」与「如何使其可用」：看到它的通常是插件使用者而非作者。
  */
 export class SubsystemUnavailableError extends Error {
   /** 错误名 */
@@ -328,9 +323,7 @@ export function unavailableServer(reason = "配置项 server.enable 为 false"):
 /**
  * 构造"没有渲染器"的实现
  *
- * 注意 `register` 是可用的：渲染器插件正是通过它把自己装进来的，
- * 只有 `render` 在没有任何渲染器时才失败。真实实现由 render 子系统提供，
- * 这里只服务于"渲染子系统整体未初始化"的极早期阶段。
+ * `register` 仍可用：渲染器插件正是通过它把自己装进来的，只有 `render` 会失败。
  * @returns RenderSink
  */
 export function unavailableRender(): RenderSink {

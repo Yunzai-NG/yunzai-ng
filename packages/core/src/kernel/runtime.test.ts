@@ -267,15 +267,16 @@ describe("消息链路", () => {
     expect(app.runtime.prompts.pending).toBe(0)
   })
 
-  it("机器人自己发的消息被忽略", async () => {
+  it("自身消息照常处理 —— 要不要投进来由适配器决定", async () => {
     const { app, mock } = await boot()
     await login(app)
 
     mock.driver.receivePrivate("#ping", { uid: "10000" })
     mock.driver.receivePrivate("#ping", { uid: "20000" })
 
-    await mock.waitForSend()
-    expect(mock.texts).toEqual(["pong"])
+    // 内核不再判自身消息：适配器不投，这里就收不到；投了就当普通消息处理
+    const sends = await mock.waitForSend(2)
+    expect(sends.map(one => one.text)).toEqual(["pong", "pong"])
   })
 })
 

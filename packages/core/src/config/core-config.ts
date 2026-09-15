@@ -42,17 +42,14 @@ export const coreConfigSchema = s.object({
         .default([])
         .title("机器人昵称")
         .desc("群里以昵称开头的消息等同于 @机器人。"),
-      ignoreSelf: s
-        .boolean()
-        .default(true)
-        .title("忽略自身消息")
-        .desc("关闭后机器人会处理自己发出的消息，容易形成死循环，仅调试时开启。"),
       onlyMaster: s
         .boolean()
         .default(false)
         .title("维护模式")
         .desc("开启后只响应主人，用于线上排障时把其他人挡在外面。")
     })
+    // ignoreSelf 已下放给适配器：由它决定自身消息是否投进内核
+    .deprecated("ignoreSelf")
     .title("基础")
     .group("基础")
     .order(10),
@@ -70,17 +67,21 @@ export const coreConfigSchema = s.object({
           silent: "关闭"
         })
         .default("info")
-        .title("日志级别"),
+        .title("日志级别")
+        .desc("控制台显示什么、面板的日志页缺省看什么。日志文件不受它影响，一律记全量。"),
       consoleLevel: s
         .enum(["trace", "debug", "info", "warn", "error", "fatal", "silent"])
         .optional()
         .title("控制台级别")
-        .desc("留空则跟随日志级别。常见用法：文件记 debug、控制台只看 info。"),
+        .desc("留空则跟随日志级别。"),
       fileLevel: s
         .enum(["trace", "debug", "info", "warn", "error", "fatal", "silent"])
         .optional()
         .title("文件级别")
-        .desc("留空则跟随日志级别。"),
+        .desc(
+          "留空即记全部（不跟随日志级别）：调低级别只该少显示，不该让那段时间的历史成为空白 —— " +
+            "复现不了的问题正是靠翻历史查。只在磁盘紧张时才调高。"
+        ),
       color: s.boolean().default(true).title("彩色输出").desc("重定向到文件或在不支持 ANSI 的终端里会自动关闭。"),
       keepDays: s.number().int().min(1).max(365).default(14).title("日志保留天数"),
       maxSize: s
@@ -429,6 +430,7 @@ export function serverSecurityWarning(config: CoreConfigSnapshot): string | unde
  * 用配置里的日志器设置更新运行中的日志器
  *
  * 抽成函数是为了让 `kernel/app.ts` 与配置的 `onChange` 复用同一段逻辑。
+ * 文件那一路只在显式配了 `fileLevel` 时才改 —— 缺省记全部，见 `LoggerHub`。
  * @param logger 日志器（需支持 setLevel 的具体实现）
  * @param config 内核配置
  */

@@ -2,14 +2,8 @@
  * 模块职责：配置 schema 构造器（校验 + WebUI 表单描述，一份声明两处产出）
  * 依赖方向：依赖类型包与 util/deep、util/duration
  * 生命周期：schema 对象不可变，可自由复用与共享
- * 注意事项：**为什么自己写而不用 zod**：面板要把 schema 降级成表单描述，而 zod 只能读 `_def`
- *          反推、版本一升就碎；内核要跑在 Termux 上，少一个运行时依赖就少一次装包失败；
- *          配置是人手写的 YAML，需要「字符串 '8080' 当端口」这类宽容转换，而 zod 的 coerce
- *          是全局开关、粒度不够。
- *
- *          三条刻意的语义：**数组整体替换**不逐元素合并（见 util/deep）；**缺失的对象节点按
- *          子字段默认值物化**，故用户只写关心的几个键即可；**未识别的键保留但报 warn**，
- *          不静默丢弃 —— 静默丢弃会让拼错的配置项改半天没反应。
+ * 注意事项：三条刻意的语义 —— 数组整体替换不逐元素合并（见 util/deep）；缺失的对象节点按
+ *          子字段默认值物化，故用户只写关心的几个键即可；未识别的键保留但报 warn，不静默丢弃。
  */
 import type { IssueSeverity, SchemaDescriptor, SchemaEnumItem, SchemaIssue, SchemaWidget } from "@yunzai-ng/types"
 import { deepClone, isPlainObject } from "../util/deep.js"
@@ -126,6 +120,8 @@ interface SchemaDef {
   shape?: Record<string, Schema<any>>
   /** 是否拒绝未识别的键 */
   strict?: boolean
+  /** 曾经存在、现已移除的键；命中时静默丢弃而不告警 */
+  deprecatedKeys?: string[]
   /** record 的值 schema */
    
   valueSchema?: Schema<any>
@@ -323,6 +319,19 @@ export class Schema<T> {
   }
 
   /**
+   * 对象：声明曾经存在、现已移除的键
+   *
+   * 这些键在旧配置文件里还留着，命中时静默丢弃 —— 走未知键那条路会让每个升级上来的人
+   * 每次启动都看一句「无法识别的配置项」，而那件事他既没做错也无从处置。丢弃而非保留：
+   * 留着它下一次写盘又会落回文件，警告就永远消不掉。
+   * @param keys 已移除的键名
+   * @returns 新 schema
+   */
+  deprecated(...keys: string[]): Schema<T> {
+    return this.#patch({ deprecatedKeys: [...(this.#def.deprecatedKeys ?? []), ...keys] })
+  }
+
+  /**
    * 数组：允许单值自动包成数组
    *
    * 让 `masterQQ: 123` 与 `masterQQ: [123]` 都能用 —— 旧配置最常见的困惑点。
@@ -410,10 +419,6 @@ export class Schema<T> {
    * 对象 schema：取子字段 schema
    * @param key 字段名
    * @returns 子 schema；不是对象或字段不存在时 undefined
-   */
-   
-  /**
-   *
    */
   field(key: string): Schema<any> | undefined {
     return this.#def.shape?.[key]
@@ -570,12 +575,10 @@ export class Schema<T> {
   /**
    * 把声明的默认值也过一遍校验
    *
-   * 默认值必须走同一条校验/转换链，否则 `defaults()` 与 `parse(用户文件)`
-   * 会给出**形态不同的同一份配置**（例如 duration 的默认 `0` 与文件里读回的
-   * `"0"`），下游按路径比对时就会在每次启动时误报"配置变了"。
-   *
-   * 默认值不合法属于插件作者的 bug，不是用户的错：这里只记 warn 并退回原始
-   * 默认值，让机器人照常启动，而不是让用户面对一个自己无法修复的启动失败。
+   * 默认值走同一条校验链，否则 `defaults()` 与 `parse(用户文件)` 会给出形态不同的
+   * 同一份配置（duration 的默认 `0` 与文件里读回的 `"0"`），下游按路径比对时会
+   * 每次启动都误报「配置变了」。默认值不合法只记 warn 并退回原值 —— 那是插件作者的
+   * bug，不该让用户面对一个自己修不了的启动失败。
    * @param path 当前路径
    * @param issues 问题收集容器
    * @returns 规范化后的默认值
@@ -745,6 +748,8 @@ export class Schema<T> {
 
     for (const key of Object.keys(input)) {
       if (Object.prototype.hasOwnProperty.call(shape, key)) continue
+      // 已移除的键静默丢弃，不写进 out —— 下次写盘它就从文件里消失了
+      if (def.deprecatedKeys?.includes(key) === true) continue
       const childPath = path === "" ? key : `${path}.${key}`
       if (def.strict) {
         this.#fail(issues, childPath, "无法识别的配置项")
@@ -784,20 +789,12 @@ export class Schema<T> {
 }
 
 /** 从 schema 反推 TS 类型 */
- 
-/**
- *
- */
 export type Infer<S> = S extends Schema<infer T> ? T : never
 
 /** 让交叉类型在编辑器提示里展开成扁平对象 */
 type Simplify<T> = { [K in keyof T]: T[K] } & {}
 
 /** 对象 schema 的字段表 */
- 
-/**
- *
- */
 export type Shape = Record<string, Schema<any>>
 
 /** 可缺省的键（输出类型含 undefined 的那些） */
@@ -978,11 +975,8 @@ function tags(): Schema<string[]> {
 /**
  * 平台 id 列表（用户 id / 群 id，允许写单个值）
  *
- * **不限于纯数字**：QQ 号与群号是纯数字，但 QQ 官方机器人下发的是 32 位十六进制
- * openid（形如 `FF23DED2F67B06F46C7A23AE9BB7C5AE`），频道场景的 id 还带适配器加的
- * `qg_` 前缀（形如 `qg_2492083538938174755`）。曾收窄为纯数字，后果是这类账号连主人
- * 都加不上 —— 而 id 的具体形态属于适配器的知识，内核不逐个平台枚举，只把「不像任何
- * 平台 id 的输入」挡在外面（含空格、中文、@ 之类多半是把昵称当 id 填了）。
+ * 不限于纯数字：QQ 官方机器人下发的是 32 位十六进制 openid，频道场景的 id 还带 `qg_`
+ * 前缀。收窄为纯数字会让这类账号连主人都加不上。
  * @returns id 数组 schema
  */
 function ids(): Schema<string[]> {

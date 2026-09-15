@@ -2,20 +2,13 @@
  * 模块职责：统一 HTTP 客户端（undici）—— 超时、重试、代理、限长、流式下载
  * 依赖方向：依赖 undici、util/{defer,duration,fs,text}、类型包；不依赖任何插件
  * 生命周期：应用级单例（`createHttpClient` 创建一份，`close()` 时释放连接池）
- * 注意事项：此处是全框架**唯一**发起 HTTP 请求的位置，插件经 `ctx.http` 取得它 —— 各处混用不同
- *          客户端时，代理要各配一遍、超时各实现一套，国内网络下「某个插件没反应」得查三份实现。
- *
- *          **连接池必须复用。** `ProxyAgent` / `Agent` 按代理地址缓存，绝不每次请求新建 ——
- *          那会丢掉全部 socket 与 TLS 会话，高频接口退化成每次重新握手。
- *
- *          **响应体必须被消费。** undici 的 body 没读完时连接不归还连接池，故丢弃响应
- *          （`responseType: "none"`、重试前、报错时）一律显式 `dump()`。
- *
- *          **缓冲读取必须有上限。** `maxBodySize` 缺省 64 MiB —— 对端返回一个无限流即可让机器人
- *          OOM，而图床故障时返回 HTML 死循环并不罕见。
- *
- *          **报错信息不得泄露凭据。** URL 里的 authkey / token 一律打码后才写日志，否则使用者
- *          贴日志求助时会连带泄露。
+ * 注意事项：全框架唯一发起 HTTP 请求的位置，插件经 `ctx.http` 取得它。四条须守住的约定：
+ *          1) 连接池必须复用 —— `ProxyAgent` / `Agent` 按代理地址缓存，每次新建会丢掉全部
+ *             socket 与 TLS 会话
+ *          2) 响应体必须被消费 —— undici 的 body 没读完时连接不归还连接池，故丢弃响应
+ *             （`responseType: "none"`、重试前、报错时）一律显式 `dump()`
+ *          3) 缓冲读取必须有上限 —— 对端返回一个无限流即可让机器人 OOM
+ *          4) 报错信息不得泄露凭据 —— URL 里的 authkey / token 一律打码后才写日志
  */
 import { createWriteStream } from "node:fs"
 import { rename, unlink } from "node:fs/promises"
@@ -180,8 +173,6 @@ interface ResolvedRequest {
 
 /**
  * 把 URL 里的敏感查询值打码
- *
- * 抽卡链接的 `authkey` 有一千多字符且等于账号凭据，直接进日志等于泄号。
  * @param raw 原始 URL
  * @returns 可安全记录的 URL
  */
@@ -286,9 +277,6 @@ function flattenHeaders(raw: Record<string, string | string[] | undefined>): Rec
 
 /**
  * 读取响应体，超过上限就中断
- *
- * 不设上限的话，对方返回一个不结束的流就能把进程吃干 —— 图床故障时
- * 返回无限重定向页面是真实发生过的。
  * @param body 响应流
  * @param max 上限字节数
  * @param onOverflow 超限时用于构造错误
@@ -313,8 +301,7 @@ async function readBounded(body: Readable, max: number, onOverflow: (read: numbe
 /**
  * 丢弃响应体
  *
- * undici 的连接要等 body 读完才还回池子；重试前、报错后如果不消费，
- * 池子会被慢慢占满，症状是"跑一段时间后所有请求都卡住"。
+ * undici 的连接要等 body 读完才还回池子，不消费会让池子被慢慢占满。
  * @param body 响应流
  */
 function discard(body: Readable): void {
@@ -333,12 +320,9 @@ function discard(body: Readable): void {
 /**
  * 按 `Content-Encoding` 套一层解压
  *
- * 刻意不使用 undici 的 `interceptors.decompress()`：它在 v7 中仍标注 experimental，
- * 加载即向 stderr 输出 `ExperimentalWarning`。机器人启动时出现这样一行，
- * 使用者的第一反应是"是否出现故障"，而此处所需仅为三行 zlib。
- *
- * 使用回调版 `pipeline` 而非手工 `pipe`：它保证任一端出错或提前关闭时
- * 两端均被销毁 —— 否则解压流被调用方 destroy 后，undici 一侧的 socket 即被泄漏。
+ * 不用 undici 的 `interceptors.decompress()`：它在 v7 仍是 experimental，加载即向 stderr
+ * 打一行 `ExperimentalWarning`。用回调版 `pipeline` 而非手工 `pipe`：它保证任一端出错或
+ * 提前关闭时两端都被销毁，否则解压流被调用方 destroy 后 undici 那侧的 socket 会泄漏。
  * @param body 原始响应流
  * @param encoding `Content-Encoding` 头值
  * @returns 解压后的流；无需解压时原样返回
@@ -374,8 +358,7 @@ function parseRetryAfter(value: string | undefined): number | undefined {
 /**
  * 判断一个网络层错误是否值得重试
  *
- * 仅重试再次尝试即可能成功者：连接被拒、超时、连接被对端重置。
- * 4xx 语义错误与证书错误重试一百次结果相同，只会刷满日志。
+ * 只重试再试一次就可能成功的：连接被拒、超时、被对端重置。
  * @param err 错误
  * @returns 是否重试
  */
@@ -414,9 +397,8 @@ function proxyFromEnv(): string | undefined {
 /**
  * 校验请求头是否可用于发送
  *
- * HTTP 头仅允许 latin1 范围内的字节，中文一律非法。插件作者遇到该问题的概率较高
- *（例如将群名置入自定义头），而 undici 仅返回 `invalid x-foo header`，
- * 既不说明原因亦不给出处置方式。此处提前拦截并明确给出处置方式。
+ * HTTP 头仅允许 latin1，中文一律非法。提前拦截是因为 undici 只回一句
+ * `invalid x-foo header`，不说原因也不给办法。
  * @param headers 请求头
  * @throws 含非法字符时抛 TypeError
  */
@@ -453,9 +435,8 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
   /**
    * 是否已 `close()`
    *
-   * 关掉之后如果还允许发请求，连接池会被静默重建，于是 `close()` 等于没调 ——
-   * 进程照旧被 keep-alive 的空闲 socket 吊着不退出，且没有任何报错可查。
-   * 所以 `close()` 是终态，之后的请求一律拒绝。
+   * `close()` 是终态，之后的请求一律拒绝：否则连接池会被静默重建，进程照旧被
+   * keep-alive 的空闲 socket 吊着不退出，且没有任何报错可查。
    */
   let closed = false
 
@@ -487,8 +468,7 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
   /**
    * 取（或建）一个带拦截器的派发器
    *
-   * 拦截器只有"重定向次数"这一个变量，所以每个代理最多缓存两份
-   * （跟随 / 不跟随），不会随请求数增长。
+   * 拦截器只有「重定向次数」这一个变量，故每个代理最多缓存两份，不随请求数增长。
    * @param proxy 代理地址；空串表示直连
    * @param redirections 跟随重定向次数
    * @returns 派发器

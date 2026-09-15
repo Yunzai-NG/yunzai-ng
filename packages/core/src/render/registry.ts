@@ -4,20 +4,11 @@
  * 生命周期：随内核创建；每个渲染器随提供方插件卸载而摘除；`stop()` 关闭全部渲染器
  * 注意事项：内核对「怎么把 HTML 变成图片」零认知，只做三件事：择一可用者、补齐全局默认值、
  *          失败时指明失败方。四项刻意的选择：
- *
- *          **`available()` 的结果要缓存。** 它的实现可能是探测 Chromium 是否存在这类几十毫秒的
- *          磁盘操作，每渲染一张图探一次会计进每条消息的响应时间。故按 TTL 缓存，且**探测本身
- *          单例化** —— 十条消息同时请求渲染不该产生十次并发探测。
- *
- *          **失败后立即让可用性缓存作废。** 浏览器崩溃这件事必须在下一次渲染时被发现。不可用
- *          状态的 TTL 更短：使用者刚装好 Chromium，不该再等一分钟。
- *
- *          **只在「该渲染器整体不可用」时切换**，此前先重试同一个。`render.retry` 的语义是本次
- *          渲染重试几次（浏览器繁忙、页面偶发超时）。全部失败时把每个渲染器的原因**逐条**汇总
- *          抛出 —— 只报最后一个的话，真实原因常在第一个里。
- *
- *          **此处不限并发。** 同时渲染多张图会不会耗尽内存，取决于渲染器自己页面池的大小，
- *          只有渲染器插件知道那个数。内核再加一层信号量只会与插件内部的池互相干扰。
+ *          1) `available()` 的结果按 TTL 缓存，且探测本身单例化 —— 它可能是几十毫秒的磁盘操作
+ *          2) 失败后立即让可用性缓存作废；不可用状态的 TTL 更短，故装好 Chromium 不必等一分钟
+ *          3) 只在「该渲染器整体不可用」时切换，此前先按 `render.retry` 重试同一个；全部失败时
+ *             逐条汇总每个渲染器的原因 —— 只报最后一个的话，真实原因常在第一个里
+ *          4) 此处不限并发：页面池大小只有渲染器插件知道，内核再加一层信号量只会互相干扰
  */
 import type {
   Disposer,
@@ -99,20 +90,12 @@ export interface RendererInfo {
 export interface RenderRegistryOptions {
   /** 基础日志器 */
   readonly logger: Logger
-  /**
-   * 取当前渲染配置
-   *
-   * 取函数而非直接传值：`render.*` 在 WebUI 里随时可改，配置存储会就地更新，
-   * 缓存一份快照就意味着"改了配置要重启才生效"。
-   */
+  /** 取当前渲染配置；取函数而非快照，故 WebUI 改了 `render.*` 立刻生效 */
   readonly policy: () => RenderPolicy
   /**
-   * 一次渲染结束后的通知（成功或全部渲染器失败）
+   * 一次渲染结束后的通知（成功或全部渲染器失败），省略即不通知
    *
-   * 取回调而非直接传 `CoreEventBus`：本文件对渲染实现零认知，认识事件总线
-   * 就等于认识插件系统。回调由 `installRuntime` 传入 —— 它本来就持有总线。
-   *
-   * 省略即不通知，现有调用方（含测试）因此无须改动。
+   * 取回调而非直接传 `CoreEventBus`：认识事件总线就等于认识插件系统。
    */
   readonly onDone?: (info: RenderDoneInfo) => void
 }
@@ -206,13 +189,7 @@ export class RenderRegistry implements RenderSink {
     const timeout = policy.timeout > 0 ? policy.timeout : FALLBACK_TIMEOUT
     const attempts = Math.max(0, policy.retry) + 1
 
-    /**
-     * 整个 `render()` 的起点
-     *
-     * 全灭时上报的耗时取这一档，而非最后一次尝试的耗时：使用者等的是「这次渲染
-     * 花了多久才失败」，那包含全部渲染器的全部重试。成功路径不用它 ——
-     * 那里取渲染器自报的 `result.cost`，与「出图快慢」对得上。
-     */
+    /** 整个 `render()` 的起点；全灭时的耗时取这一档，成功路径取渲染器自报的 `result.cost` */
     const startedAll = Date.now()
 
     /** 每个渲染器的失败原因，全灭时一起抛出 */
@@ -302,8 +279,7 @@ export class RenderRegistry implements RenderSink {
   /**
    * 摘除某插件注册的全部渲染器
    *
-   * 兜底路径：插件上下文正常会逐条调用 Disposer，但插件 setup 中途抛错时
-   * 可能存在未经 ctx 的登记。
+   * 兜底路径：插件 setup 中途抛错时可能存在未经 ctx 的登记。
    * @param owner 插件名
    * @returns 摘除的条数
    */
@@ -321,8 +297,8 @@ export class RenderRegistry implements RenderSink {
   /**
    * 关闭全部渲染器（停机时调用）
    *
-   * 会等待插件卸载时那些"发出去就不管"的 `dispose()` 收尾 —— 否则进程退出时
-   * 可能留下没杀掉的 Chromium 子进程。
+   * 要等插件卸载时那些「发出去就不管」的 `dispose()` 收尾，否则进程退出时可能
+   * 留下没杀掉的 Chromium 子进程。
    */
   async stop(): Promise<void> {
     for (const [id, entry] of [...this.#entries]) this.#remove(id, entry)
@@ -333,9 +309,8 @@ export class RenderRegistry implements RenderSink {
   /**
    * 按优先级排出候选渲染器
    *
-   * 首选（`render.default`）排在第一位，其余按注册顺序。首选未注册时不报错 ——
-   * 使用者可能仅是尚未安装该插件，"能够产出图片"比"由指定渲染器产出图片"更为重要，
-   * 但选中其他渲染器时会留下一条日志。
+   * 首选（`render.default`）排第一，其余按注册顺序。首选未注册时不报错、只落一条日志：
+   * 「能出图」比「由指定渲染器出图」更要紧。
    * @param preferred 首选渲染器 id
    * @returns 候选条目，按尝试顺序
    */
@@ -394,8 +369,7 @@ export class RenderRegistry implements RenderSink {
   /**
    * 补齐全局缺省值
    *
-   * 仅填充插件未指定的项：插件中硬编码的 `quality: 100` 表明其有相应理由，
-   * 全局配置不应覆盖它。
+   * 只填插件未指定的项：插件硬编码 `quality: 100` 说明它有理由，全局配置不该覆盖。
    * @param req 原始请求
    * @param policy 当前配置
    * @returns 补全后的请求
@@ -412,8 +386,8 @@ export class RenderRegistry implements RenderSink {
   /**
    * 摘除一条注册并关闭渲染器
    *
-   * 比对 entry 而不是只看 id：插件 A 卸载得晚、插件 B 已经用同一个 id 注册了
-   * 新实现时，A 的 Disposer 不应将 B 的实现摘除。
+   * 比对 entry 而不只看 id：A 卸载得晚而 B 已用同一个 id 注册了新实现时，
+   * A 的 Disposer 不该把 B 的摘掉。
    * @param id 渲染器 id
    * @param entry 注册时的条目
    */

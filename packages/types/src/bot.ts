@@ -146,9 +146,7 @@ export interface BotApi {
   getGroupList(): Promise<GroupInfo[]>
 
   /**
-   * 取单个群成员
-   *
-   * 实现应带缓存：这是最高频的查询（每条群消息都要判权限）。
+   * 取单个群成员；实现应带缓存，这是最高频的查询（每条群消息都要判权限）
    * @param gid 群 id
    * @param uid 用户 id
    * @returns 成员信息，不在群内时 undefined

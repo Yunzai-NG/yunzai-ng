@@ -2,17 +2,10 @@
  * 模块职责：命令注册表与匹配（实现 `CommandSink`）
  * 依赖方向：依赖类型包、plugin/hooks 的登记结构、util/text；不依赖事件实现与适配器
  * 生命周期：随内核创建，随内核销毁；每条注册返回 Disposer，插件卸载即摘除
- * 注意事项：**按触发词首字符分桶，而不是每条消息线性匹配全部正则。** 线性匹配下，
- *          装 20 个插件就意味着每条消息数百次正则测试，且插件越多越慢。
- *
- *          分桶后：`"#体力"` 进入 `#` 桶，一条 `#体力` 仅
- *          尝试 `#` 桶内的候选。桶内按 `priority` 预排序（注册时排序一次，
- *          匹配时不排序），因此匹配路径上不存在 sort 与正则编译。
- *
- *          正则模式尽力提取字面前缀（`/^#体力$/` → `#`）亦进入桶；无法提取的
- *          （`/^\d+/`、带 `m` 或 `i` 标志的字母开头）落入 `#unbucketed`，
- *          每条消息均需尝试 —— 这是必须付出的代价，因此插件作者在可使用字符串时
- *          不应改用正则。
+ * 注意事项：按触发词首字符分桶，一条消息只试同桶的候选，而不是线性匹配全部正则。
+ *          桶内按 `priority` 在注册时排好序，故匹配路径上没有 sort 也没有正则编译。
+ *          正则模式尽力提取字面前缀（`/^#体力$/` → `#`）也进桶；提取不出的
+ *          （`/^\d+/`、带 `m` 或 `i` 标志的字母开头）落入 `#unbucketed`，每条消息都要试。
  */
 import type {
   CommandInfo,
@@ -112,12 +105,9 @@ function keyOfString(pattern: string): string {
 /**
  * 尝试从正则里提取可分桶的字面首字符
  *
- * 只在**能证明**"命中必然以该字符开头"时才返回，宁可放弃优化也不能漏匹配。
- * 放弃的情形：
- * - 没有 `^` 锚定 —— 可以从任意位置命中
- * - `m` 标志 —— `^` 也匹配行首，消息第二行开头也算命中，首字符判断不成立
- * - `i` 标志且首字符是 ASCII 字母 —— 大小写两个桶，不值当
- * - 首字符是元字符、字符类（`\d`）、或后面跟着 `?`/`*` 等可选量词
+ * 只在能证明「命中必然以该字符开头」时才返回，宁可放弃优化也不能漏匹配。放弃的情形：
+ * 没有 `^` 锚定、带 `m` 标志（`^` 也匹配行首）、带 `i` 标志且首字符是 ASCII 字母、
+ * 首字符是元字符或字符类、首字符后跟可选量词。
  * @param re 正则
  * @returns 分桶键；无法提取时 undefined
  */
@@ -160,9 +150,8 @@ function keyOfRegExp(re: RegExp): string | undefined {
 /**
  * 去掉正则的有状态标志
  *
- * `g` 与 `y` 会让 `exec` 推进 `lastIndex`：同一个正则对象在第二条消息上
- * 会从上次结束的位置开始找，表现为"命令只灵一次"。这类 bug 极难排查，
- * 因此在注册时就消灭掉，并告知插件作者。
+ * `g` 与 `y` 会让 `exec` 推进 `lastIndex`，同一个正则对象在第二条消息上从上次结束的
+ * 位置开始找，表现为「命令只灵一次」。注册时就消灭掉，并告知插件作者。
  * @param re 原始正则
  * @param label 日志用的命令标识
  * @param logger 日志器
@@ -259,8 +248,7 @@ function byPriority(a: Entry, b: Entry): number {
 /**
  * 把一项按序插入已排序数组
  *
- * 注册是低频操作、匹配是高频操作，因此把排序成本挪到注册时，
- * 让匹配路径上一次 sort 都不做。
+ * 排序成本挪到注册时，故匹配路径上一次 sort 都不做。
  * @param list 已排序数组（就地修改）
  * @param entry 待插入条目
  */
@@ -291,8 +279,8 @@ function sceneAllowed(opts: CommandOptions, scene: MessageScene): boolean {
 /**
  * 命令路由器
  *
- * 既是 `ctx.command()` 的落点（`CommandSink`），也是消息管线的查询入口
- * （`match()`），还是 WebUI 的数据来源（`list()`）。
+ * 既是 `ctx.command()` 的落点（`CommandSink`），也是消息管线的查询入口（`match()`），
+ * 还是 WebUI 的数据来源（`list()`）。
  */
 export class CommandRouter implements CommandSink {
   /** 日志器 */
@@ -324,8 +312,7 @@ export class CommandRouter implements CommandSink {
   /**
    * 登记一条命令
    *
-   * 不会抛错：单个模式编译失败（如空串）只落一条 error 日志并跳过该模式，
-   * 其余别名照旧可用 —— 一条命令的一个别名写错不该让插件装不上。
+   * 不抛错：单个模式编译失败只落一条 error 并跳过该模式，其余别名照旧可用。
    * @param reg 登记内容
    * @returns 注销句柄
    */
@@ -343,9 +330,7 @@ export class CommandRouter implements CommandSink {
   /**
    * 模式变化后重建索引
    *
-   * 链式构造器的 `.alias()` 会往 `reg.patterns` 里塞新模式。整条重建而不是
-   * 增量追加：别名极少，而增量逻辑要处理"旧键还在不在别的模式里用"这种
-   * 引用计数问题，不值得。
+   * 整条重建而非增量追加：增量要处理「旧键还在不在别的模式里用」的引用计数。
    * @param reg 登记内容
    */
   reindex(reg: CommandRegistration): void {
@@ -359,8 +344,8 @@ export class CommandRouter implements CommandSink {
   /**
    * 找出该消息命中的全部命令，按匹配顺序排列
    *
-   * 只做**模式匹配**与**零成本的静态过滤**（禁用、场景、@我、权限）。
-   * 冷却是异步的、要写 KV，且命中后才该计费，因此留给 dispatch。
+   * 只做模式匹配与零成本的静态过滤（禁用、场景、@我、权限）。冷却是异步的、要写 KV，
+   * 且命中后才该计费，故留给 dispatch。
    * @param e 消息事件
    * @returns 候选数组；无命中时为空数组
    */
@@ -374,9 +359,6 @@ export class CommandRouter implements CommandSink {
       if (reg.handler === undefined) continue
       if (this.#isDisabled(reg)) continue
       if (!sceneAllowed(reg.options, e.scene)) continue
-      // 机器人自己发的消息：全局 bot.ignoreSelf 为 false 时事件才会走到这里，
-      // 但单条命令仍然默认不响应自己 —— 否则一个"复读"类命令会自我触发成死循环
-      if (reg.options.ignoreSelf !== false && e.sender.uid === e.selfId) continue
       // 群聊要求 @ 机器人；私聊天然算"对我说话"
       if (reg.options.atMe === true && e.isGroup && !e.atMe) continue
       if (reg.options.master === true && !e.isMaster) continue

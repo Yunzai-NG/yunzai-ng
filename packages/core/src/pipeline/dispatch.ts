@@ -2,18 +2,17 @@
  * 模块职责：事件分发编排 —— 把一条 `IncomingEvent` 走完"策略 → 中间件 → 等待 → 路由 → 冷却 → 处理"
  * 依赖方向：依赖管线内各子模块与事件总线；不依赖适配器实现，也不被适配器 import
  * 生命周期：随内核创建；无跨事件状态（冷却与等待都在各自的模块里）
- * 注意事项：这是**唯一**决定"一条消息会发生什么"的地方，顺序即语义：
- *
- *          1. 维护模式 / 忽略自身 —— 在构造事件对象**之前**判掉，省掉全部派生计算
+ * 注意事项：这是唯一决定「一条消息会发生什么」的地方，顺序即语义：
+ *          1. 维护模式 / 忽略自身 —— 在构造事件对象之前判掉，省掉全部派生计算
  *          2. 中间件 —— 可改写 `message`、可注入字段、可 `stop()`
- *          3. `e.prompt()` 等待者 —— 放在中间件之后（让改写生效）、路由之前
- *             （用户正在回答问题时不该同时触发命令，否则会收到两条回复）
+ *          3. `e.prompt()` 等待者 —— 在中间件之后（让改写生效）、路由之前（正在回答问题时
+ *             不该同时触发命令，否则会收到两条回复）
  *          4. 命令路由 —— 只做纯查询与零成本静态过滤
  *          5. 冷却 —— 命中之后才计费，且主人豁免
  *          6. 处理函数 —— 返回 `false` 继续找下一条，`block !== false` 则命中即止
  *
- *          `submit()` **永不抛出**。适配器在 socket 回调里调它，一个未捕获的
- *          rejection 会变成 `unhandledRejection` 进而带崩整个进程。
+ *          `submit()` 永不抛出：适配器在 socket 回调里调它，未捕获的 rejection 会变成
+ *          `unhandledRejection` 带崩进程。
  */
 import type {
   AnyEvent,
@@ -46,8 +45,6 @@ import type { CommandRouter, RouterCandidate } from "./router.js"
  * 否则"消息在哪一层被丢弃"将成为无法回答的问题。
  */
 export interface DispatchPolicyView {
-  /** 是否忽略机器人自己发出的消息 */
-  readonly ignoreSelf: boolean
   /**
    * 该用户当前是否应被响应
    * @param uid 用户 id
@@ -175,7 +172,7 @@ export class EventDispatcher {
     let event: AnyEvent | undefined
     try {
       if (incoming.kind === "message") {
-        if (!this.#acceptMessage(incoming, bot)) return
+        if (!this.#acceptMessage(incoming)) return
         const e = this.#factory.createMessage(incoming, bot)
         event = e
         this.#handled++
@@ -205,12 +202,12 @@ export class EventDispatcher {
 
   /**
    * 消息事件的准入判定
+   *
+   * 只判维护模式。自身消息由适配器决定要不要投进来，内核不再过滤。
    * @param incoming 适配器产出的消息事件
-   * @param bot 接收该事件的 Bot
    * @returns 是否继续处理
    */
-  #acceptMessage(incoming: IncomingMessageEvent, bot: BotApi): boolean {
-    if (this.#policy.ignoreSelf && incoming.sender.uid === bot.selfId) return false
+  #acceptMessage(incoming: IncomingMessageEvent): boolean {
     if (!this.#policy.canRespond(incoming.sender.uid)) {
       if (this.#logger.isLevelEnabled("trace")) {
         this.#logger.trace(`维护模式：忽略 ${incoming.sender.uid} 的消息`)
@@ -246,9 +243,8 @@ export class EventDispatcher {
   /**
    * 处理通知 / 请求 / 元事件
    *
-   * 这三类不存在"核心处理"—— 内核不代替插件决定是否同意入群请求。广播本身即为核心，
-   * 因此置于 `run` 的 core 位置：中间件调用 `stop()` 后自然不会广播，
-   * 无须在外层再判定一次 `stopped`。
+   * 这三类没有"核心处理"，广播本身即是核心，故置于 `run` 的 core 位置 ——
+   * 中间件 `stop()` 后自然不会广播，不必在外层再判一次 `stopped`。
    * @param event 运行时事件
    */
   async #processOther(event: NoticeEvent | RequestEvent | MetaEvent): Promise<void> {
@@ -270,14 +266,11 @@ export class EventDispatcher {
   /**
    * 等待者投递 + 命令路由
    *
-   * 并发闸门刻意开在**这里**而不是 `submit()` 入口，原因是 `e.prompt()`：
-   * 一个正在等用户回话的命令会一直占着许可，而"能结束这次等待"的下一条消息
-   * 必须先取得许可方能被处理 —— 闸门置于入口即构成死锁。等待者投递不需要
-   * 许可（它仅是唤醒一个已在执行中的处理函数），因此在 `offer()` 之后再取许可
-   * 既拦住了昂贵的命令处理，又不会将交互式流程锁死。
+   * 并发闸门开在这里而不是 `submit()` 入口，否则 `e.prompt()` 会死锁：正在等回话的
+   * 命令一直占着许可，而能结束这次等待的下一条消息又必须先取到许可。等待者投递不占
+   * 许可（只是唤醒一个已在执行的处理函数），故在 `offer()` 之后再取。
    *
-   * 代价是中间件与 `message` 总线事件不受限制。它们本应是轻量的，
-   * 真正可能同时开启大量浏览器页面的是命令处理函数。
+   * 代价是中间件与 `message` 总线事件不受限，它们本该是轻量的。
    * @param e 运行时消息事件
    */
   async #route(e: RuntimeMessageEvent): Promise<void> {

@@ -2,15 +2,12 @@
  * 模块职责：消息段构造器（`seg.*`）、消息内容归一化、媒体引用归一化
  * 依赖方向：仅依赖类型包与 util/text；不依赖任何子系统
  * 生命周期：纯函数，无状态
- * 注意事项：**媒体不默认转成 base64。** 一张 2MB 的图片会因此多占 2.7MB 内存（膨胀 4/3）并多一次
- *          全量 CPU 编码，而适配器与 Bot 同机部署时本可直接读盘。`toMediaRef` 保留来源种类，由
- *          适配器按 `id > url > path > buffer > base64` 选开销最低的通道。
- *
- *          **相邻文本段合并。** `e.reply(["体力：", 160, "/160"])` 若原样产出三段，平台侧会视为三条
- *          内容拼接，部分平台还按段计费或限流。合并也使 `e.text` 与实际展示文本一致。
- *
- *          **`null` / `undefined` / `false` 丢弃**，故条件拼装可直接写 `[e.isGroup && seg.at(uid), "x"]`。
- *          注意 `0` 与 `""` 的区别：`0` 是有意义的文本，只有空串才丢。
+ * 注意事项：三条约定 ——
+ *          1) 媒体不默认转 base64：`toMediaRef` 保留来源种类，由适配器按
+ *             `id > url > path > buffer > base64` 选开销最低的通道
+ *          2) 相邻文本段合并：原样产出多段会被平台视为多条内容拼接，部分平台还按段计费
+ *          3) `null` / `undefined` / `false` 丢弃，故可写 `[e.isGroup && seg.at(uid), "x"]`；
+ *             `0` 是有意义的文本，只有空串才丢
  */
 import { fileURLToPath } from "node:url"
 import { isAbsolute } from "node:path"
@@ -509,8 +506,7 @@ export function countByType(segments: readonly Segment[]): Partial<Record<Segmen
 /**
  * 将消息渲染成一行日志文本
  *
- * 媒体只出摘要不出正文，见 `describeMedia`。这是日志中"收到消息"一行的来源，
- * 也是排障时查阅频率最高的内容，因此格式刻意贴近使用者在聊天窗口中看到的形态。
+ * 媒体只出摘要不出正文，见 `describeMedia`。
  * @param segments 消息段
  * @returns 单行描述
  */

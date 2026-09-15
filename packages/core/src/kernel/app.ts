@@ -4,29 +4,19 @@
  *          **不依赖任何插件**，这是本次重写的核心不变量，由 scripts/check-layering.mjs 守着
  * 生命周期：一个进程一个实例；`stop()` 是终态，重启请新建实例
  * 注意事项：装配顺序不是任意排列，以下七项是强制约束 ——
- *
- *          **日志最先就绪，早于配置。** 否则「读配置时出错」无处记录，使用者只看到一个没有任何
- *          输出的进程。代价是轮转参数只能取 schema 默认值，配置里的改动次轮启动才生效（会记日志）。
- *
- *          **存储早于插件。** 插件加载失败要写状态、要记日志，两者都以 KV 为前提；反过来插件注册的
- *          KV 驱动本轮接管不了存储，见 kernel/kv-sink.ts。
- *
- *          **子系统接缝可后填。** `hooks` 与 `subsystems` 是可变对象，装配完直接替换字段即可，
- *          已加载的插件立即取得新实现（上下文是即时读取）。`server.enable` 为 false 时刻意不建实例，
- *          让 `hooks.server` 保持 `unavailableServer()` —— 插件调 `ctx.route()` 会得到一条说明原因的
- *          错误，而不是一次静默不生效的注册。
- *
- *          **`listen()` 排在插件加载之后、`app/ready` 之前。** 前者保证路由已齐、没有「面板部分可用」
- *          的窗口；后者是因为账号在 `app/ready` 里开始连接，反向 WebSocket 的适配器要求端点已可接入。
- *
- *          **AppView 全部用 getter。** 它被插件长期持有；若是值快照，替换 bots 注册表后插件手里
- *          那一份永远是空的。
- *
- *          **面板 API 在 `new App(...)` 之后挂载。** 它要读 `app.status` 与 `app.startedAt`。方向仍
- *          单向：`server/api.ts` 不认识 `App`，它收的是一组窄依赖加两个取值函数。
- *
- *          **内核不提供面板前端，只检测有没有插件提供。** 内核侧不留兜底实现 —— 兜底会使「替换面板」
- *          退化成必须改内核。
+ *          1) 日志最先就绪，早于配置，否则「读配置时出错」无处记录。代价是轮转参数只能取 schema
+ *             默认值，配置里的改动次轮启动才生效
+ *          2) 存储早于插件：插件加载失败要写状态、要记日志，两者都以 KV 为前提。反过来插件注册的
+ *             KV 驱动本轮接管不了存储，见 kernel/kv-sink.ts
+ *          3) 子系统接缝可后填 —— `hooks` 与 `subsystems` 是可变对象，装配完替换字段即可。
+ *             `server.enable` 为 false 时刻意不建实例，让 `ctx.route()` 得到一条说明原因的错误，
+ *             而不是一次静默不生效的注册
+ *          4) `listen()` 排在插件加载之后、`app/ready` 之前：前者保证路由已齐，后者因为账号在
+ *             `app/ready` 里开始连接，反向 WebSocket 的适配器要求端点已可接入
+ *          5) AppView 全部用 getter —— 它被插件长期持有，值快照会让替换注册表后插件手里那份永远是空的
+ *          6) 面板 API 在 `new App(...)` 之后挂载（要读 `app.status`）；方向仍单向，
+ *             `server/api.ts` 收的是一组窄依赖加两个取值函数
+ *          7) 内核不提供面板前端，只检测有没有插件提供 —— 留兜底会使「替换面板」退化成必须改内核
  */
 import { createRequire } from "node:module"
 import { isAbsolute, join, resolve } from "node:path"
@@ -148,11 +138,8 @@ export interface CreateAppOptions {
 /**
  * 可后填的子系统视图
  *
- * 这些注册表由阶段三（适配器 / 账号管理）提供。内核先置入空实现，使 `AppView`
- * 类型完整、WebUI 可正常渲染空列表，装配完成后直接替换字段。
- *
- * 未采用"未装配即抛错"的原因：`AppView` 属插件的高频读取对象
- *（例如启动横幅打印在线账号数），为一个尚未到达的阶段令插件失败并不适当。
+ * 这些注册表由阶段三（适配器 / 账号管理）提供，内核先置入空实现而非「未装配即抛错」：
+ * `AppView` 是插件的高频读取对象，为一个尚未到达的阶段令插件失败并不适当。
  */
 export interface KernelSubsystems {
   /** 适配器注册表 */
@@ -181,9 +168,8 @@ function emptySubsystems(): KernelSubsystems {
 /**
  * 从 Bot 注册表里挑一个账号
  *
- * `hooks.bots.pick` 的实现放在内核而不是账号管理器里，是为了让阶段三只需要
- * 提供 `BotRegistryView`（一个纯查询接口），不必再实现一遍"省略 id 时取第一个"
- * 这种约定。
+ * 实现放在内核而非账号管理器：阶段三只需提供 `BotRegistryView` 这个纯查询接口，
+ * 不必再实现一遍「省略 id 时取第一个」的约定。
  * @param bots Bot 注册表
  * @param id 账号记录 id 或平台 selfId；省略时取第一个在线账号
  * @returns Bot；无可用账号时 undefined
@@ -232,20 +218,13 @@ interface AppParts {
   /**
    * 装配期已登记的回收动作
    *
-   * `installRuntime` 发生在 `new App(...)` 之前，其时尚无 `own()` 可供调用，
-   * 因此它将回收动作累积于一个数组中，由此处接手。`stop()` 因而对"从未 start()"
-   * 的实例亦能完整回收 —— 装配失败后调用 `stop()` 是最自然的补救动作。
+   * `installRuntime` 早于 `new App(...)`，那时还没有 `own()`，故它把回收动作累积成
+   * 数组由此处接手 —— 「从未 start() 的实例」也因此能被 `stop()` 完整回收。
    */
   disposers: Disposer[]
   /** 停机等待上限 */
   stopTimeout: number
-  /**
-   * 共享服务器
-   *
-   * `server.enable` 为 false 时是 `undefined`，此时 `hooks.server` 仍是
-   * `unavailableServer()` 占位 —— 插件调 `ctx.route()` 会拿到一条说明原因的错误，
-   * 而不是一个静默不生效的注册。
-   */
+  /** 共享服务器；`server.enable` 为 false 时是 undefined，见文件头第 3 条 */
   server: ManagedServer | undefined
 }
 
@@ -282,29 +261,17 @@ export class App {
   readonly events: CoreEventBus
   /** 策略（主人、前缀、维护模式） */
   readonly policy: KernelPolicy
-  /**
-   * 子系统接缝
-   *
-   * **可变**：管线层、调度器、服务器、渲染器装好后替换对应字段即可，
-   * 已加载的插件立刻生效。见文件头第 3 条。
-   */
+  /** 子系统接缝；可变，装好后替换字段即可，已加载的插件立刻生效，见文件头第 3 条 */
   readonly hooks: KernelHooks
   /** 插件宿主 */
   readonly plugins: PluginHost
-  /**
-   * 可后填的子系统视图
-   *
-   * **可变**，同 `hooks`。阶段三装好适配器与账号管理后替换这里的字段。
-   */
+  /** 可后填的子系统视图；可变，同 `hooks` */
   readonly subsystems: KernelSubsystems
   /**
    * 运行期子系统的具体实现
    *
-   * 与 `subsystems` 的区别：那边是交给插件的**只读窄视图**（列表、查询），
-   * 这边是完整实现。WebUI 要做的事（增删账号、驱动登录会话、看渲染器状态、
-   * 读分发器积压）都在窄视图之外，所以内核自己留一份引用。
-   *
-   * 插件拿不到它 —— `PluginContext` 只暴露 `ctx.app`（即 `view`）。
+   * `subsystems` 是交给插件的只读窄视图，这里是完整实现 —— WebUI 要做的事（增删账号、
+   * 驱动登录会话、读分发器积压）都在窄视图之外。插件拿不到它，只能经 `ctx.app` 用 `view`。
    */
   readonly runtime: RuntimeParts
   /** 只读应用视图（交给插件的那一份） */
@@ -326,8 +293,7 @@ export class App {
   /**
    * 内部构造函数，请用 `createApp()`
    *
-   * 没有标 `private`：那样 `createApp()` 这个模块级函数自己也调不了。
-   * 封装靠 `AppParts` **不导出** —— 包外拿不到那些内部类型，也就拼不出参数。
+   * 不标 `private` 是因为那样 `createApp()` 自己也调不了；封装靠 `AppParts` 不导出。
    * @param parts 已装配好的部件
    */
   constructor(parts: AppParts) {
@@ -466,12 +432,8 @@ export class App {
   /**
    * 检测面板由谁提供，并在无人提供时给出可照做的一条指令
    *
-   * **内核不提供面板前端，此处只做检测。** 面板由插件调用 `ctx.panel()` 接管根路径，
-   * 因此检测必须排在 `plugins.loadAll()` 之后。内核侧不设兜底实现：兜底实现要求
-   * 内核知晓前端产物的目录约定，而那正是"替换面板必须改内核"的由来。
-   *
-   * 无人提供不是错误，只记一条 info：机器人收发消息与面板是两件独立的事，
-   * 精简部署（不装面板插件）是受支持的形态。
+   * 面板由插件调用 `ctx.panel()` 接管根路径，故检测必须排在 `plugins.loadAll()` 之后。
+   * 无人提供不是错误，只记一条 info —— 不装面板插件是受支持的形态。
    * @param server 共享服务器
    */
   #reportPanel(server: ManagedServer): void {
@@ -542,9 +504,8 @@ export class App {
   /**
    * 接管 `SIGINT` / `SIGTERM`，收到信号时优雅停机后退出进程
    *
-   * 刻意做成**显式调用**而不是 `createApp()` 里自动装上：往 `process` 上挂
-   * 全局监听器是有副作用的，嵌进别人程序里的内核不该私自决定进程什么时候退出。
-   * CLI 的 `yzng start` 调它，单元测试不调。
+   * 刻意做成显式调用而不是 `createApp()` 里自动装上：嵌进别人程序里的内核不该
+   * 私自决定进程什么时候退出。CLI 的 `yzng start` 调它，单元测试不调。
    * @returns 取消接管
    */
   handleSignals(): Disposer {
@@ -581,13 +542,8 @@ export class App {
   /**
    * 登记一个需在 `stop()` 中回收的句柄
    *
-   * 回收按登记的**逆序**执行，位置是 `stop()` 的第 3 步 —— 插件已卸载完毕
-   *（不再有向子系统注册的行为），而存储、事件总线、日志仍处于开启状态（尚可写出
-   * 最后一次账号状态、尚可记录最后一行日志）。
-   *
-   * 公开而非私有：`start()` 用它登记配置监听，阶段四的服务器会用它登记
-   * 关闭监听端口。装配期（`new App` 之前）的回收动作走
-   * `AppParts.disposers`，因为那时还没有实例可调。
+   * 回收按登记的逆序执行，位置是 `stop()` 的第 3 步：插件已卸载完毕，而存储、事件总线、
+   * 日志仍开着。装配期（`new App` 之前）的回收动作走 `AppParts.disposers`。
    * @param dispose 回收函数
    */
   own(dispose: Disposer): void {
@@ -611,9 +567,8 @@ export class App {
 /**
  * 创建应用
  *
- * 只装配，不启动：返回时全部子系统已就绪但没有任何账号在连、没有任何插件被
- * 加载。调用方可以在此期间往 `hooks` / `subsystems` 里塞测试替身，再调
- * `start()`。CLI 与测试都走这条路。
+ * 只装配，不启动：返回时子系统已就绪但没有账号在连、没有插件被加载。调用方可在此期间
+ * 往 `hooks` / `subsystems` 里塞测试替身，再调 `start()`。
  * @param opts 参数
  * @returns 应用实例
  * @throws 目录创建失败、或全部 KV 驱动都打不开时

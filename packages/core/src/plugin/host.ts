@@ -3,19 +3,12 @@
  * 依赖方向：依赖 plugin/{discover,define,context,events,services,hooks}、config、store、util
  * 生命周期：应用级单例；`dispose()` 卸载全部插件
  * 注意事项：这里是「内核不依赖插件」的执行现场，四条规则 ——
- *
- *          **一个插件出问题，其余插件与内核照常工作。** 导入失败、setup 抛错、setup 超时、
- *          依赖缺失，一律降级为一条 `status = "error"` 记录，内核继续启动。
- *
- *          **卸载必须完整归还资源。** 每个插件一份 `DisposalRegistry` 与一个 `AbortController`：
- *          先 abort（停掉插件内的 fetch 与循环），再逆序回收注册，最后按 owner 兜底清扫 ——
- *          兜底是为了应对「绕过 ctx 直接调注册表」这类越界写法。
- *
- *          **依赖失败要连带处理。** `resolveLoadOrder` 只能剔除未安装的依赖；一个插件 setup
- *          失败而依赖它的照常加载，会得到更难排查的半可用状态，故 setup 前再查一次实际状态。
- *
- *          **热重载只是开发期功能。** Node 的 ESM 缓存清不掉，每次重载都会永久留下一份旧模块
- *          连同其闭包，故 `reload()` 会在日志里说明这一点。
+ *          1) 一个插件出问题不影响其余：导入失败、setup 抛错或超时、依赖缺失，一律降级为一条
+ *             `status = "error"` 记录，内核继续启动
+ *          2) 卸载要完整归还资源：每插件一份 `DisposalRegistry` 与一个 `AbortController`，先 abort、
+ *             再逆序回收注册、最后按 owner 兜底清扫（兜底应对绕过 ctx 直接调注册表的写法）
+ *          3) 依赖失败要连带处理：`resolveLoadOrder` 只剔除未安装的依赖，故 setup 前再查一次实际状态
+ *          4) 热重载只是开发期功能：Node 的 ESM 缓存清不掉，每次重载永久留下一份旧模块连同其闭包
  */
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
@@ -64,11 +57,7 @@ const RELOAD_QUERY = "yzngReload"
  * 取插件版本
  *
  * `definePlugin` 中的声明优先，其次 package.json 的 `version`，两处皆无则 `0.0.0`。
- *
- * **取版本必须经此函数。** 曾出现日志只看 `definition.version`、而面板状态另有一条
- * 回落至 package.json 的取值：未在 `definePlugin` 中重复声明版本的插件（官方面板插件
- * 即是）在日志里显示为 `0.0.0`、在面板里显示为 `0.1.0`，同一进程内自相矛盾。版本号
- * 的单一事实来源应是 package.json，插件不应被要求在两处各写一遍。
+ * 取版本必须经此函数：另写一条回落链会让同一个插件在日志与面板里显示不同版本号。
  * @param definition 插件定义；无定义时（导入失败）传 undefined
  * @param candidate 候选，含 package.json
  * @returns 版本号
@@ -175,8 +164,8 @@ function describeError(err: unknown): string {
 /**
  * 插件宿主
  *
- * 线程模型：单线程；`loadAll` / `reload` / `unload` 之间用一条串行链互斥，
- * 避免"WebUI 点重载"与"文件监听触发重载"同时进来把状态搅乱。
+ * `loadAll` / `reload` / `unload` 之间用一条串行链互斥，避免「面板点重载」与
+ * 「文件监听触发重载」同时进来搅乱状态。
  */
 export class PluginHost {
   /** 依赖 */
@@ -290,13 +279,8 @@ export class PluginHost {
   /**
    * 按名取插件的运行时上下文
    *
-   * 供事件分发器使用：执行某个插件的命令处理函数时，`e.render()` 要用该插件的
-   * 模板根、`e.prompt()` 要用该插件的卸载信号。返回值刻意是完整的上下文而不是
-   * 另包一层窄接口 —— 分发器那边的参数类型（`PluginRuntimeView`）只取三个成员，
-   * 结构上天然满足，多定义一层适配器反而让"这两者必须对得上"变得不明显。
-   *
-   * 插件已卸载时返回 undefined：分发器据此把那条命令当作已失效跳过，
-   * 而不是拿着一个 signal 已 abort 的上下文继续跑。
+   * 供事件分发器使用：执行某插件的命令时，`e.render()` 要用该插件的模板根、
+   * `e.prompt()` 要用它的卸载信号。已卸载时返回 undefined，分发器据此跳过那条命令。
    * @param name 插件名
    * @returns 上下文；未加载或已卸载时 undefined
    */
@@ -307,8 +291,7 @@ export class PluginHost {
   /**
    * 将实时计数同步至状态快照
    *
-   * 计数存放于 `PluginCounters` 中由上下文实时增减，状态对象仅在被查询时同步 ——
-   * 以免每注册一条命令即更新一次快照。
+   * 计数由上下文实时增减，状态对象仅在被查询时同步，以免每注册一条命令就更新一次快照。
    * @param state 状态对象
    * @returns 同一个对象（已更新）
    */
@@ -578,9 +561,7 @@ export class PluginHost {
   /**
    * 声明插件配置
    *
-   * 没声明 `configSchema` 的插件也要有一个可用的 `ctx.config`：
-   * 让它 `get()` 返回空对象，比让插件作者判空好 —— 配置是不是空取决于用户，
-   * 插件代码不该为此分叉。
+   * 没声明 `configSchema` 的插件也给一个 `get()` 返回空对象的句柄，免得插件代码判空。
    * @param definition 插件定义
    * @returns 配置句柄与"是否真的声明了"
    */

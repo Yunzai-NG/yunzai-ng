@@ -3,20 +3,14 @@
  * 依赖方向：只依赖 node:crypto 与类型包
  * 生命周期：纯函数，无状态；令牌本身存在配置里
  * 注意事项：四条安全约定 ——
- *
- *          **令牌只从请求头读，绝不从查询串或 Cookie 读。** 查询串会进 access log、浏览器历史与
- *          Referer；Cookie 会被浏览器自动附带，那正是 CSRF 的成因。头部令牌没有「自动附带」这回事，
- *          故本服务器天然免疫 CSRF，也因此不需要 CSRF token。代价是 `EventSource` 用不了（它设不了
- *          请求头），故日志实时推送走 WebSocket。
- *
- *          **浏览器 WebSocket 同样设不了请求头**，故允许把令牌放进 `Sec-WebSocket-Protocol`。
- *          它是请求头的一部分，同样不会被自动附带。
- *
- *          **比较走 SHA-256 摘要 + `timingSafeEqual`。** 直接对原文用后者会在长度不等时抛错，
- *          等于把「长度对不对」变成一个旁路信号；先摘要则两边恒为 32 字节。
- *
- *          **没设令牌时只放行本机**，判据是 TCP 对端地址，且服务器强制 `trustProxy: false` ——
- *          否则任何人都能靠一个 `X-Forwarded-For: 127.0.0.1` 把自己伪装成本机。
+ *          1) 令牌只从请求头读，绝不从查询串或 Cookie 读：前者会进 access log 与 Referer，后者会被
+ *             浏览器自动附带（CSRF 的成因）。故本服务器免疫 CSRF、不需要 CSRF token；代价是
+ *             `EventSource` 用不了（它设不了请求头），日志实时推送因此走 WebSocket
+ *          2) 浏览器 WebSocket 同样设不了请求头，故允许把令牌放进 `Sec-WebSocket-Protocol`
+ *          3) 比较走 SHA-256 摘要 + `timingSafeEqual`：直接对原文用后者会在长度不等时抛错，
+ *             等于把「长度对不对」变成旁路信号
+ *          4) 没设令牌时只放行本机，判据是 TCP 对端地址，且服务器强制 `trustProxy: false` ——
+ *             否则一个 `X-Forwarded-For: 127.0.0.1` 就能把自己伪装成本机
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 

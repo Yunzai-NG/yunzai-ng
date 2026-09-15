@@ -2,11 +2,9 @@
  * 模块职责：统一事件模型（适配器产出的原始形态 + 内核补全后的运行时形态）
  * 依赖方向：依赖 bot / contact / segment / renderer / common
  * 生命周期：纯类型
- * 注意事项：刻意分成两种形态：`Incoming*` 只需适配器填平台真实有的字段，运行时形态
- *          由内核补齐（id / time / platform / bot / reply / render / isMaster…）。
- *          故写一个新适配器要做的只有「把平台报文翻译成 `IncomingEvent`」。
- *
- *          插件往事件上加字段走 `EventExtensions`（声明在本包入口，用法见那里）。
+ * 注意事项：分成两种形态：`Incoming*` 只需适配器填平台真实有的字段，运行时形态由内核补齐
+ *          （id / time / platform / bot / reply / render / isMaster…），故写新适配器只需把
+ *          平台报文翻译成 `IncomingEvent`。插件往事件上加字段走 `EventExtensions`（见本包入口）。
  */
 import type { BotApi, SendOptions, SendResult } from "./bot.js"
 import type { DurationLike } from "./common.js"

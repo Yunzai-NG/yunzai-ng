@@ -3,21 +3,13 @@
  * 依赖方向：依赖 fastify 与本目录的 auth/files/table；不认识任何插件，也不认识面板前端
  * 生命周期：`createManagedServer()` 建好但不监听；`listen()` 由 `App.start()` 在插件
  *          全部装完之后调用；`close()` 幂等，由 `App.own()` 登记
- * 注意事项：四个不显而易见的决定 ——
- *
- *          **Fastify 上只注册 4 条 catch-all 路由**（`/` 与 `/*` 各两条），真正的分发走 table.ts 的
- *          `PathTable` —— find-my-way 没有删除单条路由的 API，而「插件能装能卸能热重载」是核心不变量。
- *
- *          **鉴权放在 `onRequest` 钩子里**，不放在处理函数里。fastify 在 `handle-request` 开头就判
- *          `reply.sent`，故在 `onRequest` 里回了响应，body 解析与路由处理都不会发生 —— 未鉴权的请求
- *          不该有机会往本进程内存写 64MB。
- *
- *          **WebSocket 的拒绝也必须在 `onRequest` 里做。** `@fastify/websocket` 的 `onUpgrade` 会先建
- *          响应对象再调 `fastify.routing()`，此时回响应得到的是一个真正的 401/404，对方看得到原因；
- *          等进了 `wsHandler` 再关连接，对方只看到一次没有理由的断线。
- *
- *          **静态资源刻意不鉴权。** 浏览器请求文档时设不了请求头，要鉴权就只剩 Cookie 一条路，
- *          那会把 auth.ts 刻意避开的 CSRF 面重新引进来。HTML/JS 本身不是机密，要保护的是 API。
+ * 注意事项：四条不变量 ——
+ *          1) Fastify 上只注册 4 条 catch-all 路由，分发走 table.ts 的 `PathTable`：
+ *             find-my-way 删不掉单条路由，而插件要能装能卸能热重载
+ *          2) 鉴权放在 `onRequest` 钩子里而非处理函数里，故未鉴权的请求不会触发 body 解析
+ *          3) WebSocket 的拒绝同样在 `onRequest` 里做，对方才能收到真正的 401/404 而非无理由断线
+ *          4) 静态资源刻意不鉴权：浏览器请求文档时设不了请求头，鉴权就只剩 Cookie，
+ *             那会把 auth.ts 避开的 CSRF 面引回来
  */
 import { isAbsolute } from "node:path"
 import type { IncomingMessage } from "node:http"
@@ -52,8 +44,8 @@ const DEFAULT_BODY_LIMIT = 1024 * 1024
 /**
  * 任何路由都不得超过的请求体上限
  *
- * 同时作为 Fastify 实例级的 `bodyLimit`：实际的限流在本模块自有的解析器中按路由施加，
- * 此处仅为最后一道兜底，防止某个路由将 `bodyLimit` 设为 `Infinity`。
+ * 同时作为 Fastify 实例级的 `bodyLimit`。按路由的限流在本模块自有的解析器里施加，
+ * 此处是兜底，防止某个路由把 `bodyLimit` 设成 `Infinity`。
  */
 const MAX_BODY_LIMIT = 64 * 1024 * 1024
 
@@ -93,9 +85,8 @@ interface WsEntry {
 /**
  * 一次请求的查表结果
  *
- * 之所以要缓存：鉴权（`onRequest`）、请求体限流（内容解析器）、真正分发（路由处理
- * 函数）是三个不同阶段，它们必须看到**同一次**查表结果。否则一次插件热重载正好卡在
- * 中间，就会出现"按 A 路由鉴权、按 B 路由分发"这种既难复现又致命的错位。
+ * 鉴权、请求体限流、分发是三个阶段，必须看到同一次查表结果 —— 否则一次热重载卡在
+ * 中间就会「按 A 路由鉴权、按 B 路由分发」。
  */
 interface RequestContext {
   /** 归一化后的请求方法 */
@@ -132,10 +123,7 @@ type JsonParser = (
 /**
  * `ws` 原生连接里本文件真正用到的部分
  *
- * 为什么自己声明而不是 `import type { WebSocket } from "ws"`：`ws` 不自带类型声明，
- * 仓库里也没装 `@types/ws`。`@fastify/websocket` 内部 `import * as WebSocket from "ws"`，
- * 在 `skipLibCheck` 下退化成 `any`，因此这个最小接口可以直接赋给它的 `wsHandler` ——
- * 既不用装一个只为编译服务的类型包，也不用在代码里写 `any`。
+ * 自己声明而非从 `ws` 导入：它不自带类型声明，仓库也没装 `@types/ws`。
  */
 interface RawSocket {
   /** 连接状态，`1` 为已连通 */
@@ -219,9 +207,6 @@ export interface ManagedServerOptions {
 
 /**
  * 取错误的可读文本
- *
- * 内核没有统一的错误文案工具（pipeline/router.ts 也是就地内联的），这里同样自备一个，
- * 免得为一行三元表达式在 util 里加一个模块。
  * @param err 任意抛出物
  * @returns 可读文本
  */
@@ -242,13 +227,10 @@ function pathOf(url: string): string {
 /**
  * 取 TCP 对端地址
  *
- * 刻意使用 `request.socket.remoteAddress` 而非 `request.ip`：后者在 `trustProxy` 开启
- * 时会变为 `X-Forwarded-For` 的值。鉴权的"是否本机"判断绝不能被一个请求头左右，
- * 因此此处绕开 Fastify 的加工，直接向内核获取对端地址。
- *
- * 使用 `?.` 是必要的：WebSocket 升级经由 `fastify.routing()` 而非正常的请求流程，
- * 注入式测试（`injectWS`）伪造的 raw request 上并不存在 `socket`。无法取得时返回空串，
- * 于是 `isLoopbackAddress("")` 为 false —— 无法确定时按"非本机"处理，是安全的一侧。
+ * 用 `request.socket.remoteAddress` 而非 `request.ip`：后者在 `trustProxy` 开启时会变成
+ * `X-Forwarded-For` 的值，而「是否本机」不能被请求头左右。`?.` 也是必要的 —— WebSocket
+ * 升级经 `fastify.routing()`，注入式测试伪造的 raw request 上没有 `socket`；取不到时返回
+ * 空串，`isLoopbackAddress("")` 为假，即按「非本机」处理。
  * @param request Fastify 请求
  * @returns 对端地址；取不到时空串
  */
@@ -278,10 +260,8 @@ function mediaTypeOf(header: string | undefined): string {
 /**
  * 判断是否是一个 WebSocket 升级请求
  *
- * 不能只看 `request.ws`：`fastify.addHook()` 立即生效，而 `fastify.register()` 要等到
- * `ready()` 才启动插件，因此本服务器的 `onRequest` 钩子**排在 `@fastify/websocket`
- * 自己那个钩子之前**，那时 `request.ws` 还没被赋值。所以以请求头为准，
- * `request.ws` 只当快捷路径。
+ * 不能只看 `request.ws`：本服务器的 `onRequest` 钩子排在 `@fastify/websocket` 自己那个
+ * 之前（addHook 立即生效，register 要等 `ready()`），那时 `request.ws` 还没被赋值。
  * @param request Fastify 请求
  * @returns 是否为升级请求
  */
@@ -295,8 +275,7 @@ function isUpgradeRequest(request: FastifyRequest): boolean {
 /**
  * 把监听地址转成"能点开"的形式
  *
- * `0.0.0.0` 与 `::` 是通配监听地址，不是可访问地址。日志里印一条
- * `http://0.0.0.0:2536` 等于给用户一个点不开的链接。
+ * `0.0.0.0` 与 `::` 是通配监听地址，不是可访问地址。
  * @param host 配置里的监听地址
  * @returns 可放进 URL 的主机名
  */
@@ -321,8 +300,7 @@ function httpError(status: number, message: string): HttpError {
 /**
  * 从错误里取状态码
  *
- * 只认 400–599：插件把 `statusCode` 写成 `0` 或 `200` 时，回一个"成功"的错误响应
- * 远比回 500 更难排查。
+ * 只认 400–599：插件把 `statusCode` 写成 `0` 或 `200` 时，一个"成功"的错误响应比 500 难查。
  * @param err 任意抛出物
  * @returns 状态码；不合法时 500
  */
@@ -336,10 +314,8 @@ function statusOf(err: unknown): number {
 /**
  * 判断处理函数的返回值是否为一个 `RouteResponse` 信封
  *
- * `RouteHandler` 允许直接以 `return { ok: true }` 作为响应体，亦允许
- * `return { status: 201, body: x }` 指定状态码，二者必须可以区分。判据是**键集合完全
- * 落在 `status`/`headers`/`body` 之内**：业务对象只要多出一个字段便不会被误判。
- * 确需返回一个恰好只含这三个键的业务对象时，外层包裹一层 `{ body: 该对象 }` 即可。
+ * 判据是键集合完全落在 `status`/`headers`/`body` 之内，故业务对象多一个字段就不会被误判。
+ * 确需返回恰好只含这三个键的业务对象时，外层包一层 `{ body: 该对象 }`。
  * @param value 处理函数的返回值
  * @returns 是否为信封
  */
@@ -358,9 +334,8 @@ function isRouteResponse(value: unknown): value is RouteResponse<unknown> {
 /**
  * 把响应体转成 Fastify 认得的形态
  *
- * Fastify 只对 `Buffer.isBuffer()` 为真的值走二进制直发。一个普通 `Uint8Array`
- * 会被当成对象 JSON 序列化成 `{"0":137,"1":80,…}`，而且状态码还是 200 ——
- * 这种故障从现象追回类型问题极其费时，所以在这里就地转掉。
+ * Fastify 只对 `Buffer.isBuffer()` 为真的值走二进制直发；普通 `Uint8Array` 会被 JSON
+ * 序列化成 `{"0":137,"1":80,…}` 且状态码仍是 200。
  * @param body 处理函数给的响应体
  * @returns 可交给 `reply.send()` 的值
  */
@@ -391,8 +366,8 @@ function sendResult(reply: FastifyReply, result: unknown): FastifyReply {
 /**
  * 解析表单编码的请求体
  *
- * 用 `Object.create(null)` 而不是 `{}`：对字面量对象写 `out["__proto__"] = x` 会真的
- * 改掉它的原型，一个表单字段就能污染下游所有属性查找。
+ * 用 `Object.create(null)` 而不是 `{}`：对字面量对象写 `out["__proto__"] = x` 会改掉它的
+ * 原型，一个表单字段就能污染下游所有属性查找。
  * @param text 表单文本
  * @returns 无原型的键值对
  */
@@ -448,22 +423,13 @@ function wrapConnection(
   const closeCbs = new Set<(code: number, reason: string) => void>()
   const errorCbs = new Set<(err: Error) => void>()
 
-  /*
-   * 回调收进 Set 由单一监听分发，而不是每个插件各注册一次
-   *
-   * 于是 `onMessage()` 的 Disposer 只是从 Set 里删一项 —— 不需要 `off`（`RawSocket` 因而
-   * 不必声明它），也不会因一条连接上注册了十几个插件而触发 Node 的 MaxListeners 警告。
-   */
-
   /**
    * 把一个事件分发给一组回调
    * @param set 回调集合
    * @param args 回调实参
    */
   const fire = <A extends unknown[]>(set: ReadonlySet<(...args: A) => void>, ...args: A): void => {
-    // 遍历副本：在回调里调用自身的 Disposer 是常见写法，直接遍历原 Set 会让迭代器行为取决于
-    // 删除时机。抛错只记日志不外传 —— 单个插件的缺陷不该中断连接，更不该沿 ws 的事件循环
-    // 变成 uncaught exception
+    // 遍历副本：在回调里调用自身的 Disposer 是常见写法，直接遍历原 Set 会让迭代器行为取决于删除时机
     for (const cb of [...set]) {
       try {
         cb(...args)
@@ -543,9 +509,8 @@ function wrapConnection(
 /**
  * 共享 HTTP / WebSocket 服务器
  *
- * 实现 `ServerSink`，因此 `ctx.route()` / `ctx.websocket()` / `ctx.static()` 最终都落到
- * 这里。面板自己的 API 也只是"一个 scope 为 `/api` 的普通注册方"，没有任何特权 ——
- * 这是"一切皆可为插件"在服务器层的体现。
+ * 实现 `ServerSink`，故 `ctx.route()` / `ctx.websocket()` / `ctx.static()` 都落到这里。
+ * 面板 API 只是一个 scope 为 `/api` 的普通注册方，没有特权。
  */
 export class ManagedServer implements ServerSink {
   /** Fastify 实例 */
@@ -580,8 +545,8 @@ export class ManagedServer implements ServerSink {
   /**
    * 建好实例但不监听
    *
-   * **不要直接 `new`**，用 `createManagedServer()`：路由必须等到两个 Fastify 插件启动
-   * 完成之后才能注册（原因见 `#boot()`），而那是一个异步过程，构造函数里做不到。
+   * **不要直接 `new`**，用 `createManagedServer()`：路由必须等两个 Fastify 插件启动完成
+   * 才能注册（见 `#boot()`），而那是异步的。
    * @param opts 构造参数
    */
   constructor(opts: ManagedServerOptions) {
@@ -614,12 +579,10 @@ export class ManagedServer implements ServerSink {
   /**
    * 启动两个 Fastify 插件，然后装上钩子与那 4 条 catch-all 路由
    *
-   * **`await fastify.after()` 这一步不能省。** `fastify.route()` 会**同步**触发
-   * `onRoute` 钩子（见 fastify 的 `lib/route.js` 里 `addNewRoute` 直接
-   * `for (const hook of this[kHooks].onRoute)`），而 `@fastify/websocket` 的 `onRoute`
-   * 钩子是在其自身启动时方才装上的。若先注册路由，该钩子将完全观察不到本服务器的路由，
-   * 于是路由的 handler 不会被包上"升级分支" —— 表现为所有 WebSocket 握手均得到一个
-   * 普通 HTTP 响应，且完全不报错。
+   * **`await fastify.after()` 这一步不能省。** `fastify.route()` 同步触发 `onRoute` 钩子，
+   * 而 `@fastify/websocket` 的那个钩子要等自身启动才装上；先注册路由，它就观察不到本
+   * 服务器的路由，handler 不会被包上升级分支 —— 表现为全部 WebSocket 握手都得到一个
+   * 普通 HTTP 响应，且不报错。
    * @returns 完成时 resolve
    */
   async #boot(): Promise<void> {
@@ -709,8 +672,7 @@ export class ManagedServer implements ServerSink {
   /**
    * 当前服务器状态
    *
-   * 刻意做成 getter 而不是构造时算好的常量：`port: 0` 时内核会拿到一个随机端口，
-   * 只有 `listen()` 之后才知道是多少，而测试与面板都要显示真实端口。
+   * getter 而非构造时算好的常量：`port: 0` 时实际端口要等 `listen()` 之后才知道。
    * @returns 服务器信息
    */
   get info(): ServerInfo {
@@ -732,9 +694,8 @@ export class ManagedServer implements ServerSink {
   /**
    * 原生 Fastify 实例
    *
-   * 保留给两种场合：测试中的 `inject()` / `injectWS()`，以及插件确实需要 Fastify 原生
-   * 能力（multipart、SSE、自定义序列化）之时。**直接在其上注册的路由无法摘除**，
-   * 插件热重载后会残留为失效路由，因此除已确认可接受该后果外，应使用 `route()`。
+   * 留给测试的 `inject()` / `injectWS()`，以及确实要 Fastify 原生能力（multipart、SSE）
+   * 的插件。**直接在其上注册的路由无法摘除**，插件热重载后会残留为失效路由。
    * @returns Fastify 实例
    */
   get raw(): FastifyInstance {
@@ -744,13 +705,8 @@ export class ManagedServer implements ServerSink {
   /**
    * 确保有访问令牌，没有就生成一个并落盘
    *
-   * **不再区分是否只监听本机。** 早先只在监听地址对外时生成，理由是「单机用户不该为了
-   * 打开面板先去抄一串随机字符」。但那让本机部署处在一种没有门的状态：`checkAuth` 在
-   * 无令牌时放行一切回环请求，而「本机」并不等于「可信」—— 使用者浏览器里的任何一个
-   * 页面都能向 `127.0.0.1:2536` 发请求，那正是面板的全部写权限。
-   *
-   * 代价是首次启动多一步：从日志里把令牌抄进面板。故令牌取 16 位字母数字而非 32 位
-   * base64url（见 `generateToken`），且面板的令牌页留了一枚「发送到日志」以便重看。
+   * 不区分是否只监听本机：`checkAuth` 在无令牌时放行一切回环请求，而「本机」不等于
+   * 「可信」—— 使用者浏览器里的任何页面都能向 `127.0.0.1:2536` 发请求。
    * @returns 完成时 resolve
    */
   async ensureToken(): Promise<void> {
@@ -787,8 +743,7 @@ export class ManagedServer implements ServerSink {
   /**
    * 关闭服务器
    *
-   * 幂等。清表置于 `finally` 中：`fastify.close()` 抛错（例如某个 `preClose` 钩子出现问题）
-   * 亦不应残留大量指向已卸载插件闭包的注册项。
+   * 幂等。清表放在 `finally` 里：`fastify.close()` 抛错时也不该残留指向已卸载插件闭包的注册项。
    * @returns 完成时 resolve
    */
   async close(): Promise<void> {
@@ -840,9 +795,7 @@ export class ManagedServer implements ServerSink {
   /**
    * 注册一个 WebSocket 端点
    *
-   * 不给 `verify` 时沿用面板令牌校验（与 `route()` 的 `auth` 默认为 true 对齐）。
-   * 适配器的反向连接端点要让平台连进来，就自己给一个 `verify` 做签名校验 ——
-   * 给了就完全接管，不再叠加令牌校验。
+   * 不给 `verify` 时沿用面板令牌校验；给了就完全接管，不再叠加令牌校验。
    * @param scope URL 前缀
    * @param path 相对 scope 的路径
    * @param handler 连接建立后的处理函数
@@ -870,9 +823,8 @@ export class ManagedServer implements ServerSink {
   /**
    * 挂载面板：把一个单页应用目录挂到站点根路径
    *
-   * 内置面板与接管它的插件都走这里，因此"谁在提供面板"只有一个判定依据
-   * （`claimant("/")`）。第二个调用方会在路径表里撞上重复模式而抛错，
-   * 这正是期望行为：静默覆盖会让面板显示的内容无法判定。
+   * 内置面板与接管它的插件都走这里，故「谁在提供面板」只有一个判据（`claimant("/")`）。
+   * 第二个调用方会撞上重复模式而抛错，这是期望行为 —— 静默覆盖会让面板内容无法判定。
    * @param owner 归属标识，如 `core` 或 `plugin:webui-next`
    * @param dir 单页应用产物目录（绝对路径）
    * @returns 注销句柄；幂等
@@ -919,8 +871,7 @@ export class ManagedServer implements ServerSink {
   /**
    * 查询某路径当前由谁提供
    *
-   * 先查静态挂载再查 GET 路由：内核用它判断根路径是否已被插件接管，而接管
-   * 面板既可以挂一个单页目录，也可以注册一条返回 HTML 的路由，两种都要认。
+   * 静态挂载与 GET 路由都要查：接管面板既可以挂单页目录，也可以注册一条返回 HTML 的路由。
    * @param path URL 路径
    * @returns 提供方的注册前缀；无人提供时 undefined
    */
@@ -934,9 +885,8 @@ export class ManagedServer implements ServerSink {
   /**
    * 静态挂载的公共实现
    *
-   * 模式写成 `<urlPath>/*rest`：通配段"连什么都不剩也匹配"（见 table.ts 的
-   * `matchSegments`），所以 `/webui/*rest` 同时命中 `/webui` 与 `/webui/a/b.js`，
-   * 不必再额外注册一条裸路径。
+   * 模式写成 `<urlPath>/*rest`：通配段连空也匹配（见 table.ts 的 `matchSegments`），
+   * 故 `/webui/*rest` 同时命中 `/webui` 与 `/webui/a/b.js`，不必再注册一条裸路径。
    * @param scope URL 前缀
    * @param urlPath 相对 scope 的 URL 路径
    * @param dir 本地目录绝对路径
@@ -1017,9 +967,8 @@ export class ManagedServer implements ServerSink {
   /**
    * 拒绝一次升级请求
    *
-   * 额外附带 `Connection: close`：升级被拒之后该条 TCP 连接已无其他用途，而
-   * `@fastify/websocket` 的 `onResponse` 钩子仅在 `request.ws` 为真时才去 destroy
-   * socket —— 本服务器的钩子执行于其之前，该标记此时尚未被设置。
+   * 附带 `Connection: close`：`@fastify/websocket` 的 `onResponse` 钩子只在 `request.ws`
+   * 为真时才去 destroy socket，而本服务器的钩子跑在它之前，那时该标记还没被设上。
    * @param reply Fastify 响应
    * @param status 状态码
    * @param message 错误文案
@@ -1032,9 +981,8 @@ export class ManagedServer implements ServerSink {
   /**
    * 唯一的请求入口钩子：查表 → 鉴权 → 缓存上下文
    *
-   * 返回 `undefined` 表示放行，返回 `reply` 表示"已经回过响应了，别再往下走"。后者
-   * 之所以真的能拦住后续阶段，是因为 fastify 的 `lib/handle-request.js` 第一行就是
-   * `if (reply.sent === true) return`，body 解析与路由处理都在它之后。
+   * 返回 `reply` 即「已回过响应，别再往下走」—— fastify 的 `handle-request.js` 第一行
+   * 判 `reply.sent`，body 解析与路由处理都在它之后。
    * @param request Fastify 请求
    * @param reply Fastify 响应
    * @returns 已回响应时是 `reply`，放行时是 `undefined`
@@ -1185,9 +1133,8 @@ export class ManagedServer implements ServerSink {
   /**
    * 把 Fastify 请求转成插件看到的 `RouteRequest`
    *
-   * 插件拿到的是一个平的、只读的普通对象，不是 Fastify 请求：一方面插件不该依赖
-   * Fastify 的 API（将来换 HTTP 实现时才不必改插件），另一方面这样也堵住了插件从
-   * `request` 上摸到 `raw.socket` 去做越权操作的路。
+   * 给插件一个平的只读对象而非 Fastify 请求：换 HTTP 实现时不必改插件，也堵住了从
+   * `request.raw.socket` 越权的路。
    * @param request Fastify 请求
    * @param ctx 本次请求的查表结果
    * @param params 路径参数
@@ -1213,9 +1160,8 @@ export class ManagedServer implements ServerSink {
   /**
    * 唯一的请求体解析器
    *
-   * 只注册一个 `"*"` catch-all 而不是按类型注册若干个，原因和路由一样：限流上限是
-   * **按路由**来的，只有拿到本次请求的上下文才知道该按多少截断，而 Fastify 的按类型
-   * 解析器拿不到"这条请求命中了哪个路由"。
+   * 只注册一个 `"*"` catch-all：限流上限是按路由来的，而 Fastify 的按类型解析器拿不到
+   * 「这条请求命中了哪个路由」。
    * @param request Fastify 请求
    * @param payload 原始请求流
    * @param done 解析完成回调
@@ -1301,8 +1247,8 @@ export class ManagedServer implements ServerSink {
   /**
    * 真正分发一次请求
    *
-   * 走到这里说明 `onRequest` 已经放行，所以上下文一定在；查不到只可能是有人绕开了钩子
-   * （比如直接往 `raw` 上加了路由），那是 500 而不是 404。
+   * `onRequest` 已放行，故上下文一定在；查不到只可能是有人绕开了钩子（直接往 `raw` 上
+   * 加路由），那是 500 而不是 404。
    * @param request Fastify 请求
    * @param reply Fastify 响应
    * @returns 同一个 `reply`
@@ -1369,10 +1315,8 @@ export class ManagedServer implements ServerSink {
 /**
  * 创建一个共享服务器，但**不**开始监听
  *
- * `await ready()` 在此处即完成，而非留至 `listen()`：`ready()` 之后 Fastify 不再
- * 接受新路由，而本服务器共计只有那 4 条 catch-all，插件后续注册的路由均进入 `PathTable`，
- * 不经由 Fastify —— 因此提前 ready 是安全的，同时可使 `raw.inject()` / `raw.injectWS()`
- * 在不占用端口的前提下直接用于测试。
+ * `ready()` 在此处就完成而非留到 `listen()`：ready 之后 Fastify 不再收新路由，而插件的
+ * 路由都进 `PathTable` 不经 Fastify，故提前 ready 安全，且 `raw.inject()` 无需占端口即可测。
  * @param opts 构造参数
  * @returns 已就绪的服务器
  */

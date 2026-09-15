@@ -881,7 +881,7 @@ describe("面板 API", () => {
       expect(spies.market.install).toHaveBeenLastCalledWith("fresh", { dependencies: false })
 
       await call("POST", "market/demo/update", { dependencies: false })
-      expect(spies.market.update).toHaveBeenLastCalledWith("demo", { dependencies: false, stash: false })
+      expect(spies.market.update).toHaveBeenLastCalledWith("demo", { dependencies: false, onDirty: "abort" })
     })
 
     /*
@@ -948,8 +948,8 @@ describe("面板 API", () => {
       const res = await call("POST", "market/demo/update", {})
       expect(res.statusCode).toBe(200)
       expect(spies.plugins.unload).toHaveBeenCalledWith("demo")
-      // stash 缺省为假：撞上本地改动时内核中止并交回决定权，面板据此弹一个必须回答的问句
-      expect(spies.market.update).toHaveBeenCalledWith("demo", { dependencies: true, stash: false })
+      // onDirty 缺省为 abort：撞上本地改动时内核中止并交回决定权，面板据此弹一个必须回答的问句
+      expect(spies.market.update).toHaveBeenCalledWith("demo", { dependencies: true, onDirty: "abort" })
       expect(res.json().unloaded).toBe(true)
       expect(res.json().version).toBe("2.0.0")
     })
@@ -970,16 +970,47 @@ describe("面板 API", () => {
     })
 
     /*
-     * 同意暂存那一路把 `stash` 原样传下去
+     * 三个取值各自原样传下去
      *
-     * 这一条与上面那条缺省为假的用例是一对：两者合起来钉住「问过才暂存」。少了任一条，
-     * 一次「缺省翻回真」的改动都不会让用例变红，而症状是使用者的改动在他没答应的情况下
-     * 进了 stash —— 那正是这次改动要消除的行为。
+     * 与上面那条缺省 `abort` 的用例是一组：合起来钉住「问过才动磁盘」。少了它们，一次
+     * 「缺省翻成 stash」的改动不会让用例变红，而症状是使用者的改动在他没答应的情况下
+     * 进了 stash。`discard` 那一路更要钉 —— 它不可撤销。
      */
-    it("同意暂存时把 stash 传给内核", async () => {
-      const res = await call("POST", "market/demo/update", { stash: true })
+    it("onDirty 的三个取值原样传给内核", async () => {
+      await call("POST", "market/demo/update", { onDirty: "stash" })
+      expect(spies.market.update).toHaveBeenLastCalledWith("demo", { dependencies: true, onDirty: "stash" })
+
+      await call("POST", "market/demo/update", { onDirty: "discard" })
+      expect(spies.market.update).toHaveBeenLastCalledWith("demo", { dependencies: true, onDirty: "discard" })
+
+      const res = await call("POST", "market/demo/update", { onDirty: "abort" })
       expect(res.statusCode).toBe(200)
-      expect(spies.market.update).toHaveBeenCalledWith("demo", { dependencies: true, stash: true })
+      expect(spies.market.update).toHaveBeenLastCalledWith("demo", { dependencies: true, onDirty: "abort" })
+    })
+
+    /*
+     * 读不懂的 `onDirty` 退回 `abort`，而不是当作某个动作
+     *
+     * 面板与内核各自发布，一个新面板可能送来这里还不认识的取值。此时唯一安全的落点是
+     * 「什么都不做」—— 猜成 stash 或 discard 都在替使用者动他的文件。
+     */
+    it("onDirty 取值不认识时退回 abort", async () => {
+      await call("POST", "market/demo/update", { onDirty: "wipe" })
+      expect(spies.market.update).toHaveBeenLastCalledWith("demo", { dependencies: true, onDirty: "abort" })
+    })
+
+    /*
+     * 旧面板的 `stash: true` 继续收
+     *
+     * 面板与内核各自发布，版本不必齐步。旧面板只会送 `stash`，而它发出的那次更新不该
+     * 因为内核换了参数名就以一条 400 收场。`onDirty` 同时在场时以它为准。
+     */
+    it("旧请求体的 stash: true 等价于 onDirty: stash", async () => {
+      await call("POST", "market/demo/update", { stash: true })
+      expect(spies.market.update).toHaveBeenLastCalledWith("demo", { dependencies: true, onDirty: "stash" })
+
+      await call("POST", "market/demo/update", { stash: true, onDirty: "abort" })
+      expect(spies.market.update).toHaveBeenLastCalledWith("demo", { dependencies: true, onDirty: "abort" })
     })
 
     /*
@@ -1040,7 +1071,7 @@ describe("面板 API", () => {
       const res = await call("POST", "market/relay-checkin-plugin/update", {})
       expect(res.statusCode).toBe(200)
       expect(spies.plugins.unload).toHaveBeenCalledWith("relay-checkin")
-      expect(spies.market.update).toHaveBeenCalledWith("relay-checkin-plugin", { dependencies: true, stash: false })
+      expect(spies.market.update).toHaveBeenCalledWith("relay-checkin-plugin", { dependencies: true, onDirty: "abort" })
     })
 
     /*

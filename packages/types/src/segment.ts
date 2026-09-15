@@ -261,12 +261,7 @@ export interface KeyboardSegment {
   rows: KeyboardButton[][]
 }
 
-/**
- * 平台私有段的兼容出口
- *
- * 适配器遇到通用模型未覆盖的类型时原样传入，插件可依据 `platform` + `platformType`
- * 自行处理。内核仅保证其可被完整透传回同一平台。
- */
+/** 平台私有段的兼容出口：内核只保证原样透传回同一平台，插件按 `platform` + `platformType` 自行处理 */
 export interface RawSegment {
   /** 段类型 */
   type: "raw"
@@ -309,10 +304,9 @@ export type SegmentType = Segment["type"]
 /**
  * 按类型取出对应的段接口
  *
- * 判别条件写作 `Record<"type", T>` 而非形式更直观的 `{ type: T }`：
- * 后者为内联属性签名，将被 `jsdoc/require-jsdoc` 的 `TSPropertySignature`
- * 规则要求补充注释，`--fix` 会在类型表达式中间插入一段空注释并将该行拆为四行。
- * 两种写法对 `Extract` 完全等价，不应将其"简化"回前一种形式。
+ * 判别条件必须写作 `Record<"type", T>` 而非 `{ type: T }`：后者是内联属性签名，
+ * 会被 `jsdoc/require-jsdoc` 要求补注释，`--fix` 之后这一行会被拆成四行。两者对
+ * `Extract` 等价，不要"简化"回去。
  */
 export type SegmentOf<T extends SegmentType> = Extract<Segment, Record<"type", T>>
 
@@ -320,9 +314,6 @@ export type SegmentOf<T extends SegmentType> = Extract<Segment, Record<"type", T
 export type MessageContentItem = string | number | Segment | null | undefined | false
 
 /**
- * 消息内容的宽松输入
- *
- * 支持任意层数嵌套数组，内核 `toSegments()` 会展平并把裸字符串/数字转成文本段。
- * 这样 `e.reply([seg.at(uid), "你的体力：", imgs])` 可以直接写。
+ * 消息内容的宽松输入：任意层嵌套数组，`toSegments()` 展平并把裸字符串/数字转成文本段
  */
 export type MessageContent = MessageContentItem | readonly MessageContent[]

@@ -2,16 +2,13 @@
  * 模块职责：Bot 门面（`BotFacade`）与 Bot 注册表（实现 `BotRegistryView`）
  * 依赖方向：依赖类型包、message/*、util/*；**不认识适配器实现，也不认识账号管理器**
  * 生命周期：门面随账号连接建立、随断开销毁；注册表随内核创建
- * 注意事项：门面存在的理由是**把发送语义收进内核**，使适配器只需实现「把这一段消息段发出去」。
- *          以下四件一律由门面负责：`splitLength` 超长切分、`sequential` 同会话串行（`KeyedQueue`，
- *          键与 `e.prompt()` 共用 `targetKey`）、`sendTimeout` 发送超时、`recallAfter` /
- *          `autoForward`。故 `SendOptions` 四个字段里**只有 `quote` 会传到驱动**。
+ * 注意事项：门面把发送语义收进内核，故适配器只需实现「把这一段消息段发出去」。四件事由门面负责：
+ *          `splitLength` 超长切分、`sequential` 同会话串行（`KeyedQueue`，键与 `e.prompt()` 共用
+ *          `targetKey`）、`sendTimeout` 发送超时、`recallAfter` / `autoForward`。故 `SendOptions`
+ *          四个字段里只有 `quote` 会传到驱动。
  *
- *          **超时只是「不再等」，取消不了已发出的请求** —— 消息可能仍然送达，故超时后绝不自动重试，
- *          否则用户会收到两条一样的回复。
- *
- *          **只有发送类调用套 `sendTimeout`。** 查询类不套：`getGroupMemberList` 在千人群上本就要
- *          十几秒，按「发一条消息」的尺度掐掉它是错的，那属于适配器自己的 HTTP 超时。
+ *          超时只是「不再等」，取消不了已发出的请求，故超时后绝不自动重试 —— 否则用户收到两条回复。
+ *          只有发送类调用套 `sendTimeout`：`getGroupMemberList` 在千人群上本就要十几秒。
  */
 import type {
   BotApi,
@@ -40,10 +37,9 @@ import { KeyedQueue } from "../util/queue.js"
 /**
  * `BotApi` 上的可选方法名
  *
- * 门面必须**存在性对齐**驱动：`pipeline/event.ts` 的 `createRequest` 即依靠
- * `bot.handleGroupRequest === undefined` 判断"该平台是否支持同意加群"。
- * 若门面无条件补齐这些方法（即便内部转发至一个不存在的实现），
- * 该处判断将永远为真，错误亦由"能力探测失败"转变为"调用时于运行时抛错"。
+ * 门面必须**存在性对齐**驱动：`pipeline/event.ts` 的 `createRequest` 靠
+ * `bot.handleGroupRequest === undefined` 判断该平台支不支持同意加群。无条件补齐这些方法
+ * 会让那处判断永远为真。
  */
 const OPTIONAL_METHODS = [
   "sendForward",
@@ -66,9 +62,8 @@ const TIMED_METHODS: ReadonlySet<string> = new Set(["sendForward"])
 /**
  * 门面需要的发送策略视图
  *
- * 三个字段都在**每次发送时**读取，因此实现方可以用 getter 直连当前配置快照：
- * 用户在 WebUI 里把 `splitLength` 从 3000 改成 1000，下一条消息就生效，
- * 不需要重连账号。
+ * 三个字段都在每次发送时读取，故实现方可用 getter 直连当前配置快照：改了配置下一条消息就生效，
+ * 不必重连账号。
  */
 export interface SendPolicyView {
   /** 单条消息最大文本长度；`<= 0` 表示不切分 */
@@ -92,11 +87,8 @@ export interface BotFacadeOptions {
   /**
    * 一条消息发出后的回调，用于触发 `message/sent` 总线事件
    *
-   * 取回调而非直接传 `CoreEventBus`：本文件的职责边界是「把发送语义收进内核」，
-   * 认识事件总线就等于认识插件系统，而门面连账号管理器都不认识（见文件头）。
-   * 回调由账号管理器传入 —— 它本来就持有总线。
-   *
-   * 省略即不通知，`createBotFacade` 的现有调用方因此无须改动。
+   * 取回调而非直接传 `CoreEventBus`：认识总线就等于认识插件系统，而门面连账号管理器都不认识。
+   * 省略即不通知。
    */
   readonly onSent?: (info: MessageSentInfo) => void
 }
@@ -108,9 +100,8 @@ export interface BotFacade extends BotApi {
   /**
    * 关闭门面
    *
-   * 此后所有调用立刻 reject，待撤回的定时器一并取消。
-   * **不会**调 `driver.disconnect()` —— 驱动的生死由账号管理器负责，
-   * 门面只管"别再让插件用这个壳子"。
+   * 此后所有调用立刻 reject，待撤回的定时器一并取消。**不会**调 `driver.disconnect()`：
+   * 驱动的生死由账号管理器负责。
    */
   close(): void
 }

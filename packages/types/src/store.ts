@@ -16,10 +16,9 @@ export interface StoredEnvelope {
 }
 
 /**
- * KV 驱动
+ * KV 驱动：一个存储插件只需实现这几个方法
  *
- * 一个存储插件只需要实现这几个方法。`incr` 可选：驱动没有原生原子自增时，
- * 内核会退化为"命名空间内串行队列 + 读改写"，语义仍然正确。
+ * `incr` 可选：没有原生原子自增时内核退化为「命名空间内串行队列 + 读改写」，语义仍正确。
  */
 export interface KvDriver {
   /** 驱动 id，用于配置里指定 */
@@ -96,11 +95,7 @@ export interface KvSetOptions {
   ttl?: DurationLike
 }
 
-/**
- * 命名空间化的 KV 视图
- *
- * 每个插件取得的 `ctx.kv` 已绑定 `plugin:<name>:` 前缀，插件之间不会相互覆写键。
- */
+/** 命名空间化的 KV 视图；`ctx.kv` 已绑定 `plugin:<name>:` 前缀，插件间不会互相覆写键 */
 export interface KvNamespace {
   /** 本命名空间的键前缀（只读，便于调试） */
   readonly prefix: string
@@ -192,8 +187,7 @@ export type SqlParam = string | number | bigint | boolean | null | Uint8Array
 /**
  * 关系型存储句柄
  *
- * 只暴露最小面：抽卡记录、角色面板这类「多行 + 需要索引」的数据用它，其余一律用 KV。
- * **不引 ORM** —— 用得到的能力不足其 5%，而代价是一大坨依赖与启动开销。
+ * 只暴露最小面：「多行 + 需要索引」的数据用它，其余一律用 KV。不引 ORM。
  */
 export interface SqlHandle {
   /**
@@ -228,9 +222,7 @@ export interface SqlHandle {
   transaction<T>(fn: (tx: SqlHandle) => Promise<T>): Promise<T>
 
   /**
-   * 应用迁移脚本
-   *
-   * 内核按 `version` 记录已执行到哪一步，重复调用幂等。
+   * 应用迁移脚本；内核按 `version` 记录已执行到哪一步，重复调用幂等
    * @param migrations 迁移列表，按 version 升序
    */
   migrate(migrations: SqlMigration[]): Promise<void>

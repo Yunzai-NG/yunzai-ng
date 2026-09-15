@@ -2,19 +2,13 @@
  * 模块职责：日志枢纽（pino 实例、控制台/文件双路输出、运行时改级别、尾部缓冲）
  * 依赖方向：依赖 logger/format、logger/rotate、util
  * 生命周期：应用级单例，`close()` 时刷盘
- * 注意事项：三个不显然的设计决定 ——
- *
- *          1) **pino 实例常驻 trace，级别过滤放在包装层做**。pino 的 child
- *             logger 在创建时固化 level，改父级不会传播给已有子级；而 WebUI
- *             上"把日志级别调成 debug"必须立刻对所有插件生效。所以过滤前移到
- *             `#emit`，顺带连 `joinArgs` 的字符串拼接都省掉了，比 pino 自带
- *             的级别检查更省。
- *
- *          2) **参数按 console.log 语义拼接**（见 format.ts 的 `joinArgs`）。
- *             pino 原生仅识别第一个参数，`logger.info("查询", uid)` 将丢弃 uid。
- *
- *          3) **不采用 pino.multistream**。控制台与文件的级别过滤在自有的
- *             dispatcher 中完成，同时将日志写入 WebUI 的环形缓冲，一次解析三处使用。
+ * 注意事项：三个不显然的决定 ——
+ *          1) pino 实例常驻 trace，级别过滤放在包装层的 `#emit`：pino 的 child logger 在创建时
+ *             固化 level，改父级不传播给已有子级，而面板上改级别必须立刻对所有插件生效
+ *          2) 参数按 console.log 语义拼接（见 format.ts 的 `joinArgs`）：pino 原生只认第一个参数，
+ *             `logger.info("查询", uid)` 会丢掉 uid
+ *          3) 不用 pino.multistream：两路的级别过滤在自有 dispatcher 里做，同时写进环形缓冲，
+ *             一次解析三处使用
  */
 import pino from "pino"
 import type { Disposer, LogBindings, Logger, LogLevel } from "@yunzai-ng/types"
@@ -94,13 +88,23 @@ export class LoggerHub {
   /** 防止订阅者内部再打日志导致无限递归 */
   #notifying = false
 
-  /** 全局级别 */
+  /** 全局级别：控制台的缺省级别，也是查看器不指定级别时的缺省过滤 */
   #level: LogLevel
   /** 控制台级别数字 */
   #consoleValue: number
-  /** 文件级别数字 */
+  /**
+   * 文件级别数字
+   *
+   * 缺省是 trace（记全部），不跟随 `level`：改级别是为了改「看什么」，
+   * 而历史日志一旦没落盘就再也补不回来 —— 复现不了的缺陷正是靠它翻回去查。
+   */
   #fileValue: number
-  /** 生效阈值：两路里更低的那个，低于它的日志直接不生成 */
+  /**
+   * 生效阈值：两路里更低的那个，低于它的日志直接不生成
+   *
+   * 有文件输出时它恒为文件那一档（缺省 trace），故控制台调高级别不会让
+   * 文件与查看器跟着丢数据。
+   */
   #threshold: number
 
   /** 是否输出控制台 */
@@ -124,7 +128,8 @@ export class LoggerHub {
     this.#ring = new Array<LogRecord | undefined>(Math.max(50, config.tailSize ?? DEFAULT_TAIL))
 
     this.#consoleValue = this.#console ? levelValue(config.consoleLevel ?? this.#level) : Number.POSITIVE_INFINITY
-    this.#fileValue = config.dir ? levelValue(config.fileLevel ?? this.#level) : Number.POSITIVE_INFINITY
+    // 文件缺省 trace 而非跟随 level：见 #fileValue
+    this.#fileValue = config.dir ? levelValue(config.fileLevel ?? "trace") : Number.POSITIVE_INFINITY
     this.#threshold = Math.min(this.#consoleValue, this.#fileValue)
 
     this.#writer = config.dir
@@ -161,9 +166,7 @@ export class LoggerHub {
   }
 
   /**
-   * 判断某级别当前是否会被输出
-   *
-   * 由 `HubLogger` 在每次打日志前调用；命中 false 时连消息都不拼。
+   * 判断某级别当前是否会被输出；由 `HubLogger` 在每次打日志前调用，命中 false 时连消息都不拼
    * @param level 目标级别
    * @returns 是否启用
    */
@@ -172,35 +175,36 @@ export class LoggerHub {
   }
 
   /**
-   * 运行时修改级别
+   * 运行时修改级别；立刻对所有已创建的子日志器生效，这正是把过滤放在包装层的原因
    *
-   * 立刻对所有已创建的子日志器生效 —— 这正是把过滤放在包装层的原因。
+   * 缺省只改控制台，**不动文件那一路**：文件要留全量，否则调低级别的那段时间就成了
+   * 历史里的空白，而那正是最需要翻回去看的一段。要改文件得显式传 `"file"`。
    * @param level 新级别
-   * @param target 只改某一路：`"console"` / `"file"`；缺省两路都改
+   * @param target 只改某一路：`"console"` / `"file"`；缺省改控制台与查看器缺省
    */
   setLevel(level: LogLevel, target?: "console" | "file"): void {
     const value = levelValue(level)
-    if (target === "console") {
-      if (this.#console) this.#consoleValue = value
-    } else if (target === "file") {
+    if (target === "file") {
       if (this.#writer) this.#fileValue = value
     } else {
-      this.#level = level
+      if (target !== "console") this.#level = level
       if (this.#console) this.#consoleValue = value
-      if (this.#writer) this.#fileValue = value
     }
     this.#threshold = Math.min(this.#consoleValue, this.#fileValue)
   }
 
   /**
    * 取尾部日志
-   * @param query 查询条件
+   *
+   * 缓冲里存的是全量，级别只在读取时过滤：缺省按当前 `level`，查看器可传更低的级别
+   * 翻出**已经过去**的 debug —— 那正是「复现不了、只能回头查」的那类缺陷要的东西。
+   * @param query 查询条件；`level` 缺省取当前全局级别
    * @returns 按时间正序的日志记录
    */
   tail(query: TailQuery = {}): LogRecord[] {
     const size = this.#ring.length
     const count = this.#ringFull ? size : this.#ringPos
-    const minLevel = query.level ? levelValue(query.level) : 0
+    const minLevel = levelValue(query.level ?? this.#level)
     const keyword = query.keyword?.toLowerCase()
 
     const out: LogRecord[] = []
@@ -241,9 +245,7 @@ export class LoggerHub {
   }
 
   /**
-   * 分发一行 pino 输出
-   *
-   * 一次解析，三处使用：控制台、文件、环形缓冲/订阅者。
+   * 分发一行 pino 输出：一次解析，三处使用（控制台、文件、环形缓冲/订阅者）
    * @param line pino 生成的 JSON 行
    */
   #dispatch(line: string): void {

@@ -36,14 +36,9 @@ export interface AccountRecord {
   /**
    * 这个账号自己的重连策略；缺省沿用全局配置 `adapter.*`
    *
-   * **与 `config` 分开，因为拥有者不同。** `config` 里的字段由适配器的 `accountSchema`
-   * 声明（「这个号的 WS 地址与 token 是什么」），内核不认识其中任何一个；重连是内核**替
-   * 所有适配器统一做的事**（见 `AccountManager.#scheduleReconnect`），适配器根本不参与。
-   * 塞进 `config` 就得要求每个适配器作者各自声明一遍这些字段，于是同一件事有 N 份声明、
-   * N 套校验，且哪个适配器忘了写，它的账号就没有这个能力。
-   *
-   * 逐字段可缺，缺的那一项各自回落到全局值 —— 不是「填了就整套接管」：多数人只想给某个
-   * 号单独设个上限，不该因此被迫把退避的三个数也抄一遍。
+   * 与 `config` 分开，因为拥有者不同：`config` 由适配器的 `accountSchema` 声明，
+   * 重连由内核替所有适配器统一做（见 `AccountManager.#scheduleReconnect`）。
+   * 逐字段可缺，缺的那一项各自回落到全局值。
    */
   retry?: AccountRetryOverride
   /** 已知的平台账号 id，首次连接成功后回填 */
@@ -57,10 +52,7 @@ export interface AccountRecord {
 /**
  * 单个账号对重连策略的覆盖
  *
- * 四项逐个可缺，缺的回落到全局配置 `adapter.*` 的同名项。**取「逐字段回落」而非「整套
- * 二选一」**：真实诉求多半是「这一个号连不上就别再试了」，而那不该迫使人把退避的三个数
- * 一并抄进来 —— 抄进来的那份此后不会跟着全局改动走，而没人记得自己抄过。
- *
+ * 四项逐个可缺，缺的回落到全局配置 `adapter.*` 的同名项，不是「填了就整套接管」。
  * 单位与全局配置一致：`interval` / `maxInterval` 收毫秒数或 `"2s"` 这类时长表达式。
  */
 export interface AccountRetryOverride {
@@ -155,9 +147,8 @@ export interface LoginPrompt {
 /**
  * 交互式登录会话
  *
- * 适配器只管"推一步、等一次输入"，WebUI 负责把它渲染成页面。
- * 扫码登录、短信验证码、填 token 三种流程用同一套原语表达，
- * 所以新增一个平台的登录方式不需要改前端。
+ * 适配器只管「推一步、等一次输入」，WebUI 负责渲染成页面。扫码、短信验证码、填 token
+ * 三种流程用同一套原语表达，故新增登录方式不必改前端。
  */
 export interface LoginSession {
   /** 会话 id */
@@ -253,8 +244,8 @@ export interface PolicyView {
 /**
  * 内核给适配器的宿主能力
  *
- * 适配器**只能**通过它接触外界：日志、存储、投递事件、挂路由。
- * 没有全局变量可用，所以卸载插件时内核能确定地把这些全部回收。
+ * 适配器只能通过它接触外界：日志、存储、投递事件、挂路由。没有全局变量可用，
+ * 故卸载插件时内核能确定地把这些全部回收。
  */
 export interface AdapterHost {
   /** 该账号专属日志器（已带 adapter/account 字段） */
@@ -341,8 +332,8 @@ export interface BotDriver extends BotApi {
 /**
  * 适配器提供方
  *
- * 由插件通过 `ctx.registerAdapter()` 注册。这就是"账号登录也是插件"的接口：
- * 内核对 QQ 协议零认知，只负责存账号、按需创建驱动、把事件送进管线。
+ * 由插件通过 `ctx.registerAdapter()` 注册。内核对 QQ 协议零认知，只负责存账号、
+ * 按需创建驱动、把事件送进管线。
  */
 export interface AdapterProvider<TAccount extends object = Record<string, unknown>> {
   /** 适配器 id，账号记录里引用它 */

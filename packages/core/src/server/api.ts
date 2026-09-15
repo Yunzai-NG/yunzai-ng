@@ -4,17 +4,14 @@
  *          以及本目录的 ManagedServer 类型；不认识前端，也不被任何子系统反向依赖
  * 生命周期：`registerApi()` 由 `App.start()` 之前的装配步骤调用一次，返回的 Disposer
  *          交给 `App.own()`；端点本身随服务器一起活到停机
- * 注意事项：本模块只产出描述，注册由调用方做（`createApiRoutes` 给出 `ApiSurface`，
- *          `registerApi` 才挂上去）—— 直接 import `kernel/app.ts` 会形成 app → api → app 的环。
+ * 注意事项：本模块只产出描述，注册由调用方做 —— 直接 import `kernel/app.ts` 会形成
+ *          app → api → app 的环。
  *
- *          只读模式（`server.readonly`）是面板策略而非服务器策略：插件注册的路由一律照常放行，
- *          适配器的 webhook 不该因为面板设成只读而收不到消息。故判断在 `requireWritable()`。
+ *          只读模式（`server.readonly`）是面板策略而非服务器策略，故判断在 `requireWritable()`：
+ *          插件路由与适配器 webhook 一律照常放行。
  *
- *          日志走 WebSocket 而非 SSE：令牌只走请求头，而 `EventSource` 设不了请求头，
- *          退到 Cookie 会引回 CSRF 面、退到查询串会把令牌写进访问日志。
- *
- *          历史日志与实时日志分两条路。合成一条时「握手瞬间同步发出的那一帧」在部分客户端会丢，
- *          历史缺一段而无人察觉。
+ *          日志走 WebSocket 而非 SSE：令牌只走请求头，而 `EventSource` 设不了请求头。
+ *          历史日志与实时日志分两条路，合成一条会丢掉握手瞬间同步发出的那一帧。
  */
 import { basename, dirname, resolve } from "node:path"
 import type {
@@ -48,7 +45,7 @@ import type { LoginManager } from "../adapter/login.js"
 import type { RenderRegistry } from "../render/registry.js"
 import type { EventDispatcher } from "../pipeline/dispatch.js"
 import type { PluginHost } from "../plugin/host.js"
-import type { PluginMarket } from "../plugin/market.js"
+import type { DirtyAction, PluginMarket } from "../plugin/market.js"
 import type { SystemInfo } from "../platform/system.js"
 import type { ServerSink } from "../plugin/hooks.js"
 import { isDurationLike, parseDuration } from "../util/duration.js"
@@ -74,13 +71,8 @@ const LOG_LEVELS: readonly string[] = ["trace", "debug", "info", "warn", "error"
 /**
  * 两次「把令牌打进日志」之间的最小间隔
  *
- * 这个端点是 `auth: false` 的，而 `auth: false` 在服务器那一层**同时**跳过了
- * `checkAuth` 与 `checkForgeableBody`（见 `index.ts` 的 `#gate`）—— 于是一个跨站页面
- * 可以向它发表单类 POST。响应体不带令牌（那是这个端点的第 3 条约定），故拿不到权限，
- * 但不加节流就能靠反复请求把日志刷满、把真正有用的记录顶出滚动窗口。
- *
- * 10 秒：使用者点一下要等这么久是不合理的，故按钮那侧不受此限 —— 界面上点一次只发一次，
- * 而人不会在 10 秒内需要两次。
+ * 该端点 `auth: false`，故跨站页面可向它发表单类 POST。响应体不带令牌，但不加节流
+ * 就能靠反复请求把有用的日志顶出滚动窗口。
  */
 const REVEAL_COOLDOWN_MS = 10_000
 
@@ -115,8 +107,8 @@ export interface ApiSurface {
 /**
  * 命令、定时任务与中间件清单
  *
- * 与 `kernel/app.ts` 的 `KernelSubsystems.registries` 同形。这里重新声明一份而不是
- * import 那个类型，是为了不让 api 反向依赖 kernel（见文件头第 1 条）。
+ * 与 `kernel/app.ts` 的 `KernelSubsystems.registries` 同形，重新声明一份而非 import，
+ * 以免 api 反向依赖 kernel。
  */
 export interface ApiRegistries {
   /**
@@ -159,8 +151,7 @@ export interface ApiDeps {
   /**
    * 插件市场
    *
-   * 可选：市场依赖网络与插件目录写权限，嵌入式使用场景可以不提供，
-   * 此时相关端点一律返回 501，而不是让面板拿到一个空列表误以为市场是空的。
+   * 可选：不提供时相关端点一律返回 501，而非让面板拿到空列表误以为市场是空的。
    */
   readonly market?: PluginMarket
   /** 命令与任务清单 */
@@ -366,16 +357,9 @@ function optionalNumber(
 /**
  * 解析请求体里的每账号重连覆盖
  *
- * **四项逐个可缺**，缺的那项由内核回落到全局配置（见 `AccountManager.#policyOf`）；
- * 故此处不填任何默认值 —— 填了就等于把「跟随全局」偷换成「此刻的全局值」，而后者
- * 不会再跟着全局改动走。
- *
- * `retry: null` 是「清掉这个号的覆盖，改回跟随全局」，与 `retry` 整个缺席（「这次不动它」）
- * 不同：PATCH 语义下没有这条路，取消覆盖就只能删账号重建。
- *
- * 时长两项收数字毫秒或 `"2s"` 这类字符串，与全局配置同一形制；字符串的格式不在这里校验，
- * 由内核 `parseDuration` 解析、解析不出来时回落到全局值 —— 在这里拒绝会让「填错单位」
- * 从一次可恢复的回落变成一次改不进去的 400。
+ * 四项逐个可缺，缺的那项由内核回落到全局配置（见 `AccountManager.#policyOf`），故此处
+ * 不填默认值 —— 填了就把「跟随全局」变成「此刻的全局值」。时长字符串的格式不在这里校验，
+ * 由 `parseDuration` 解析、解析不出来时回落到全局值。
  * @param body 请求体
  * @returns 覆盖对象；`retry` 缺席时 undefined，`retry: null` 时 null（表示清空）
  * @throws 类型不对或越界时抛 400
@@ -391,13 +375,8 @@ function retryOverrideOf(body: Record<string, unknown>): AccountRetryOverride | 
   if (limit !== undefined) override.limit = Math.trunc(limit)
   const factor = optionalNumber(obj, "factor", { min: 1, max: 10 })
   if (factor !== undefined) override.factor = factor
-  /*
-   * 两项时长走 `isDurationLike` 而非自备一条正则：判据必须与 `parseDuration` 同一条，
-   * 否则会收下一个它解析不了的值，而那时内核悄悄回落到全局值 —— 使用者看到的是
-   * 「我明明填了 5 秒，它却按一分钟退避」。
-   *
-   * 负数单独挡掉：`"-2s"` 合乎格式却会让 `setTimeout` 立刻触发，退避形同不存在。
-   */
+  // 判据必须与 `parseDuration` 同一条，否则会收下一个它解析不了的值而静默回落到全局。
+  // 负数单独挡掉：`"-2s"` 合乎格式却会让 `setTimeout` 立刻触发，退避形同不存在
   for (const key of ["interval", "maxInterval"] as const) {
     const value = obj[key]
     if (value === undefined || value === null) continue
@@ -413,8 +392,7 @@ function retryOverrideOf(body: Record<string, unknown>): AccountRetryOverride | 
 /**
  * 取查询串里的单个值
  *
- * 查询串允许同名重复（`?scope=a&scope=b`），此时 Fastify 给出数组。面板不需要
- * 多值语义，取第一个即可 —— 报错反而会让"手动拼 URL 调试"变得麻烦。
+ * 同名重复（`?scope=a&scope=b`）时 Fastify 给出数组，取第一个。
  * @param query 查询串对象
  * @param key 参数名
  * @returns 字符串；缺失时 undefined
@@ -455,8 +433,7 @@ function levelOf(query: RouteRequest["query"]): LogLevel | undefined {
 /**
  * 造出面板 API 的全部端点描述
  *
- * 只造描述，不注册 —— 注册由 `registerApi()` 或调用方自己做，理由见文件头第 1 条。
- * 想单测某个端点时，直接从返回值里挑出来调它的 `handler` 即可，不需要起服务器。
+ * 只造描述，不注册（理由见文件头），故单测某个端点时可直接调它的 `handler`。
  * @param deps 依赖
  * @returns 端点清单
  */
@@ -464,12 +441,8 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
   const routes: ApiRoute[] = []
   const websockets: ApiWebSocket[] = []
 
-  /**
-   * 上一次把令牌打进日志的时刻，用于节流（见 `POST token/reveal`）
-   *
-   * 放在这一层而不是模块级：模块级的可变状态会在同进程内起两台服务器时相互串扰，
-   * 测试里正是这种用法。
-   */
+  // 上一次把令牌打进日志的时刻，用于节流（见 `POST token/reveal`）。
+  // 不放模块级：同进程内起两台服务器时会相互串扰，测试里正是这种用法
   let lastReveal = 0
 
   /** 只读模式下拦住写操作，见文件头第 2 条 */
@@ -482,8 +455,8 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
   /**
    * 登记一条端点，并统一将 SchemaError 转换为 400
    *
-   * SchemaError 中携带逐字段的 issues，直接抛出只会保留一条拼接后的消息文本，
-   * 前端即无法将错误标注至对应的表单项 —— 因此此处改为**返回**一个 400 信封。
+   * 直接抛出只会保留一条拼接后的消息，前端无从把错误标到对应表单项，故返回带
+   * `issues` 的 400 信封。
    */
   const add = (method: HttpMethod, path: string, handler: RouteHandler, options?: RouteOptions): void => {
     routes.push({
@@ -552,21 +525,8 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     }
   })
 
-  /*
-   * 磁盘与显卡
-   *
-   * **单独一个端点，不并入 `GET /api/overview`。** 两条理由：
-   *
-   * 1) 概览是每 5 秒必拉的那一个，而本项要量文件系统、还可能 spawn 一个
-   *    nvidia-smi。并进去就是让最热的端点等最慢的采样。
-   * 2) 概览页之外的地方（日后的插件页、排障页）可能只要磁盘不要那一大坨计数。
-   *
-   * **CPU 与内存刻意不在这里**，它们已在概览里 —— 同一事实供两份，两处的采样时刻
-   * 还不一样，面板上就会出现「CPU 卡片与 CPU 环不是一个数」。
-   *
-   * 不要令牌之外的额外权限：它报的是容量与型号，不含任何路径或文件名，
-   * 与 `GET fs` 那种「能看见目录树」不是一类东西，故只读模式下照常可用。
-   */
+  // 单独一个端点，不并入概览：概览每 5 秒必拉，而本项要量文件系统、还可能 spawn nvidia-smi。
+  // CPU 与内存刻意不在这里 —— 已在概览里，同一事实供两份会让两处的数对不上
   add("GET", "system", () => deps.system())
 
   /* ────────────────────────────── 配置 ────────────────────────────── */
@@ -640,18 +600,10 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
   }
 
   /**
-   * 找出装在 `plugins/<dir>` 里的那个插件的**声明名**
+   * 找出装在 `plugins/<dir>` 里的那个插件的声明名
    *
-   * 市场的寻址单位是**安装目录**（`joinWithin(pluginsDir, name)`），插件宿主的寻址单位是
-   * `definePlugin({ name })` 里那个**声明名**。两者常常不同 —— 索引条目 `relay-checkin-plugin`
-   * 取的是仓库名，而插件自己声明 `relay-checkin`。把目录名直接交给 `plugins.unload()`
-   * 会得到两种相反的错，且都不报错：
-   *
-   * - **该卸的没卸**：目录里的代码换掉了，内存里那份旧模块还在响应命令
-   * - **不该卸的被卸**：另一个恰好与目录同名的插件凭空消失
-   *
-   * 按**目录**比对而非按名字，故单文件插件不会被误认 —— 它们的 `root` 就是 `plugins/`
-   * 本身，不是任何一个安装目录。
+   * 市场按安装目录寻址，插件宿主按 `definePlugin({ name })` 的声明名寻址，两者常常不同。
+   * 把目录名直接交给 `plugins.unload()` 会静默卸错对象或该卸的没卸，故按目录比对而非按名字。
    * @param dir 安装目录名
    * @returns 声明名；该目录下没有已知插件时 undefined
    */
@@ -666,16 +618,8 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
   /**
    * 失败之后把先前卸掉的那个插件装回来
    *
-   * 卸载发生在**动手之前**，而失败并不意味着目录变了：索引里没有这个名字、`minCore`
-   * 不满足、以及「有本地改动而未同意暂存」这三种情形下，目录一个字节都没动，把插件
-   * 留在已卸载状态纯属牵连。最后那种尤其要紧 —— 它是刻意设计的中止路径，对使用者的
-   * 承诺是「目录停在原样」，而在此之前插件其实已经停了。
-   *
-   * 取源途中失败（网络断在半路、`reset` 只应用了一部分）时目录可能已变，此时装回来
-   * 同样是最优解：装上的要么是他原有那份、要么是新代码，都好过一个悄无声息消失的插件。
-   *
-   * 装不回来只记日志不改写错误：此刻要报给使用者的是**原本那个失败**，用一句
-   * 「重载失败」盖掉它，等于把人引向错误的方向。
+   * 卸载发生在动手之前，而多数失败（索引里没有、`minCore` 不满足、有改动而未同意暂存）
+   * 根本没碰目录。装不回来只记日志、不改写错误 —— 要报给使用者的是原本那个失败。
    * @param name 先前卸掉的插件声明名
    * @param unloaded 当时是否确实卸掉了
    */
@@ -688,15 +632,14 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
   /**
    * 安装或更新一个市场插件，并按需加载
    *
-   * 更新前先卸载：旧版本的模块若留在内存中，其注册的命令仍会响应，而磁盘上已是
-   * 新版本代码，两者不一致。失败一律折成 400 —— 名称、版本、网络与归档内容的问题
-   * 都由请求方的输入或环境决定，不是服务端故障。
+   * 更新前先卸载：旧模块留在内存里时其命令仍会响应，而磁盘上已是新代码。
+   * 失败一律折成 400 —— 都是请求方的输入或环境决定的，不是服务端故障。
    * @param name 插件目录名（与索引条目同名）
    * @param load 安装后是否立即加载
    * @param replace 目标已存在时是否覆盖
    * @param dependencies 是否顺带装依赖并跑索引声明的装后步骤
    * @param fresh 覆盖时跳过就地拉取，直接整目录重下
-   * @param stash 就地拉取撞上本地改动时是否暂存；为假则那次更新原地中止
+   * @param onDirty 就地拉取撞上本地改动时怎么办：暂存 / 丢弃 / 中止，缺省中止
    * @returns 安装结果，附本次加载成功的插件名
    * @throws 安装失败时以 400 结束请求
    */
@@ -706,18 +649,11 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     replace: boolean,
     dependencies: boolean,
     fresh = false,
-    stash = false
+    onDirty: DirtyAction = "abort"
   ): Promise<Record<string, unknown>> => {
     const instance = market()
     const occupant = replace ? pluginInDir(name) : undefined
-    /*
-     * 拿声明名当目录名了 —— 早于任何动作挡下，并把两个名字都摆出来
-     *
-     * 市场按目录寻址，而插件列表显示的是 `definePlugin({ name })`。两者不同名时（索引条目
-     * `relay-checkin-plugin` 取仓库名，插件自己声明 `relay-checkin`），照声明名请求会撞上
-     * 「插件市场中没有名为 relay-checkin 的插件」—— 而那个插件明明就装在那儿，这句话把人
-     * 引向「市场是不是坏了」。此处改说该用哪个名字。
-     */
+    // 市场按目录寻址，而插件列表显示的是声明名；两者不同名时改说该用哪个名字
     const mistaken = replace && occupant === undefined ? deps.plugins.list().find(s => s.name === name) : undefined
     if (mistaken !== undefined && mistaken.root !== "") {
       const dir = basename(mistaken.root)
@@ -728,26 +664,12 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
       if (occupant !== undefined && deps.plugins.get(occupant) !== undefined) {
         unloaded = await deps.plugins.unload(occupant)
       }
-      /*
-       * `fresh` 那一路直接调 `install(replace)`，绕开 `update()` 的就地拉取
-       *
-       * 目录被改花了、`reset --hard` 收不干净、或产物与源码对不上时要的正是「整份换掉」。
-       * 走 `update()` 达不到：它先试 `#tryPull`，而那条路成功时什么都不会重下。
-       *
-       * `stash` 只对就地拉取那一路有意义：整份重装根本不碰 git，那条路上目录连同改动
-       * 一起被替换掉 —— 那是「重装」这个词本来的意思，故不在此处多问一次。
-       */
+      // `fresh` 绕开就地拉取直接重下：`update()` 拉取成功时什么都不会重下
       let result
       if (!replace) result = await instance.install(name, { dependencies })
       else if (fresh) result = await instance.install(name, { replace: true, dependencies })
-      else result = await instance.update(name, { dependencies, stash })
-      /*
-       * 缺依赖或装后步骤失败时不加载
-       *
-       * 两者都注定让加载失败，而报出来的错离原因很远：缺依赖报的是「找不到某个包」，
-       * 缺产物（`build` 挂了）报的是「找不到 dist/index.js」。两条错误里后一条更
-       * 显眼而更没用 —— 使用者会去查那个文件为什么不在，而真正该看的是上一条。
-       */
+      else result = await instance.update(name, { dependencies, onDirty })
+      // 缺依赖或装后步骤失败时不加载：加载注定失败，且报出的错离原因很远
       const skip = result.setupError !== undefined || result.dependencyError !== undefined || result.needsDependencies
       const loaded = load && !skip ? [...(await deps.plugins.loadAll()).loaded] : []
       return { ...result, unloaded, loaded }
@@ -763,13 +685,7 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
 
   add("POST", "market/refresh", () => market().list(true))
 
-  /*
-   * 装依赖缺省为真
-   *
-   * 与面板商店那侧一致。缺省关掉会让「装完却跑不起来」成为常态，而那条提示（「请到
-   * 目录内自行执行 pnpm install」）对着的是一个多数人不会去开的终端。请求方仍可显式
-   * 传 false —— 离线部署、或依赖已随镜像预置好时用得上。
-   */
+  // 装依赖缺省为真，与面板商店那侧一致；离线部署可显式传 false
   add("POST", "market/install", async req => {
     requireWritable()
     const body = objectOf(req.body)
@@ -782,15 +698,7 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     )
   })
 
-  /*
-   * 更新前的探测：会走哪条路、目录里有没有改动
-   *
-   * **GET 且不要求写权限**：它只读 git 的状态，一个字节都不改。只读模式下同样可用 ——
-   * 那时更新本身会被挡下，但「我这个目录到底改过没有」仍是个能回答的问题。
-   *
-   * 面板据此决定要不要弹那个必须回答的问句。**判据与执行同源**（`PluginMarket` 里的
-   * `#isDirty`），故不会出现「探测说干净、执行时却撞上改动」那种自相矛盾。
-   */
+  // 只读动作，故不要求写权限：只读模式下更新会被挡下，但「目录改过没有」仍该答得出
   add("GET", "market/:name/update-probe", async req => {
     const name = req.params.name ?? ""
     try {
@@ -801,52 +709,41 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
   })
 
   /*
-   * 更新，或整份重装
+   * 更新，或整份重装（`fresh` 为真时跳过就地拉取）
    *
-   * 同一条路由而非两个端点：两者都是「把这个插件换成索引里那一份」，差别只在**允不允许
-   * 就地拉取**。`fresh` 为真时跳过拉取直接重下 —— 目录被改花了、或产物与源码对不上时
-   * 要的正是这个，而 `update()` 走得通拉取时永远不会重下。
-   *
-   * 缺省为假：就地拉取保住目录里那份 `node_modules`（动辄几十兆），是绝大多数更新该走的路。
-   *
-   * `stash` 缺省为假，故**不作答就撞不动改动过的目录** —— 从前这里无条件暂存，理由是
-   * 「留了副本」，但取回要懂 `git stash pop`，不懂的人只看到自己改的东西不见了。
+   * `onDirty` 三取值：`abort`（缺省，原地中止）、`stash`（暂存后更新，可 pop 取回）、
+   * `discard`（丢弃后更新，取不回）。旧请求体的 `stash: true` 继续收，等价于 `"stash"`
+   * —— 面板与内核各自发版，旧面板发来的更新请求不该因此失败。
    */
   add("POST", "market/:name/update", async req => {
     requireWritable()
     const name = req.params.name ?? ""
     const body = req.body === undefined ? {} : objectOf(req.body)
+    const raw = optionalString(body, "onDirty")
+    const onDirty: DirtyAction =
+      raw === "stash" || raw === "discard" || raw === "abort"
+        ? raw
+        : optionalBoolean(body, "stash") === true
+          ? "stash"
+          : "abort"
     return installFromMarket(
       name,
       optionalBoolean(body, "load") ?? true,
       true,
       optionalBoolean(body, "dependencies") ?? true,
       optionalBoolean(body, "fresh") ?? false,
-      optionalBoolean(body, "stash") ?? false
+      onDirty
     )
   })
 
-  /*
-   * 单独重跑装依赖与装后步骤，不重新取源
-   *
-   * 三种情形要用到：手工放进插件目录的插件（没有安装动作可挂）、装的时候这一步失败过、
-   * 以及使用者自己 `git pull` 过而产物已旧。与安装那条路共用 `PluginMarket.setup()`，
-   * 故「装什么、跑什么」只有一处定义。
-   */
+  // 单独重跑装依赖与装后步骤，不重新取源；与安装那条路共用 `PluginMarket.setup()`
   add("POST", "market/:name/setup", async req => {
     requireWritable()
     const name = req.params.name ?? ""
     const body = req.body === undefined ? {} : objectOf(req.body)
     const load = optionalBoolean(body, "load") ?? true
-    /*
-     * 先卸载，再跑 —— 次序有意义
-     *
-     * `build` 会覆盖 `dist/`，而旧模块此刻还在内存里、它注册的命令仍在响应。跑完再卸载
-     * 意味着中间有一段时间里「磁盘上是新代码、正在响应的是旧代码」，那种不一致比一次
-     * 失败的重载难查得多。
-     *
-     * 卸的是**这个目录里装着的那个插件**，不是与目录同名的那个：见 `pluginInDir`。
-     */
+    // 先卸载再跑：`build` 会覆盖 `dist/`，而旧模块还在内存里响应命令。
+    // 卸的是这个目录里装着的那个插件，不是与目录同名的那个，见 `pluginInDir`
     const occupant = pluginInDir(name)
     const unloaded =
       occupant !== undefined && deps.plugins.get(occupant) !== undefined ? await deps.plugins.unload(occupant) : false
@@ -889,14 +786,7 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
   add("GET", "commands", () => deps.registries.commands())
   add("GET", "tasks", () => deps.registries.tasks())
 
-  /*
-   * 中间件清单
-   *
-   * 与 `commands` / `tasks` 同一形制，都是内省：面板的插件卡片一直显示着中间件的
-   * **条数**，而点进去看不到是哪几条 —— 排查「消息被谁拦下了」时，条数没有用。
-   *
-   * 顺序即实际的执行顺序，不是注册顺序，理由见 `MiddlewarePipeline.list()`。
-   */
+  // 顺序即实际的执行顺序，不是注册顺序，见 MiddlewarePipeline.list()
   add("GET", "middlewares", () => deps.registries.middlewares())
 
   add("GET", "renderers", () => deps.renderers.list())
@@ -917,13 +807,8 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     const config = body.config === undefined ? {} : objectOf(body.config)
     const label = optionalString(body, "label")
     const enabled = optionalBoolean(body, "enabled") ?? true
-    /*
-     * 建号时给 `retry` 是允许的，但**不必给** —— 不给即四项全跟随全局配置，那是绝大多数
-     * 账号该有的样子。`null` 在建号这里没有意义（本来就没有可清的覆盖），当 undefined 处理。
-     *
-     * 一次 `create()` 带上它，不走「先建号再 PATCH」两步：`update()` 会 `disconnect()` 再
-     * `connect()`，那样建一个号会当场多一次断开重连 —— 使用者看到的是刚建好的账号闪一下离线。
-     */
+    // 一次 create() 带上 retry，不走「先建号再 PATCH」：update() 会断开重连，
+    // 那样建一个号会让它当场闪一下离线。建号时 null 无意义，按 undefined 处理
     const retry = retryOverrideOf(body) ?? undefined
     // create() 的失败几乎都是用户输入问题（适配器没装、配置字段填错），
     // 而 validateAccount 的错误信息按契约就是给用户看的 —— 一律 400
@@ -945,12 +830,7 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     if (label !== undefined) patch.label = label
     const enabled = optionalBoolean(body, "enabled")
     if (enabled !== undefined) patch.enabled = enabled
-    /*
-     * `retry: null` 与不传是两件事，故这里区分三态
-     *
-     * 不传即「这次不动它」，`null` 即「清掉覆盖、改回跟随全局」。少了后者，一个填过上限的
-     * 账号就再没有回到全局缺省的途径 —— 面板上那个「跟随全局」的选项会变成假的。
-     */
+    // 三态：不传即「这次不动它」，null 即「清掉覆盖、改回跟随全局」
     const retry = retryOverrideOf(body)
     if (retry !== undefined) patch.retry = retry
     try {
@@ -1052,27 +932,12 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
   })
 
   /*
-   * 把当前令牌打进日志
+   * 把当前令牌打进日志，供「令牌抄丢了、正被令牌页挡在外面」时取回
    *
-   * 为「首次打开面板、令牌抄丢了」这一种处境而存在：令牌恒被生成（见 `ensureToken`），
-   * 而使用者此刻正被令牌页挡在外面，无从用面板里的任何功能去查看它。
-   *
-   * 三条约定，缺一条这个端点就成了漏洞：
-   *
-   * 1. **`auth: false`** —— 需要它的人恰恰是没有令牌的人。带令牌才能调等于没有这个功能。
-   * 2. **只放行回环对端**，判据与 `checkAuth` 无令牌那一路同一个 `isLoopbackAddress`，
-   *    且服务器强制 `trustProxy: false`，故 `X-Forwarded-For` 伪造不了。
-   * 3. **响应体一个字节都不带令牌。** 这是与「显示到界面上」的分界：`auth: false` 意味着
-   *    使用者浏览器里的任何页面都能发出这个请求（跨站也可，它不触发预检），若响应里带着
-   *    令牌，那个页面就取到了面板的全部写权限。写进日志则读日志本身另需权限（终端或文件
-   *    系统），跨站脚本读不到。
-   *
-   * 因此它是 POST 而非 GET：语义上这是「产生一条日志」的动作，不是读取。
-   *
-   * **另加一道节流。** `auth: false` 不只跳过 `checkAuth`，也跳过 `checkForgeableBody`
-   * （见 `ManagedServer` 的路由前置钩子）—— 于是一个跨站页面能向这里发不触发预检的表单
-   * POST。它读不到响应、也拿不到令牌，但能把日志刷满一串令牌行。节流后最坏情形是每
-   * `REVEAL_COOLDOWN_MS` 多一行，而使用者手动点两次的间隔本就远大于此。
+   * 四条缺一不可的约定：`auth: false`（需要它的人恰恰没有令牌）、只放行回环对端
+   * （同 `checkAuth` 的 `isLoopbackAddress`，且服务器强制 `trustProxy: false`）、
+   * 响应体一个字节都不带令牌（`auth: false` 下任何跨站页面都能发这个请求）、
+   * 以及节流（`auth: false` 同时跳过 `checkForgeableBody`，否则跨站表单 POST 能刷满日志）。
    */
   add(
     "POST",
@@ -1146,17 +1011,9 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
   /*
    * 只读列目录：`file` / `dir` 配置项的候选来源
    *
-   * 三条边界写在这里，因为它们都是**面板策略**，与文件系统本身无关
-   * （文件系统那一侧的四条限制见 browse.ts 的文件头）：
-   *
-   * 1) **要令牌。** 与其余 `/api/*` 一致 —— `add()` 不传 options 即为「要令牌」。
-   *    未设令牌时服务器只放行本机（见 auth.ts），故该端点不会凭空对外开放。
-   * 2) **只读模式下禁用。** 表面上矛盾：一个只读接口为何在只读模式下不可用？
-   *    因为它的用途只有「给配置项挑一个路径」，而只读模式下配置根本改不了 ——
-   *    此时它提供的唯一东西就是「让访问者看见这台机器的目录树」，那是纯粹的扩权。
-   *    宁可在用不到它的场合关掉。这一条是 2026-08-25 定夺的第 4 项。
-   * 3) **起点由前端给，不由内核猜。** 「从哪个目录开始浏览」取决于字段当前填的是什么，
-   *    只有前端知道。不带 `path` 时 Windows 列盘符、其余系统列 `/`。
+   * 三条面板侧边界（文件系统那侧的限制见 browse.ts 文件头）：要令牌；只读模式下禁用
+   * （那时配置改不了，它只剩「让访问者看见目录树」这一个作用）；起点由前端给，
+   * 不带 `path` 时 Windows 列盘符、其余系统列 `/`。
    */
   add("GET", "fs", async req => {
     if (deps.config.get().server.readonly) {

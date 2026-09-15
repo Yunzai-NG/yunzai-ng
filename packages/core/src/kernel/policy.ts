@@ -48,11 +48,6 @@ export class KernelPolicy implements PolicyView {
     return this.#config.get().bot.nickname
   }
 
-  /** 是否忽略自身发出的消息 */
-  get ignoreSelf(): boolean {
-    return this.#config.get().bot.ignoreSelf
-  }
-
   /** 是否处于维护模式（只响应主人） */
   get maintenance(): boolean {
     return this.#config.get().bot.onlyMaster

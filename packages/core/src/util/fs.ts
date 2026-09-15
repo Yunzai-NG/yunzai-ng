@@ -2,12 +2,9 @@
  * 模块职责：文件系统助手（原子写、目录保证、路径越界防护）
  * 依赖方向：仅依赖 node:fs / node:path 与 util/defer
  * 生命周期：纯函数
- * 注意事项：**原子写是必需品**，一律走"写临时文件 → rename"。直接 `writeFileSync` 时，
- *          进程恰在此刻被杀（Windows 关窗口、安卓被系统回收）会留下一个截断的配置文件，
- *          下次启动即崩。
- *
- *          Windows 上 rename 会因杀软/资源管理器短暂占用而抛 EPERM
- *          （本项目 pnpm install 就撞过一次），所以带退避重试。
+ * 注意事项：原子写是必需品，一律走「写临时文件 → rename」：直接 `writeFileSync` 时进程被杀
+ *          （Windows 关窗口、安卓被系统回收）会留下一个截断的配置文件，下次启动即崩。
+ *          Windows 上 rename 会因杀软/资源管理器短暂占用抛 EPERM，故带退避重试。
  */
 import { constants as fsConstants } from "node:fs"
 import {
@@ -97,8 +94,7 @@ export async function ensureDir(path: string): Promise<string> {
 /**
  * 带重试的 rename
  *
- * Windows 下杀软扫描、编辑器索引会短暂锁住新建文件，导致 rename 抛 EPERM。
- * 这类错误重试即可，不该让一次配置保存失败。
+ * Windows 下杀软扫描、编辑器索引会短暂锁住新建文件而抛 EPERM，重试即可。
  * @param from 源路径
  * @param to 目标路径
  * @throws 重试用尽后抛出最后一次错误
@@ -119,8 +115,7 @@ async function renameWithRetry(from: string, to: string): Promise<void> {
 /**
  * 原子写文件
  *
- * 先写同目录下的 `.tmp-*` 文件再 rename 覆盖 —— 同目录是关键，
- * 跨分区 rename 不是原子操作。
+ * 先写同目录下的 `.tmp-*` 再 rename 覆盖。同目录是关键：跨分区 rename 不是原子操作。
  * @param path 目标文件路径
  * @param data 内容
  * @throws 写入或替换失败时抛出；此时原文件保持不变
@@ -249,8 +244,7 @@ export async function sizeOf(path: string): Promise<number | undefined> {
 /**
  * 在根目录内安全拼接路径，阻止 `../` 越界
  *
- * WebUI 的静态资源、插件模板资源都要按外部传入的相对路径取文件，
- * 不做这层校验就是任意文件读取漏洞。
+ * 静态资源与插件模板都按外部传入的相对路径取文件，少了这层校验即任意文件读取漏洞。
  * @param root 允许访问的根目录
  * @param requested 外部传入的相对路径
  * @returns 解析后的绝对路径

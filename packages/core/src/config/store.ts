@@ -3,18 +3,12 @@
  * 依赖方向：依赖 config/schema、config/yaml、util/{fs,deep}、类型包
  * 生命周期：应用级单例；`dispose()` 关闭文件监听
  * 注意事项：四条行为约定 ——
- *
- *          **变更通知按叶子路径。** `diffPaths` 算出实际变化的路径，只通知关注它的订阅者，
- *          而不是一有变动就全量重算。
- *
- *          **写入用 `atomicWrite`**（临时文件 + rename）：直接写会在断电或强杀进程时
- *          留下一份截断的 YAML。
- *
- *          **配置写坏了不崩。** 记录错误、退回上一份可用配置（首次加载则用缺省值），
- *          并**绝不覆盖**使用者那份坏文件 —— 他要照着报错自己改。
- *
- *          **新增配置项会补进既有文件。** 校验通过后按当前 schema 重写，新选项连同
- *          中文注释一并补入，幂等。否则升级之后新选项在使用者的配置里根本看不见。
+ *          1) 变更通知按叶子路径：`diffPaths` 算出实际变化的路径，只通知关注它的订阅者
+ *          2) 写入走 `atomicWrite`（临时文件 + rename），否则断电或强杀会留下截断的 YAML
+ *          3) 配置写坏了不崩：记录错误、退回上一份可用配置（首次加载则用缺省值），且绝不
+ *             覆盖使用者那份坏文件
+ *          4) 新增配置项会补进既有文件：校验通过后按当前 schema 重写，新选项连同中文注释
+ *             一并补入，幂等 —— 否则升级之后新选项在使用者的配置里根本看不见
  */
 import { watch, type FSWatcher } from "node:fs"
 import { basename, join } from "node:path"
@@ -172,9 +166,7 @@ export class ConfigFile<T> implements ConfigHandle<T> {
   /**
    * 只订阅某个路径（及其子路径）的变更
    *
-   * 这是"细粒度失效"的入口：渲染器仅关注 `render.*`，即不会被 `bot.*` 的
-   * 变动通知。父子路径双向匹配 —— 修改 `bot` 会通知订阅 `bot.masterQQ` 的一方，
-   * 反之亦然。
+   * 父子路径双向匹配：改 `bot` 会通知订阅 `bot.masterQQ` 的一方，反之亦然。
    * @param path 点分路径，空串等价于 `onChange`
    * @param cb 回调
    * @returns 取消订阅
@@ -361,8 +353,7 @@ export class ConfigStore {
   /**
    * 声明一份配置
    *
-   * 同名重复声明会抛错 —— 两个插件抢同一个文件是必须暴露的 bug，
-   * 而不是让后者悄悄覆盖前者。
+   * 同名重复声明抛错，不让后者悄悄覆盖前者。
    * @param name 配置名，同时是文件名（`<name>.yaml`）
    * @param validator schema
    * @param opts 附加信息
@@ -402,10 +393,6 @@ export class ConfigStore {
    * 取已声明的配置
    * @param name 配置名
    * @returns 配置句柄；未声明时 undefined
-   */
-   
-  /**
-   *
    */
   get(name: string): ConfigFile<any> | undefined {
     return this.#files.get(name)

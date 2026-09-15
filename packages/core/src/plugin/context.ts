@@ -3,15 +3,9 @@
  * 依赖方向：依赖 plugin/{hooks,events,services}、util/*、类型包；**不依赖任何子系统实现**
  * 生命周期：每个插件实例一个 ctx，随插件卸载整体失效
  * 注意事项：三条硬规则 ——
- *
- *          **零全局变量。** 全部能力须经 ctx 上的具名方法获取，故「某插件用了哪些能力」
- *          可枚举，卸载时可确定性回收。
- *
- *          **每个注册型方法都把 disposer 登记进 DisposalRegistry。** 插件作者无从遗漏清理 ——
- *          否则改十次代码就有十份定时器同时在跑。
- *
- *          **路径不做算术。** `ctx.resource()` 与模板根由内核依据插件根计算，`safeJoin` 拦
- *          `../` 越界；手工拼相对路径会在目录层级一变时给出空白页面。
+ *          1) 零全局变量：能力一律经 ctx 上的具名方法获取，故卸载时可确定性回收
+ *          2) 每个注册型方法都把 disposer 登记进 DisposalRegistry，插件作者无从遗漏清理
+ *          3) 路径不做算术：`ctx.resource()` 与模板根由内核依插件根计算，`safeJoin` 拦 `../` 越界
  */
 import { join } from "node:path"
 import type {
@@ -130,9 +124,8 @@ export interface PluginContextHandle {
 /**
  * 链式命令构造器
  *
- * 每一环都在改同一份 `CommandRegistration`，路由器持有该对象引用，
- * 因此 `.desc()` / `.master()` 这类不影响索引键的改动无需通知路由器；
- * 只有 `.alias()` 改了索引键才调 `reindex`。
+ * 每一环都在改同一份 `CommandRegistration`，路由器持有该对象引用，故只有 `.alias()`
+ * 改了索引键才需要 `reindex`。
  */
 class ChainedCommand implements CommandBuilder {
   /** 登记内容 */
@@ -273,12 +266,8 @@ export interface RenderCall {
 /**
  * 把两条渲染通路的实参归一为一次调用描述
  *
- * `render()` 有两种形态：`render(page, opts)` 与 `render(template, data, opts)`。
- * 以第一参是否为字符串判别 —— `RenderablePage` 是对象，二者不可能混淆。
- * 判别只做这一处，两个调用点（`ctx.render` 与 `e.render`）共用同一份语义。
- *
- * 页面上的 `tailwind` 声明在此并入选项，且**调用点显式给出者优先**：声明是模板的常态，
- * 而调用点是对某一次渲染的临时覆盖，后者压过前者才合乎「越局部越优先」。
+ * 以第一参是否为字符串判别两种形态。判别只做这一处，`ctx.render` 与 `e.render` 共用。
+ * 页面声明的 `tailwind` 在此并入选项，调用点显式给出者优先。
  * @param first 页面或模板相对路径
  * @param second 模板数据（字符串通路）或渲染选项（TSX 通路）
  * @param third 渲染选项（字符串通路）
@@ -297,8 +286,7 @@ export function splitRenderArgs(
     template: first.name,
     data: {},
     html: first.html,
-    // 展开顺序即优先级：页面声明在前，调用点在后覆盖之。
-    // 页面未声明时不写入该键 —— 显式的 undefined 会盖掉渲染器一侧的缺省判定
+    // 页面未声明时不写入该键：显式的 undefined 会盖掉渲染器一侧的缺省判定
     opts: first.tailwind === undefined ? given : { tailwind: first.tailwind, ...given }
   }
 }
@@ -306,8 +294,7 @@ export function splitRenderArgs(
 /**
  * 插件上下文实现
  *
- * 每个成员都对应 `PluginContext` 的一项能力；除 `resource()` 这类纯计算外，
- * 所有注册都经过 `#own()` 登记回收。
+ * 除 `resource()` 这类纯计算外，所有注册都经过 `#own()` 登记回收。
  */
 class Context implements PluginContext<unknown> {
   /** 依赖 */
@@ -357,11 +344,8 @@ class Context implements PluginContext<unknown> {
     this.kv = deps.kv
     this.config = deps.config
     this.app = deps.app
-    // 把卸载信号并进 HTTP 客户端的默认值：插件卸载后它发出的请求随即中止，
-    // 不必依赖每个插件作者都记得手动传 `ctx.signal`。忘记传就漏一个，
-    // 而漏掉的表现是「插件已卸载，它的请求还在跑」——
-    // 停机时那些孤儿请求还会把关闭连接池的一步拖满整个超时。
-    // extend() 与根客户端共享连接池，只是多一层默认值，没有额外开销。
+    // 卸载信号并进 HTTP 客户端的默认值，插件卸载后它发出的请求随即中止；
+    // 否则停机时那些孤儿请求会把关闭连接池的一步拖满整个超时
     this.http = deps.http.extend({ signal: deps.signal })
     this.signal = deps.signal
   }
@@ -563,10 +547,8 @@ class Context implements PluginContext<unknown> {
   /**
    * 接管站点根路径，替换内置面板
    *
-   * 不经过 `this.#scope`：接管面板的意义就在于占据 `/`，挂在
-   * `/plugin/<插件名>` 之下的页面无法成为默认入口。归属标识写成
-   * `plugin:<插件名>`，`claimant("/")` 因此能回答"面板由谁提供"。
-   * 根路径已被占用时抛错，不静默覆盖 —— 见 types 里的说明。
+   * 不经过 `this.#scope`：接管面板的意义就在于占据 `/`。归属标识写成
+   * `plugin:<插件名>`，故 `claimant("/")` 能回答「面板由谁提供」。
    * @param dir 单页应用产物目录（绝对路径）
    * @returns 注销句柄
    * @throws 服务器未启用、或根路径已被占用时
@@ -623,8 +605,7 @@ class Context implements PluginContext<unknown> {
    * @param opts 渲染选项
    * @returns 图片段；分页时为数组
    * @throws 无可用渲染器、渲染失败或渲染器返回空结果时
-   */
-  async render(template: string, data?: Record<string, unknown>, opts?: RenderOptions): Promise<RenderedImage>
+   */  async render(template: string, data?: Record<string, unknown>, opts?: RenderOptions): Promise<RenderedImage>
 
   /**
    * 渲染实现
@@ -669,8 +650,7 @@ class Context implements PluginContext<unknown> {
   /**
    * 打开本插件专属的 SQLite 库
    *
-   * 同名库只打开一次：插件在多处 `await ctx.sql()` 拿到的是同一个连接，
-   * 否则 WAL 下多连接互相等锁，症状是"偶发变慢"，极难定位。
+   * 同名库只打开一次：WAL 下多连接互相等锁，症状是「偶发变慢」，极难定位。
    * @param name 库名，缺省 `"main"`
    * @returns SQL 句柄
    * @throws better-sqlite3 不可用时
@@ -704,8 +684,7 @@ class Context implements PluginContext<unknown> {
   /**
    * 拼出插件内资源的绝对路径
    *
-   * 走 `safeJoin`：插件传入 `"../../../etc/passwd"` 会被拒绝。参数很可能来自
-   * 用户消息（如"看某个模板"），不挡住就是任意文件读。
+   * 走 `safeJoin`：参数很可能来自用户消息，不挡住 `../` 就是任意文件读。
    * @param parts 相对插件根的路径片段
    * @returns 绝对路径
    * @throws 结果越出插件根目录时
@@ -750,9 +729,6 @@ class Context implements PluginContext<unknown> {
 
   /**
    * 把一个 disposer 登记进本插件的回收簿
-   *
-   * 插件卸载后仍然发生的注册（异步 setup 慢一步）会被立即回收 ——
-   * 这是 `DisposalRegistry.add` 的既有行为，此处依赖它。
    * @param fn 回收函数
    * @param label 标签
    * @returns 提前回收的句柄

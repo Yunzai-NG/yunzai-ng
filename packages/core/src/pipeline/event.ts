@@ -2,17 +2,11 @@
  * 模块职责：把适配器产出的 `Incoming*Event` 补全成插件可用的运行时事件
  * 依赖方向：依赖类型包、message/segment、pipeline/prompt、util/id、util/duration；不依赖适配器实现
  * 生命周期：每条事件一个实例，处理完即被 GC；不持有跨事件状态
- * 注意事项：**适配器只负责翻译报文，派生字段全部由这里算** —— 摊到各适配器里会让 `e.atBot` 在
- *          不同协议下语义不一致，插件只能两边都试。
- *
- *          派生字段（`atMe` / `atUsers` / `images` / `text`）用 getter + 私有缓存：中间件改写
- *          `message` 后调一次 `refresh()` 重算，而不是每次读取都重新遍历 —— 路由匹配阶段 `e.text`
- *          会被读几十次。
- *
- *          实例**刻意不 freeze、不 seal**：`EventExtensions` 的正规用法就是插件在事件上挂自有字段。
- *
- *          `e.render()` 依赖「当前执行的是哪个插件」（模板根随插件而定），故该绑定由 dispatch 在调
- *          每个 handler 之前经 `bind()` 替换，而不写进事件的构造参数 —— 一条消息会依次流经多个插件。
+ * 注意事项：适配器只负责翻译报文，派生字段全部由这里算 —— 摊到各适配器里会让 `e.atBot` 在
+ *          不同协议下语义不一致。派生字段（`atMe` / `atUsers` / `images` / `text`）用 getter +
+ *          私有缓存，改写 `message` 后调 `refresh()` 重算；路由匹配阶段 `e.text` 会被读几十次。
+ *          实例刻意不 freeze、不 seal：`EventExtensions` 的正规用法就是插件挂自有字段。
+ *          `e.render()` 的模板根随插件而定，故由 dispatch 在每个 handler 前经 `bind()` 替换。
  */
 import type {
   BotApi,
@@ -62,8 +56,7 @@ const NICKNAME_TAIL_RE = /^[\s,，、:：]+/
 /**
  * 事件工厂需要的策略视图
  *
- * 只取用得到的两项而不是直接依赖 `KernelPolicy`：事件构造与"主人是谁"之间
- * 只有这么一点耦合，写成最小接口后单测里给个字面量就能跑。
+ * 只取用得到的两项而不是直接依赖 `KernelPolicy`，故单测里给个字面量就能跑。
  */
 export interface EventPolicyView {
   /** 机器人昵称列表，用于把"云崽 #体力"识别为对我说话 */
@@ -79,8 +72,7 @@ export interface EventPolicyView {
 /**
  * 当前正在执行的插件在事件上的投影
  *
- * `PluginContext` 结构上天然满足它，因此 dispatch 直接把上下文传进来即可，
- * 不需要额外包一层。
+ * `PluginContext` 结构上天然满足它，故 dispatch 直接把上下文传进来。
  */
 export interface PluginRuntimeView {
   /** 插件名 */
@@ -139,8 +131,8 @@ function errText(err: unknown): string {
 /**
  * 推断通知事件应该回到哪里
  *
- * 有群号回群、否则回给相关用户。两者都没有（如纯连接类通知）返回 undefined，
- * 由 `reply()` 抛错 —— 静默丢弃会让插件作者以为消息发出去了。
+ * 有群号回群、否则回给相关用户。两者都没有时返回 undefined，由 `reply()` 抛错 ——
+ * 静默丢弃会让插件作者以为消息发出去了。
  * @param n 通知事件
  * @returns 发送目标；无法推断时 undefined
  */
@@ -502,9 +494,8 @@ class MessageEventImpl implements RuntimeMessageEvent {
   /**
    * 剥除开头的机器人昵称
    *
-   * 取**最长**匹配而非遍历顺序上的第一个：昵称配置为 `["云", "云崽"]` 时，
-   * 先命中 `云` 会将 `云崽帮我看看` 剥为 `崽帮我看看`。一次遍历即可求得最长者，
-   * 不必为此排序（昵称列表可能在 WebUI 中随时修改，排序结果无法长期缓存）。
+   * 取最长匹配而非遍历顺序上的第一个：昵称为 `["云", "云崽"]` 时，先命中 `云`
+   * 会把 `云崽帮我看看` 剥成 `崽帮我看看`。
    * @param text 当前纯文本
    * @returns 剥除昵称后的文本；未命中昵称时 undefined
    */
@@ -553,12 +544,7 @@ class MessageEventImpl implements RuntimeMessageEvent {
   }
 }
 
-/**
- * 运行时事件工厂
- *
- * 内核里唯一构造事件的地方。适配器把 `IncomingEvent` 交给 `host.submit()`，
- * 由 dispatch 调这里补全成运行时形态。
- */
+/** 运行时事件工厂：内核里唯一构造事件的地方 */
 export class EventFactory {
   /** 工厂依赖 */
   readonly #opts: EventFactoryOptions
@@ -652,8 +638,8 @@ export class EventFactory {
     /**
      * 落到平台的同意/拒绝
      *
-     * 好友与加群的第三个参数含义不同：好友是"同意后设置的备注"，
-     * 加群是"拒绝的理由"。该不对称源自 OneBot，在此处封装以免插件误用。
+     * 好友与加群的第三个参数含义不同：好友是「同意后设置的备注」，加群是「拒绝的理由」。
+     * 该不对称源自 OneBot，在此封装以免插件误用。
      * @param approve 是否同意
      * @param extra 备注或理由
      */

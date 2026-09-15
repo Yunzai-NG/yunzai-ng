@@ -290,14 +290,13 @@ describe("静态门禁", () => {
     expect(hits(router, { text: "#多限", scene: "group" })).toEqual([])
   })
 
-  it("默认不响应机器人自己发的消息，ignoreSelf:false 才放行", () => {
+  it("不再过滤机器人自己发的消息：要不要投进内核由适配器决定", () => {
     const { router } = make()
-    router.register(reg("#复读", {}, "默认"))
-    router.register(reg("#复读", { ignoreSelf: false }, "放行"))
+    router.register(reg("#复读", {}, "命中"))
 
-    // 自己发的：只有显式声明放行的那条能命中，否则复读类命令会自我触发成死循环
-    expect(hits(router, { text: "#复读", uid: "10000", selfId: "10000" })).toEqual(["放行"])
-    expect(hits(router, { text: "#复读", uid: "20000" })).toEqual(["默认", "放行"])
+    // 事件能走到路由，就说明适配器已经决定投递它
+    expect(hits(router, { text: "#复读", uid: "10000", selfId: "10000" })).toEqual(["命中"])
+    expect(hits(router, { text: "#复读", uid: "20000" })).toEqual(["命中"])
   })
 
   it("atMe 只约束群聊，私聊天然算对我说话", () => {

@@ -2,29 +2,18 @@
  * 模块职责：确定并创建运行时目录布局
  * 依赖方向：依赖 util/fs、platform/detect
  * 生命周期：启动时解析一次，之后只读
- * 注意事项：优先级：显式参数 > `YZNG_HOME` > 便携模式标记 > 当前目录。
- *          启动时把八个目录一次性定死成绝对路径，其余模块只准通过 `app.paths` 取。
+ * 注意事项：优先级为显式参数 > `YZNG_HOME` > 便携模式标记 > 当前目录，启动时一次性定死成绝对路径，
+ *          其余模块只准通过 `app.paths` 取。
  *
- *          **默认落在当前目录**：解压或克隆到一个文件夹、在其中 `yzng init`，数据就在
- *          眼前，拷走整个文件夹即完成迁移。代价是本模块必须读 `process.cwd()`，而以
- *          Windows 服务、开机自启或 pm2 启动时工作目录并非项目目录 —— 那些场景必须
- *          显式给出 `YZNG_HOME` 或启动器的工作目录，否则数据会落在启动器所在之处。
+ *          默认落在当前目录，故本模块要读 `process.cwd()`；以 Windows 服务、开机自启或 pm2 启动时
+ *          工作目录并非项目目录，那些场景必须显式给出 `YZNG_HOME`。旧版（0.1.1 及更早）的系统目录
+ *          位置不做静默回落，改由 {@link legacyInstance} 报给 CLI 提示 —— 换目录该是使用者看得见的
+ *          一步。
  *
- *          0.1.1 及更早的默认位置是系统目录（Windows 的 `%LOCALAPPDATA%\YunzaiNG` 等）。
- *          此处**不**为其保留静默回落 —— 那会使「默认在当前目录」在任何装过旧版的机器上
- *          都不成立。改由 {@link legacyInstance} 把旧实例报给 CLI 显式提示：换目录应当是
- *          使用者看得见的一步，而不是内核悄悄替他挑一个。
- *
- *          **「当前目录」先向上认已有实例，见 {@link findInstanceRoot}。** 直接取
- *          `process.cwd()` 的后果是：在实例的子目录里（`plugins/`、`logs/`、某个插件目录内）
- *          执行 `yzng start`，内核会当场在那里现建第二个实例 —— 空配置、无账号、面板端口
- *          与上层那个相撞，而使用者看到的是「我的账号和插件都没了」。cd 进 `plugins`
- *          去看一眼再随手启动是极自然的动作，不该以此为代价。
- *
- *          主判据是**`package.json` 里声明了 `@yunzai-ng/cli`**，而非「有没有 `config/`」：
- *          装 CLI 的唯一理由就是要在这个目录里跑一个实例，故它在**全新安装尚未 init**
- *          时也成立 —— 那恰是只看配置文件会漏掉的一种情形，且后果一样（在子目录里
- *          init 出第二个实例）。
+ *          「当前目录」先向上认已有实例，见 {@link findInstanceRoot}：直接取 `process.cwd()` 会在
+ *          实例的子目录里现建第二个实例，空配置、无账号、面板端口与上层相撞。主判据是
+ *          `package.json` 声明了 `@yunzai-ng/cli` 而非「有没有 `config/`」，故全新安装尚未 init 时
+ *          也成立。
  */
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join, parse as parsePath, resolve } from "node:path"
@@ -120,9 +109,8 @@ function defaultHome(): string {
 /**
  * 判断一个目录里是否已有实例
  *
- * 以 `config/` 是否存在为准：`ensurePaths` 建的七个目录中只有它必定装着文件
- * （`ConfigStore` 会把缺省配置落盘），而空的 `data/`、`logs/` 无从区分
- * 「一个实例」与「随手建的空目录」。
+ * 以 `config/` 是否存在为准：`ensurePaths` 建的七个目录里只有它必定装着文件，而空的 `data/`、
+ * `logs/` 无从区分「一个实例」与「随手建的空目录」。
  * @param dir 待判断的目录
  * @returns 是否已有实例
  */
@@ -133,12 +121,10 @@ function hasInstance(dir: string): boolean {
 /**
  * 一个目录的 `package.json` 是否声明了 CLI
  *
- * **这是「此处是一个 Yunzai 实例」最确凿的标记，故向上找实例以它为主。** 装 `@yunzai-ng/cli`
- * 的唯一理由是要在这个目录里跑一个实例；插件依赖的是 `core` 与 `types`，绝不会依赖 CLI，
- * 于是一个插件目录不会被误认。三段依赖表都看：源码开发时它可能在 `devDependencies` 里。
- *
- * 判据刻意不是「存在 `node_modules/@yunzai-ng/cli`」：那样一个自行 `pnpm add @yunzai-ng/core`
- * 的插件目录就会被认成实例根，而症状是数据落进那个插件的目录里。
+ * 装 CLI 的唯一理由就是要在这个目录里跑实例，而插件只依赖 `core` 与 `types`，故插件目录不会被
+ * 误认。三段依赖表都看：源码开发时它可能在 `devDependencies` 里。判据刻意不是「存在
+ * `node_modules/@yunzai-ng/cli`」—— 那样一个自行 `pnpm add @yunzai-ng/core` 的插件目录会被认成
+ * 实例根。
  * @param dir 待判断的目录
  * @returns 是否声明了 CLI
  */
@@ -160,16 +146,10 @@ function declaresCli(dir: string): boolean {
 /**
  * 向上找实例时的次判据：`config/yunzai.yaml`
  *
- * 覆盖 CLI 判据照不到的两种布局：全局安装（`pnpm add -g`，实例目录里没有 `package.json`）
- * 与源码构建（在仓库外另建的实例目录里直接 `node …\bin.js start`）。
+ * 覆盖 CLI 判据照不到的两种布局：全局安装（实例目录里没有 `package.json`）与源码构建。
  *
- * 比 {@link hasInstance} 的「有 `config/` 目录」严格：那一条只用于报告旧位置，认宽了顶多
- * 多打一行提示；这一条决定**数据往哪写**，认宽了会把一个无关项目的 `config/` 目录当成
- * Yunzai 实例。而 `config/yunzai.yaml` 由 `ConfigStore` 在初始化时必定落盘，任何跑过一次的
- * 实例都有它。
- *
- * 文件名与 `CORE_CONFIG_NAME` 对应，此处刻意不 import config 层 —— platform 是更底的一层，
- * 反向依赖会成环。
+ * 比 {@link hasInstance} 的「有 `config/` 目录」严格：这一条决定数据往哪写，认宽了会把无关项目的
+ * `config/` 当成 Yunzai 实例。`config/yunzai.yaml` 由 `ConfigStore` 初始化时必定落盘。
  * @param dir 待判断的目录
  * @returns 是否装着一份内核配置
  */
@@ -199,9 +179,9 @@ function walkUp(from: string, match: (dir: string) => boolean): string | undefin
 /**
  * 自 `from` 向上找装着 CLI 的那个目录
  *
- * 供 `yzng update` 定位「在哪跑包管理器」。与 {@link findInstanceRoot} 分开：升级必须落在
- * 一个**有 `package.json`** 的目录上，而后者还认只有配置文件的实例（全局安装的情形）——
- * 在那种目录里跑 `pnpm add` 会凭空造出一份 `package.json`。
+ * 供 `yzng update` 定位「在哪跑包管理器」。与 {@link findInstanceRoot} 分开：升级必须落在一个有
+ * `package.json` 的目录上，而后者还认只有配置文件的实例 —— 在那种目录里跑 `pnpm add` 会凭空造出
+ * 一份 `package.json`。
  * @param from 起点目录
  * @returns 安装目录；找不到时 undefined
  */
@@ -212,12 +192,8 @@ export function findInstallRoot(from: string): string | undefined {
 /**
  * 自 `from` 向上找已有实例的根
  *
- * 逐级向上而非只看当前目录：在实例的子目录里执行 `yzng start` 是极自然的动作
- * （cd 进 `plugins/` 看一眼插件、或在某个插件目录里改完代码），而只看当前目录
- * 会在那里现建第二个实例 —— 空配置、无账号、面板端口与上层那个相撞，
- * 使用者看到的却是「我的账号和插件都没了」。
- *
- * 两条判据取就近命中者，不分主次：嵌套时离当前目录最近的那个才是使用者所指的。
+ * 逐级向上而非只看当前目录：在实例的子目录里执行 `yzng start` 是极自然的动作，而只看当前目录会在
+ * 那里现建第二个实例。两条判据取就近命中者，不分主次 —— 嵌套时最近的那个才是使用者所指的。
  * @param from 起点目录
  * @returns 实例根目录；一路到盘根都没有时 undefined
  */
@@ -228,8 +204,8 @@ export function findInstanceRoot(from: string): string | undefined {
 /**
  * 未显式指定、也无便携标记时的主目录
  *
- * 先向上找已有实例，找不到才用当前目录 —— 后者是「新装」，前者是「已经装过了，
- * 只是此刻站在它的某个子目录里」。见文件头第 4 条。
+ * 先向上找已有实例，找不到才用当前目录：后者是「新装」，前者是「已经装过了，只是此刻站在它的某个
+ * 子目录里」。
  * @returns 绝对路径
  */
 function autoHome(): string {
@@ -239,9 +215,8 @@ function autoHome(): string {
 /**
  * 0.1.1 及更早的默认位置上是否还留着一个实例
  *
- * 供 CLI 提示使用：默认位置自 0.2.0 起改为当前目录，装过旧版的机器上那个实例仍在原处，
- * 而使用者多半以为「配置全没了」。内核只负责报出位置，是否搬家由使用者决定 ——
- * 自动迁移会在两个目录都有内容时无从判断该以谁为准。
+ * 供 CLI 提示使用：默认位置自 0.2.0 起改为当前目录，装过旧版的机器上那个实例仍在原处。内核只报出
+ * 位置，是否搬家由使用者决定 —— 自动迁移在两个目录都有内容时无从判断以谁为准。
  * @param home 本次实际使用的主目录
  * @returns 旧实例所在目录；不存在、或恰好就是本次所用的目录时 undefined
  */
@@ -254,8 +229,7 @@ export function legacyInstance(home: string): string | undefined {
 /**
  * 解析目录布局
  *
- * 只做路径计算，不创建目录 —— 便于测试与 `yzng doctor` 之类"只想看看
- * 路径解析成什么"的场景。创建请调用 `ensurePaths`。
+ * 只做路径计算，不创建目录，便于测试与 `yzng doctor` 这类只想看路径的场景。创建请调用 `ensurePaths`。
  * @param opts 解析参数
  * @returns 目录布局（全为绝对路径）
  */

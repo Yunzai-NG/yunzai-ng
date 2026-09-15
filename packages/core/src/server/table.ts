@@ -2,19 +2,10 @@
  * 模块职责：路径表 —— 注册 / 注销 / 按请求路径查找，含参数与通配段
  * 依赖方向：只依赖 `@yunzai-ng/types`；不认识 Fastify，也不认识业务
  * 生命周期：随共享服务器创建；插件卸载时按 Disposer 逐条摘除
- * 注意事项：**为什么要自己维护一张表，而不是直接用 Fastify 的路由树**
- *
- *          Fastify（find-my-way）只能加路由，没有删除单条路由的 API。而
- *          "插件能装能卸能热重载"是本框架的核心不变量：重载一次插件如果留下
- *          一条死路由，第二次注册同一路径就会被 duplicate route 直接抛错，
- *          插件从此装不上。
- *
- *          于是服务器只在 Fastify 上注册两条 catch-all（`/` 与 `/*`），真正
- *          的分发走这张表：注册是 Map/数组操作，注销就是删掉一项。代价是参数
- *          解析与优先级排序要自己写 —— 也就是本文件。
- *
- *          排序在**注册时**一次算好（`#dynamic` 始终有序），查找路径上没有
- *          sort、没有正则编译，理由同 pipeline/router.ts：注册低频、查找高频。
+ * 注意事项：自己维护一张表而非直接用 Fastify 的路由树，因为 find-my-way 没有删除单条路由的
+ *          API，而「插件能装能卸能热重载」是核心不变量 —— 留下一条死路由，第二次注册同一路径
+ *          就会 duplicate route 抛错。故服务器只在 Fastify 上注册 catch-all，分发走这张表。
+ *          排序在注册时一次算好（`#dynamic` 始终有序），查找路径上没有 sort 与正则编译。
  */
 import type { Disposer, HttpMethod } from "@yunzai-ng/types"
 
@@ -214,9 +205,8 @@ function insertSorted<T>(list: Bound<T>[], item: Bound<T>): void {
 /**
  * 一张路径表
  *
- * 静态模式（无参数无通配）走 Map 精确命中，其余按具体度顺序线性试。
- * HTTP 路由、WebSocket 路径、静态目录挂载三者的查找规则完全一样，
- * 所以共用这一个实现，只是承载的 `T` 不同。
+ * 静态模式走 Map 精确命中，其余按具体度顺序线性试。HTTP 路由、WebSocket 路径与
+ * 静态挂载三者的查找规则相同，故共用这一个实现，只是承载的 `T` 不同。
  */
 export class PathTable<T> {
   /** 无参数模式：路径 → 项 */

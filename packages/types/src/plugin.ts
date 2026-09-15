@@ -3,7 +3,7 @@
  * 依赖方向：依赖本包内几乎所有其他模块
  * 生命周期：纯类型
  * 注意事项：插件想做的每件事都是 `ctx` 上的一个方法，且每个注册都返回 `Disposer`，
- *          故内核在卸载时能确定性地回收一切。没有全局变量这条路。
+ *          故内核在卸载时能确定性地回收一切
  */
 import type {
   AccountState,
@@ -38,9 +38,8 @@ import type {
 /**
  * 命令模式
  *
- * - 字符串：前缀匹配。内核按首字符分桶索引，一条消息只会去试同桶的候选，
- *   而不是像旧 loader 那样对每条消息线性跑完全部正则。
- * - 正则：完整匹配 `e.text`，捕获组会填进 `e.command.groups` / `captures`。
+ * - 字符串：前缀匹配，内核按首字符分桶索引，一条消息只试同桶的候选
+ * - 正则：完整匹配 `e.text`，捕获组填进 `e.command.groups` / `captures`
  */
 export type CommandPattern = string | RegExp
 
@@ -79,8 +78,6 @@ export interface CommandOptions {
   block?: boolean
   /** 是否在帮助中隐藏 */
   hidden?: boolean
-  /** 是否忽略机器人自己发出的消息，缺省 true */
-  ignoreSelf?: boolean
 }
 
 /**
@@ -181,7 +178,6 @@ export interface CommandInfo {
  * 中间件
  *
  * Koa 语义：接收事件与 `next`，可在 next 前后执行动作，不调用 next 即阻断。
- * 游戏前缀识别（`*` → 星铁、`%` → 绝区零）这类逻辑属于插件的中间件，不进内核。
  */
 export type Middleware<E extends AnyEvent = AnyEvent> = (e: E, next: () => Promise<void>) => Awaitable<void>
 
@@ -193,23 +189,13 @@ export interface MiddlewareOptions {
   kind?: AnyEvent["kind"] | Array<AnyEvent["kind"]>
 }
 
-/**
- * 中间件的对外描述
- *
- * 与 `CommandInfo` / `TaskInfo` 同类，供 WebUI 展示。**不含中间件函数本身** ——
- * 那是个闭包，序列化不出去，而面板要回答的是「一条消息先过谁」。
- */
+/** 中间件的对外描述，供 WebUI 展示；不含中间件函数本身（闭包序列化不出去） */
 export interface MiddlewareInfo {
   /** 所属插件名 */
   plugin: string
   /** 实际生效的优先级（未声明时即缺省值） */
   priority: number
-  /**
-   * 适用的事件大类
-   *
-   * 未声明 `kind` 的中间件在此列出全部大类，而不是留空 —— 「适用于全部」与
-   * 「一类都不适用」在面板上必须分得开。
-   */
+  /** 适用的事件大类；未声明 `kind` 的中间件在此列出全部大类，而非留空 */
   kinds: Array<AnyEvent["kind"]>
 }
 
@@ -225,9 +211,8 @@ export interface TaskOptions {
   /**
    * 上一轮还没跑完时的策略
    *
-   * - `"skip"`（缺省）：跳过本轮。移植旧 loader 的 `taskRunning` 保护，
-   *   避免推送任务堆积把内存吃光。
-   * - `"queue"`：排队等上一轮结束。
+   * - `"skip"`（缺省）：跳过本轮，避免任务堆积
+   * - `"queue"`：排队等上一轮结束
    */
   overlap?: "skip" | "queue"
   /** 单次执行超时；超时会 abort 传入的 signal */
@@ -260,12 +245,7 @@ export interface TaskInfo {
 
 /* ────────────────────────────── 内核事件 ────────────────────────────── */
 
-/**
- * 一次命令处理的结果
- *
- * 三个「已完成」事件（命令、发送、渲染）都带 `cost` 与 `ok`：统计插件要算的
- * 无非「多少次、多久、成功率」，缺任一项都得自己再埋一遍表。
- */
+/** 一次命令处理的结果；三个「已完成」事件都带 `cost` 与 `ok`，供统计插件直接取用 */
 export interface CommandDoneInfo {
   /** 命令所属插件 */
   plugin: string
@@ -345,20 +325,9 @@ export interface CoreEventMap {
   "config/changed": [owner: string, paths: string[]]
   /** 事件处理中抛出未捕获错误 */
   "pipeline/error": [e: AnyEvent, err: unknown]
-  /**
-   * 一条命令处理完毕（成功或抛错都会触发）
-   *
-   * 与 `message` 的分工：`message` 说明「收到了一条消息」，本事件说明
-   * 「某条命令跑完了、花了多久」。统计「命令调用次数与耗时」要的是后者 ——
-   * 一条消息可能命中零条或多条命令。
-   */
+  /** 一条命令处理完毕（成功或抛错都会触发）；一条消息可能命中零条或多条命令 */
   "command/done": [e: MessageEvent, info: CommandDoneInfo]
-  /**
-   * 一条消息已发出
-   *
-   * 在 `BotApi.sendMessage` 的出口触发，因此 `e.reply()`、`ctx.render()` 之后的
-   * 发送、定时任务里的主动推送都在其中 —— 埋在 `reply()` 上会漏掉后两者。
-   */
+  /** 一条消息已发出；埋在 `BotApi.sendMessage` 的出口，故主动推送也在其中 */
   "message/sent": [info: MessageSentInfo]
   /** 一次渲染结束（成功或全部渲染器失败） */
   "render/done": [info: RenderDoneInfo]
@@ -395,13 +364,7 @@ export interface PluginState {
   description?: string
   /** 作者 */
   author?: string
-  /**
-   * 仓库或主页地址
-   *
-   * 取自插件 `package.json` 的 `homepage`，或 `definePlugin` 的同名字段。
-   * **取不到时本字段不出现**，面板据此决定是否显示「访问仓库」——
-   * 按钮在而点了没反应，比按钮不在更糟。
-   */
+  /** 仓库或主页地址，取自 `package.json` 的 `homepage` 或 `definePlugin` 同名字段；取不到时不出现 */
   homepage?: string
   /** 安装目录 */
   root: string
@@ -417,19 +380,9 @@ export interface PluginState {
   tasks: number
   /** 注册的中间件数 */
   middlewares: number
-  /**
-   * 是否位于随发行版预置的插件目录
-   *
-   * 内核自身不预置任何插件，该标记仅在宿主显式传入 `builtinDirs` 时为真，
-   * 用于区分"由发行版放置"与"由用户或插件市场安装"。
-   */
+  /** 是否位于随发行版预置的插件目录，仅宿主显式传入 `builtinDirs` 时为真 */
   builtin: boolean
-  /**
-   * 是否声明了配置 schema
-   *
-   * 为真时存在一份与插件同名的配置文件，面板据此决定是否展示配置入口。
-   * 加载失败的插件此项恒为假：其 `setup` 未执行，配置未被声明。
-   */
+  /** 是否声明了配置 schema；加载失败的插件恒为假，其 `setup` 未执行 */
   configured: boolean
 }
 
@@ -580,8 +533,7 @@ export interface PluginContext<C = unknown> {
   /**
    * 对外提供服务，供其他插件 `inject` 取用
    *
-   * 插件间协作的唯一入口：mhy-game-plugin 提供 `"mihoyo.api"`，其他插件按需取，
-   * 内核只维护一张键到值的表，对表里装的是什么毫无认知。
+   * 插件间协作的唯一入口；内核只维护一张键到值的表，不认识表里装的是什么。
    * @param key 服务键，建议 `"<插件域>.<能力>"`
    * @param value 服务实例
    * @returns 注销句柄
@@ -643,12 +595,8 @@ export interface PluginContext<C = unknown> {
   /**
    * 接管站点根路径，以本插件提供的单页应用替换内置面板
    *
-   * 与 `static()` 的区别在于挂载位置：`static()` 挂在 `/plugin/<插件名>` 之下，
-   * 本方法挂在 `/`。内核自带的面板是**兜底实现**，仅在根路径无人接管时才挂载，
-   * 因此调用本方法即可整体替换面板前端，无需修改内核。
-   *
-   * 同一时刻只允许一个插件接管：根路径已被占用时抛错，而不是静默覆盖 ——
-   * 静默覆盖会使"面板显示的是哪个插件的页面"变得无法判定。
+   * 挂在 `/` 而非 `static()` 的 `/plugin/<插件名>` 之下。内核自带的面板只在根路径
+   * 无人接管时才挂载。同一时刻只允许一个插件接管，已被占用时抛错而非静默覆盖。
    * @param dir 单页应用产物目录（绝对路径，需含 index.html）
    * @returns 注销句柄；注销后内置面板不会自动补挂，需重启进程
    */
@@ -678,8 +626,7 @@ export interface PluginContext<C = unknown> {
   /**
    * 渲染 TSX 页面为图片段
    *
-   * 页面由 `@yunzai-ng/jsx` 的 `defineTemplate()` 产出：组件在插件进程内即求值完毕，
-   * 因此模板数据的类型在调用处便已检查。
+   * 页面由 `@yunzai-ng/jsx` 的 `defineTemplate()` 产出。
    * @param page 已渲染好的页面
    * @param opts 渲染选项
    * @returns 图片段（分页时为数组）
@@ -721,8 +668,8 @@ export interface PluginContext<C = unknown> {
   /**
    * 注册清理回调
    *
-   * 卸载时按注册的逆序执行。凡是 ctx 之外自己开的资源（socket、子进程、
-   * 第三方库的 watcher）都必须在这里登记。
+   * 卸载时按注册的逆序执行。ctx 之外自己开的资源（socket、子进程、第三方库的
+   * watcher）都必须在这里登记，否则卸载后仍在跑。
    * @param fn 清理函数
    */
   onDispose(fn: Disposer): void
@@ -770,10 +717,9 @@ export interface PluginDefinition<C = unknown> extends PluginMeta {
   /**
    * 配置 schema
    *
-   * 实际类型是 `@yunzai-ng/core` 的 `Schema`（由 `s.object({...})` 构造）。
-   * 类型包不依赖任何工作区包以保持叶子，故此处只能是 `unknown`；
-   * 真正的类型推导由 core 的 `definePlugin` 完成 —— 这也是插件必须用
-   * `definePlugin` 而不是手写对象字面量的原因。
+   * 实际类型是 core 的 `Schema`（由 `s.object({...})` 构造），此处只能写 `unknown`
+   * 因为类型包不依赖工作区包。类型推导由 core 的 `definePlugin` 完成，故插件必须用
+   * 它而不是手写对象字面量。
    */
   configSchema?: unknown
 
