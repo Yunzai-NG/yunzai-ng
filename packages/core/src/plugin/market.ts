@@ -15,7 +15,14 @@ import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/pro
 import { dirname, join } from "node:path"
 import type { HttpClient, Logger } from "@yunzai-ng/types"
 import { isDirectory, isFile } from "../util/fs.js"
-import { INSTALL_TIMEOUT_MS, SCRIPT_TIMEOUT_MS, isScriptName, runPm, type PmRunner } from "./pm.js"
+import {
+  INSTALL_TIMEOUT_MS,
+  SCRIPT_TIMEOUT_MS,
+  assertScriptName,
+  isScriptName,
+  runPm,
+  type PmRunner
+} from "./pm.js"
 import { extractTarGz, joinWithin, singleRoot } from "./tar.js"
 
 /** 合法插件名：字母或数字开头，其余可含字母、数字、点、下划线与连字符 */
@@ -35,6 +42,14 @@ const TRANSFER_TIMEOUT_MS = 5 * 60 * 1000
 /** 只读本地仓库的 git 命令超时毫秒；不含网络往返，故与传输超时分开取值 */
 const GIT_LOCAL_TIMEOUT_MS = 10_000
 
+/**
+ * 自定义条目的 `source` 取值
+ *
+ * 条目的 `source` 本是「这一条来自哪个索引地址」，而自定义条目不来自任何索引。给一个
+ * 固定的伪地址而非空串：面板上那一行照原样显示，看到的是「自定义安装」而不是一处空白，
+ * 且它与任何真实地址都不会相撞（不是一个 URL）。
+ */
+export const CUSTOM_SOURCE = "custom"
 
 /** 判定"看起来是一个插件"时接受的入口文件 */
 const ENTRY_FILES: readonly string[] = ["index.js", "index.mjs", "index.cjs", "dist/index.js", "dist/index.mjs"]
@@ -99,6 +114,40 @@ export interface MarketEntry {
   readonly setup?: MarketSetupSpec
   /** 该条目来自哪个索引地址 */
   readonly source: string
+  /**
+   * 这一条是使用者自己登记的，不来自任何索引
+   *
+   * **登记成条目而非另开一条安装路径**，是为了让 `install` / `update` / `inspectUpdate` /
+   * `setup` / `remove` 一字不改地适用：那几个方法都经 {@link PluginMarket.entry} 找条目，
+   * 找得到就照原样办事。另开一条路径要把「就地 fetch + reset --hard」「撞上本地改动时
+   * 先 stash」「装依赖再跑脚本」逐条重写一遍，而那必然与这一份分叉。
+   *
+   * 索引里的同名条目优先：某个插件哪天进了官方索引，索引那份自动接管，无须手工清理。
+   */
+  readonly custom?: true
+}
+
+/**
+ * 使用者登记一个自定义插件时填的东西
+ *
+ * 只有 `url` 必填。其余各项都能从地址推出或留空 —— 一个要填七个字段才能装一个插件的
+ * 表单，与直接 `git clone` 相比没有便利可言。
+ */
+export interface CustomSpec {
+  /** git 仓库地址 */
+  readonly url: string
+  /** 安装目录名；留空则取仓库名 */
+  readonly name?: string
+  /** 分支；留空由远端决定 */
+  readonly branch?: string
+  /** 装完之后要不要编译（即跑 `build`） */
+  readonly build?: boolean
+  /** 除 `build` 之外还要跑的 script，按给出的顺序执行 */
+  readonly scripts?: readonly string[]
+  /** 展示标题；留空取目录名 */
+  readonly title?: string
+  /** 一句话说明 */
+  readonly description?: string
 }
 
 /** 附带本地安装状态的条目 */
@@ -263,6 +312,16 @@ export interface MarketDeps {
   readonly tempDir: string
   /** 索引缓存文件路径 */
   readonly cacheFile: string
+  /**
+   * 自定义条目的存放路径
+   *
+   * 与索引缓存分开成两个文件：缓存是可随时丢弃的加速手段（`#saveCache` 写失败只记一行
+   * 日志），而这一份是使用者自己填进去的、丢了就要重填的东西。混在一处的话，一次缓存
+   * 重写就会把它一起抹掉。
+   *
+   * 不给这一项即「本部署不支持自定义安装」，此时相关方法一律拒绝。
+   */
+  readonly customFile?: string
   /** 读取当前配置 */
   readonly settings: () => MarketSettings
   /** 当前内核版本，用于 `minCore` 判定 */
@@ -343,6 +402,92 @@ export function tarballFromGit(url: string, branch = "HEAD"): string | undefined
   const match = /^https?:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(url)
   if (!match) return undefined
   return `https://codeload.github.com/${match[1]}/${match[2]}/tar.gz/${branch}`
+}
+
+/**
+ * 由 git 地址推出仓库名，供自定义安装缺省的目录名
+ *
+ * 取地址末段并剥掉 `.git`：`https://github.com/foo/bar-plugin.git` 得 `bar-plugin`。
+ * 查询串与锚点先切掉 —— 一个从浏览器地址栏复制来的地址常带 `?tab=readme`，
+ * 带着它推出的目录名会因 `assertPluginName` 而整次安装失败，而失败原因看起来
+ * 与地址无关。
+ *
+ * **主机之后至少要有两段路径**，否则不猜。`https://github.com/foo/` 的末段是 `foo`，
+ * 那是所有者而非仓库名；`https://example.com/` 的末段是主机本身。这两种都能推出一个
+ * 长得像名字的东西，而它指向的目录与使用者的意图无关 —— 装完之后他看到的是一个
+ * 叫「foo」的插件目录，且不知道那是哪来的。
+ *
+ * **推不出合法名字时返回 undefined 而非猜一个**：那时该让使用者自己填目录名，
+ * 见 {@link customEntry}。
+ * @param url git 仓库地址
+ * @returns 仓库名；推不出或不合法时 undefined
+ */
+export function repoNameOf(url: string): string | undefined {
+  const bare = url.trim().split(/[?#]/)[0] ?? ""
+  // 主机之后的那一截；连主机都切不出来时无从谈路径段数
+  const path = /^[a-z]+:\/\/[^/]+\/(.*)$/i.exec(bare)?.[1]
+  if (path === undefined) return undefined
+  const parts = path.split("/").filter(one => one !== "")
+  if (parts.length < 2) return undefined
+  const last = (parts[parts.length - 1] ?? "").replace(/\.git$/i, "")
+  if (last === "" || !NAME_RE.test(last) || last.startsWith(".")) return undefined
+  return last
+}
+
+/**
+ * 把使用者填的那几项变成一条市场条目
+ *
+ * 这是自定义安装的全部「翻译」工作：此后它与索引里的条目**在类型上无从区分**，故安装、
+ * 更新、装依赖、卸载各条路径都不必知道它的来历。
+ *
+ * 三处判断值得写明：
+ *
+ * - **只收 `https?://`**，与索引里的 `parseInstall` 同一判据。`git@github.com:...` 那种
+ *   SSH 写法要本机配好密钥，而这个函数跑在一次无人值守的 HTTP 请求里 —— 缺密钥时 git
+ *   会挂在凭据提示上直到超时（`runGit` 已关掉提示，于是表现为一句难懂的失败）。
+ * - **`build` 与额外脚本合成一份 `setup`**，`build` 排在最前：额外脚本多半建立在产物之上
+ *   （renderer-puppeteer 的 `install:browser` 要先有编译好的东西）。
+ * - **`dev: true` 恒成立**（只要有 setup）：编译器在 devDependencies 里，`--prod` 装不到它，
+ *   那时 `build` 必然失败在「找不到 tsc」上。
+ * @param spec 使用者填的那几项
+ * @returns 一条自定义条目
+ * @throws 地址为空或非 http(s)、目录名推不出或不合法、script 名不合法时
+ */
+export function customEntry(spec: CustomSpec): MarketEntry {
+  const url = (spec.url ?? "").trim()
+  if (url === "") throw new Error("请填写 git 仓库地址")
+  if (!/^https?:\/\//.test(url)) {
+    throw new Error(`仓库地址须以 http:// 或 https:// 开头，收到的是：${url}`)
+  }
+
+  const given = (spec.name ?? "").trim()
+  const name = given === "" ? repoNameOf(url) : given
+  if (name === undefined) {
+    throw new Error(`从地址推不出合法的目录名，请自行填写「安装目录名」一项。地址：${url}`)
+  }
+  assertPluginName(name)
+
+  const extra = (spec.scripts ?? []).map(one => one.trim()).filter(one => one !== "")
+  for (const one of extra) assertScriptName(one)
+  const scripts = [...(spec.build === true ? ["build"] : []), ...extra.filter(one => one !== "build")]
+
+  const branch = (spec.branch ?? "").trim()
+  const title = (spec.title ?? "").trim()
+  const description = (spec.description ?? "").trim()
+
+  return {
+    name,
+    title: title === "" ? name : title,
+    description,
+    tags: [],
+    // 自定义的一概不是官方维护 —— 那枚标记的含义是「经索引审核」，此处没有任何审核
+    official: false,
+    install: { type: "git", url, ...(branch === "" ? {} : { branch }) },
+    ...(scripts.length === 0 ? {} : { setup: { scripts, dev: true } }),
+    // 来源写成一句人话而不是某个地址：详情页那一行要答的是「这条打哪来的」
+    source: CUSTOM_SOURCE,
+    custom: true
+  }
 }
 
 /**
@@ -509,8 +654,17 @@ export class PluginMarket {
   /** 依赖 */
   readonly #deps: MarketDeps
 
-  /** 内存中的索引条目 */
+  /** 内存中的索引条目，已含自登记的那几条（见 `#apply`） */
   #entries: MarketEntry[] = []
+
+  /**
+   * 自登记的那几条，与索引条目分开存着
+   *
+   * 分开存是因为 `#entries` 会被一次索引刷新整体换掉，而自登记那几条不该随之消失 ——
+   * 合在一处的话每次刷新都要先把它们捞出来再放回去，漏一次的表现是「刷新一下自定义
+   * 插件就没了」。
+   */
+  #customs: MarketEntry[] = []
 
   /** 内存索引的获取时间，0 表示尚未取到 */
   #fetchedAt = 0
@@ -609,10 +763,14 @@ export class PluginMarket {
    */
   async #fetchAll(force: boolean): Promise<void> {
     const { sources, mirror, timeout, cacheTtl } = this.#deps.settings()
+
+    // 自登记的那几条每次都重读：它由另一条路径（`addCustom`）写入，且那条路径不刷索引
+    this.#customs = await this.#loadCustoms()
+
     if (!force && this.#fetchedAt === 0) {
       const cache = await this.#loadCache()
       if (cache !== undefined && Date.now() - cache.fetchedAt < cacheTtl) {
-        this.#entries = cache.entries
+        this.#apply(cache.entries)
         this.#fetchedAt = cache.fetchedAt
         this.#sources = [{ url: this.#deps.cacheFile, ok: true, count: cache.entries.length }]
         return
@@ -640,15 +798,137 @@ export class PluginMarket {
     if (merged.size === 0 && results.every(item => !item.ok)) {
       const cache = await this.#loadCache()
       if (cache !== undefined) {
-        this.#entries = cache.entries
+        this.#apply(cache.entries)
         this.#fetchedAt = cache.fetchedAt
         this.#deps.logger.warn("插件市场全部索引不可达，沿用上次缓存")
         return
       }
     }
-    this.#entries = [...merged.values()]
+    this.#apply([...merged.values()])
     this.#fetchedAt = Date.now()
     await this.#saveCache()
+  }
+
+  /**
+   * 把索引条目与自登记条目合成 `#entries`
+   *
+   * **一个 setter 而非三处各拼一遍。** `#fetchAll` 有三个出口（磁盘缓存新鲜、全部源
+   * 不可达而沿用缓存、正常取到），少写一处的表现是「自定义插件平时在、断网时不见了」
+   * —— 那种缺失极难与网络问题区分开。
+   *
+   * **索引里的同名条目优先**：某个插件哪天进了官方索引，索引那份自动接管，而使用者
+   * 那条登记留着也不碍事。反过来（自登记覆盖索引）会让「我明明装的是官方那份」
+   * 变成一句无从查证的话。
+   * @param indexed 来自索引或磁盘缓存的条目
+   */
+  #apply(indexed: readonly MarketEntry[]): void {
+    const byName = new Map<string, MarketEntry>()
+    for (const item of indexed) byName.set(item.name, item)
+    for (const item of this.#customs) if (!byName.has(item.name)) byName.set(item.name, item)
+    this.#entries = [...byName.values()]
+  }
+
+  /**
+   * 读回自登记的那几条
+   *
+   * **按不可信输入对待**，与索引缓存同一道理（那个文件同样在使用者手边）：逐条重新
+   * 经 `parseIndex` 校验，一条坏的只丢那一条。`custom` 标记在此处补回 —— 它不在
+   * `parseEntry` 的认领范围内，而少了它面板上分不出这条打哪来。
+   * @returns 自登记条目；文件不存在或整份读不动时空数组
+   */
+  async #loadCustoms(): Promise<MarketEntry[]> {
+    const file = this.#deps.customFile
+    if (file === undefined) return []
+    try {
+      const raw = JSON.parse(await readFile(file, "utf8")) as unknown
+      const entries = parseIndex(raw, CUSTOM_SOURCE, this.#deps.logger)
+      return entries.map(item => ({ ...item, source: CUSTOM_SOURCE, custom: true as const }))
+    } catch {
+      return []
+    }
+  }
+
+  /**
+   * 写下自登记的那几条
+   *
+   * **写失败要抛**，与索引缓存那处相反：缓存写不进去只是下次多发一次网络请求，而这里
+   * 写不进去意味着「装完了、重启后更新不了」—— 那时该让使用者当场知道，而不是几天后
+   * 发现更新按钮不亮。
+   * @param entries 全部自登记条目
+   * @throws 写入失败时
+   */
+  async #saveCustoms(entries: readonly MarketEntry[]): Promise<void> {
+    const file = this.#deps.customFile
+    // 没配这一项即本部署不支持自定义安装。抛而不是静默不写：静默的表现是「登记了、
+    // 重启后没了」，而那与「写失败」在界面上分不出来
+    if (file === undefined) throw new Error("当前部署未启用自定义插件安装")
+    await mkdir(dirname(file), { recursive: true })
+    await writeFile(file, JSON.stringify({ plugins: entries }, undefined, 2), "utf8")
+  }
+
+  /**
+   * 登记一条自定义插件 —— **只登记，不安装**
+   *
+   * 分成两步而不是一个 `addCustom` 里连着装完，是为了让 HTTP 那层能在两步之间插进它自己的
+   * 事情：卸掉占着这个目录的插件、装完 `loadAll()`、失败时把卸掉的那个装回去（见 `api.ts`
+   * 的 `installFromMarket`）。若这里直接调 `install`，那一整套就得在自定义这条路上重写一遍。
+   *
+   * **登记先落盘，安装在其后另行发起。** 安装可能失败在取源、编译或装依赖上，而那几种失败都
+   * 留下「目录已在、下次想重试」的局面 —— 登记若等安装成功才写，重试就得重填一遍表单。登记
+   * 本身不动插件目录，故一条指向错地址的登记除占一行 JSON 之外无害，撤掉即可。
+   * @param spec 使用者填的那几项
+   * @returns 登记下来的那条条目
+   * @throws 表单不合法（见 {@link customEntry}）、索引里已有同名条目，或登记写入失败时
+   */
+  async registerCustom(spec: CustomSpec): Promise<MarketEntry> {
+    const entry = customEntry(spec)
+
+    // 索引里已有同名的一条时不许登记：那会让两份来源指向同一个目录名，而谁生效取决于
+    // `#apply` 的优先级 —— 使用者看到的是「我填的地址没生效」
+    const existing = await this.entry(entry.name)
+    if (existing !== undefined && existing.custom !== true) {
+      throw new Error(
+        `插件索引里已有名为 ${entry.name} 的插件，请在市场里直接安装它，或为这一条另填一个「安装目录名」`
+      )
+    }
+
+    const kept = this.#customs.filter(item => item.name !== entry.name)
+    await this.#saveCustoms([...kept, entry])
+    this.#customs = [...kept, entry]
+    this.#apply(this.#entries.filter(item => item.custom !== true))
+    this.#deps.logger.info(`已登记自定义插件 ${entry.name}：${entry.install.url}`)
+    return entry
+  }
+
+  /**
+   * 撤掉一条自定义登记
+   *
+   * **只撤登记，不删插件目录。** 删目录是 `remove()` 的事，两件事分开才使得「我想改一下
+   * 这条的地址」不必先卸载插件。反过来说，`remove()` 之后这条登记还在 —— 那时市场页上
+   * 它显示为「未安装」，点安装即按原地址重装一次，那是有用的。
+   * @param name 插件名
+   * @returns 是否确实撤掉了一条
+   * @throws 写入失败时
+   */
+  async removeCustom(name: string): Promise<boolean> {
+    assertPluginName(name)
+    this.#customs = await this.#loadCustoms()
+    const kept = this.#customs.filter(item => item.name !== name)
+    if (kept.length === this.#customs.length) return false
+    await this.#saveCustoms(kept)
+    this.#customs = kept
+    this.#entries = this.#entries.filter(item => !(item.name === name && item.custom === true))
+    this.#deps.logger.info(`已撤掉自定义插件 ${name} 的登记（插件目录未动）`)
+    return true
+  }
+
+  /**
+   * 列出全部自定义登记
+   * @returns 自登记条目
+   */
+  async customs(): Promise<MarketEntry[]> {
+    this.#customs = await this.#loadCustoms()
+    return [...this.#customs]
   }
 
   /**

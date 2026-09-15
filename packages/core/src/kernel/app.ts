@@ -706,6 +706,9 @@ export async function createApp(opts: CreateAppOptions = {}): Promise<App> {
     pluginsDir: paths.plugins,
     tempDir: join(paths.temp, "market"),
     cacheFile: join(paths.cache, "market-index.json"),
+    // 自登记落在 data 而非 cache：清缓存是使用者随手会做的事，而登记一旦丢了，那几个
+    // 自定义插件就再也更新不了（`entry()` 找不到条目）—— 那种损坏与清缓存的动作隔着几天
+    customFile: join(paths.data, "market-custom.json"),
     coreVersion: version,
     settings: () => {
       const current = config.get().market

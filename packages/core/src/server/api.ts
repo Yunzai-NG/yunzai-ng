@@ -698,6 +698,73 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     )
   })
 
+  /*
+   * 自己填一个 git 地址装插件 —— 索引之外的那条路
+   *
+   * **登记与安装是两步，中间夹着这一层自己的事**（卸掉占目录的插件、装完 loadAll、失败时装回去），
+   * 故这里调 `registerCustom` 而非让市场一口气装完：那一套若在市场里重写一遍，两条安装路径迟早
+   * 在「装失败之后插件还在不在」这种事上分叉。
+   *
+   * **登记成功而安装失败时不撤登记。** 那时目录多半已经在了（失败在编译或装依赖上），使用者
+   * 下一步是修一修再点重试，而撤掉登记等于让他重填一遍表单。要清掉就用 DELETE 那条。
+   *
+   * 路由段数与 `market/:name` 那几条都不同，故不会互相吃掉。
+   */
+  add("POST", "market/custom", async req => {
+    requireWritable()
+    const body = objectOf(req.body)
+    const scripts = Array.isArray(body.scripts)
+      ? body.scripts.filter((one): one is string => typeof one === "string")
+      : []
+    let entry
+    try {
+      entry = await market().registerCustom({
+        url: requireString(body, "url"),
+        ...(optionalString(body, "name") === undefined ? {} : { name: optionalString(body, "name") }),
+        ...(optionalString(body, "branch") === undefined ? {} : { branch: optionalString(body, "branch") }),
+        ...(optionalString(body, "title") === undefined ? {} : { title: optionalString(body, "title") }),
+        ...(optionalString(body, "description") === undefined
+          ? {}
+          : { description: optionalString(body, "description") }),
+        build: optionalBoolean(body, "build") ?? false,
+        scripts
+      })
+    } catch (err) {
+      // 登记这一步的失败一概是表单问题（地址不合法、目录名推不出、script 名不合法、已有同名索引条目）
+      throw fail(400, err instanceof Error ? err.message : String(err))
+    }
+    const result = await installFromMarket(
+      entry.name,
+      optionalBoolean(body, "load") ?? true,
+      optionalBoolean(body, "replace") ?? false,
+      optionalBoolean(body, "dependencies") ?? true
+    )
+    return { ...result, custom: true }
+  })
+
+  // 列出自己登记过的那几条。只读动作，故不要求写权限
+  add("GET", "market/customs", () => market().customs())
+
+  /*
+   * 撤掉一条登记 —— **不删插件目录**
+   *
+   * 删目录是 `DELETE market/:name` 的事。两件事分开，才使得「我想改一下这条的地址」不必先
+   * 卸载插件：撤掉旧登记、填一条新的即可。反过来，插件目录删掉之后这条登记还在，那时它在
+   * 市场页上显示为「未安装」，点一下即按原地址重装 —— 那是有用的。
+   */
+  add("DELETE", "market/custom/:name", async req => {
+    requireWritable()
+    const name = req.params.name ?? ""
+    let removed: boolean
+    try {
+      removed = await market().removeCustom(name)
+    } catch (err) {
+      throw fail(400, err instanceof Error ? err.message : String(err))
+    }
+    if (!removed) throw fail(404, `没有名为 ${name} 的自定义登记`)
+    return { name, removed }
+  })
+
   // 只读动作，故不要求写权限：只读模式下更新会被挡下，但「目录改过没有」仍该答得出
   add("GET", "market/:name/update-probe", async req => {
     const name = req.params.name ?? ""

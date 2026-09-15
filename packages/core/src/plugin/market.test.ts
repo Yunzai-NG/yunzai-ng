@@ -19,11 +19,14 @@ import { fakeLogger, type FakeLogger } from "../testing/fake.js"
 import { buildTarGz } from "./tar.js"
 import type { PmRunner, PmTask } from "./pm.js"
 import {
+  CUSTOM_SOURCE,
   PluginMarket,
   applyMirror,
   assertPluginName,
   compareVersion,
+  customEntry,
   parseIndex,
+  repoNameOf,
   tarballFromGit,
   type GitRunner,
   type MarketSettings
@@ -190,6 +193,8 @@ interface Harness {
   pluginsDir: string
   /** 索引缓存文件 */
   cacheFile: string
+  /** 自定义登记文件 */
+  customFile: string
   /** 日志 */
   logger: FakeLogger
   /** HTTP 调用记录 */
@@ -220,6 +225,9 @@ async function makeHarness(
   const pluginsDir = join(root, "plugins")
   const tempDir = join(root, "temp")
   const cacheFile = join(root, "cache", "market.json")
+  // 与缓存分在两处目录，正如实际部署（cache/ 与 data/）—— 同一目录会让「清缓存不该
+  // 抹掉登记」这条约定在用例里无从验证
+  const customFile = join(root, "data", "market-custom.json")
   await mkdir(pluginsDir, { recursive: true })
   const logger = reuse?.logger ?? fakeLogger()
   const { http, calls } = stubHttp(routes)
@@ -229,6 +237,7 @@ async function makeHarness(
     pluginsDir,
     tempDir,
     cacheFile,
+    customFile,
     coreVersion: "1.0.0",
     settings: () => ({
       sources: ["https://example.com/index.json"],
@@ -254,7 +263,7 @@ async function makeHarness(
      */
     pm: pm ?? (() => Promise.reject(new Error("用例未注入包管理器替身")))
   })
-  harness = { market, pluginsDir, cacheFile, logger, calls, root }
+  harness = { market, pluginsDir, cacheFile, customFile, logger, calls, root }
   return harness
 }
 
@@ -1309,5 +1318,328 @@ describe("PluginMarket.setup", () => {
     // 单文件插件没有依赖可言，跑一趟只会在一个没有 package.json 的目录里报错
     expect(pm.calls).toEqual([])
     expect(result).toMatchObject({ needsDependencies: false, version: "0.0.0" })
+  })
+})
+
+describe("repoNameOf", () => {
+  it("取地址末段并剥掉 .git", () => {
+    expect(repoNameOf("https://github.com/foo/bar-plugin.git")).toBe("bar-plugin")
+    expect(repoNameOf("https://github.com/foo/bar-plugin")).toBe("bar-plugin")
+  })
+
+  it("末尾多余的斜杠不影响", () => {
+    expect(repoNameOf("https://github.com/foo/bar/")).toBe("bar")
+  })
+
+  /*
+   * 查询串与锚点要先切掉
+   *
+   * 从浏览器地址栏复制来的地址常带 `?tab=readme-ov-file`。不切的话推出的名字含 `?`，
+   * 而那会撞在 `assertPluginName` 上 —— 使用者看到的是一句「插件名不合法」，与他填的
+   * 地址看起来毫无关系。
+   */
+  it("**查询串与锚点先切掉** —— 从地址栏复制来的地址常带它们", () => {
+    expect(repoNameOf("https://github.com/foo/bar?tab=readme-ov-file")).toBe("bar")
+    expect(repoNameOf("https://github.com/foo/bar#readme")).toBe("bar")
+  })
+
+  it("推不出合法名字时给 undefined，不猜一个", () => {
+    expect(repoNameOf("https://github.com/foo/")).toBeUndefined()
+    expect(repoNameOf("https://github.com/foo/.hidden")).toBeUndefined()
+    expect(repoNameOf("https://github.com/foo/-leading")).toBeUndefined()
+  })
+})
+
+describe("customEntry", () => {
+  it("只给地址即可，目录名由地址推出", () => {
+    const entry = customEntry({ url: "https://github.com/foo/bar-plugin.git" })
+    expect(entry).toMatchObject({
+      name: "bar-plugin",
+      title: "bar-plugin",
+      install: { type: "git", url: "https://github.com/foo/bar-plugin.git" },
+      custom: true,
+      source: CUSTOM_SOURCE
+    })
+  })
+
+  it("给了目录名就用它，不再看地址", () => {
+    expect(customEntry({ url: "https://github.com/foo/bar.git", name: "my-thing" }).name).toBe("my-thing")
+  })
+
+  /*
+   * 这一条是「官方」那枚标记的含义所在
+   *
+   * 那枚标记读作「经索引审核」，而自定义安装没有任何审核。让它跟着填表人的意愿走，
+   * 等于让任何人给自己的插件盖一个官方章。
+   */
+  it("**自定义的一概不是官方维护** —— 那枚标记的含义是「经索引审核」", () => {
+    expect(customEntry({ url: "https://github.com/foo/bar.git" }).official).toBe(false)
+  })
+
+  it("地址为空或不是 http(s) 时拒绝，且说明该怎么填", () => {
+    expect(() => customEntry({ url: "" })).toThrow(/请填写/)
+    expect(() => customEntry({ url: "   " })).toThrow(/请填写/)
+    // SSH 写法要本机配好密钥，而这个函数跑在一次无人值守的请求里
+    expect(() => customEntry({ url: "git@github.com:foo/bar.git" })).toThrow(/http/)
+  })
+
+  it("地址推不出目录名且没自己填时，报错指向「安装目录名」那一项", () => {
+    expect(() => customEntry({ url: "https://example.com/" })).toThrow(/安装目录名/)
+  })
+
+  it("勾了编译即得一条 build", () => {
+    expect(customEntry({ url: "https://github.com/foo/bar.git", build: true }).setup).toEqual({
+      scripts: ["build"],
+      dev: true
+    })
+  })
+
+  /*
+   * `build` 必须排在额外脚本之前
+   *
+   * renderer-puppeteer 的 `install:browser` 要在编译产物之上跑。次序反了的表现是
+   * 「装完少了东西」，而两个 script 都各自成功过。
+   */
+  it("**build 排在额外脚本之前** —— 额外脚本多半建立在产物之上", () => {
+    expect(
+      customEntry({ url: "https://github.com/foo/bar.git", build: true, scripts: ["install:browser"] }).setup
+    ).toEqual({ scripts: ["build", "install:browser"], dev: true })
+  })
+
+  it("额外脚本里再写一遍 build 不会重复", () => {
+    expect(customEntry({ url: "https://github.com/foo/bar.git", build: true, scripts: ["build"] }).setup).toEqual({
+      scripts: ["build"],
+      dev: true
+    })
+  })
+
+  it("只写额外脚本、不勾编译也成立", () => {
+    expect(customEntry({ url: "https://github.com/foo/bar.git", scripts: ["prepare"] }).setup).toEqual({
+      scripts: ["prepare"],
+      dev: true
+    })
+  })
+
+  it("两样都没有时不带 setup —— 那是「装完依赖就算完」", () => {
+    expect(customEntry({ url: "https://github.com/foo/bar.git" }).setup).toBeUndefined()
+  })
+
+  /*
+   * `dev: true` 恒成立
+   *
+   * 编译器在 devDependencies 里，`--prod` 装不到它。那时 `build` 必然失败在「找不到 tsc」上，
+   * 而那句错与「你勾了编译」之间隔着一层。
+   */
+  it("**有 setup 时 dev 恒为真** —— 编译器在 devDependencies 里", () => {
+    expect(customEntry({ url: "https://github.com/foo/bar.git", build: true }).setup?.dev).toBe(true)
+  })
+
+  it("script 名不合法时拒绝：那个名字要拼进命令行", () => {
+    expect(() => customEntry({ url: "https://github.com/foo/bar.git", scripts: ["rm -rf /"] })).toThrow()
+    expect(() => customEntry({ url: "https://github.com/foo/bar.git", scripts: ["a && b"] })).toThrow()
+  })
+
+  it("空白的额外脚本项直接滤掉，不因此报错", () => {
+    expect(customEntry({ url: "https://github.com/foo/bar.git", scripts: ["", "  "] }).setup).toBeUndefined()
+  })
+
+  it("分支照原样带上，留空则不带", () => {
+    expect(customEntry({ url: "https://github.com/foo/bar.git", branch: "dev" }).install.branch).toBe("dev")
+    expect(customEntry({ url: "https://github.com/foo/bar.git", branch: "  " }).install.branch).toBeUndefined()
+  })
+
+  it("目录名仍要过 assertPluginName", () => {
+    expect(() => customEntry({ url: "https://github.com/foo/bar.git", name: "../evil" })).toThrow()
+    expect(() => customEntry({ url: "https://github.com/foo/bar.git", name: "node_modules" })).toThrow()
+  })
+})
+
+/** 一份不含任何条目的索引：自定义登记的用例要的正是「索引里没有这一条」 */
+const EMPTY_INDEX = { version: 1, plugins: [] }
+
+describe("PluginMarket 自定义登记", () => {
+  it("登记之后 entry() 找得到，且带 custom 标记", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } })
+
+    await h.market.registerCustom({ url: "https://github.com/demo/demo.git" })
+
+    expect(await h.market.entry("demo")).toMatchObject({ name: "demo", custom: true })
+  })
+
+  /*
+   * 这一条是整个功能的目的
+   *
+   * 从前 `#tryPull` 里那句 `entry === undefined` 就把它拦在 git 动作之前，于是自主安装的
+   * 插件在面板上压根没有可用的更新按钮（`inspectUpdate` 恒返回 `willPull: false`）。
+   * 登记成条目之后，走的是与索引插件完全相同的那条路。
+   */
+  it("**自登记的插件更新走的是索引插件那条路** —— 这是本功能的目的所在", async () => {
+    const git = stubGit()
+    const h = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } }, {}, undefined, git.run)
+    await h.market.registerCustom({ url: "https://github.com/demo/demo.git" })
+    await makeGitRepo(h.pluginsDir)
+
+    const result = await h.market.update("demo")
+
+    expect(result).toMatchObject({ via: "pull" })
+    // 与索引插件那批用例逐字相同的一串命令
+    expect(git.cmds()).toEqual(["--version", "rev-parse", "status", "fetch", "reset", "rev-parse"])
+    expect(git.calls.find(item => item.args[0] === "fetch")?.args).toEqual([
+      "fetch",
+      "--depth",
+      "1",
+      "https://github.com/demo/demo.git",
+      "HEAD"
+    ])
+  })
+
+  it("更新前的探测同样答得出「会就地拉取」", async () => {
+    const git = stubGit()
+    const h = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } }, {}, undefined, git.run)
+    await h.market.registerCustom({ url: "https://github.com/demo/demo.git" })
+    await makeGitRepo(h.pluginsDir)
+
+    expect(await h.market.inspectUpdate("demo")).toEqual({ willPull: true, dirty: false })
+  })
+
+  /*
+   * 登记落盘，且重启后仍在
+   *
+   * 落在 `data` 而非 `cache`：缓存是可随时丢弃的，而这一份丢了就要重填一遍表单，
+   * 且丢了之后那个插件的更新按钮又会不亮 —— 那种故障与「几天前清过缓存」之间毫无线索。
+   */
+  it("**登记落盘，新实例读得回来** —— 它不是缓存", async () => {
+    const first = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } })
+    await first.market.registerCustom({ url: "https://github.com/demo/demo.git", build: true })
+
+    const doc = JSON.parse(await readFile(first.customFile, "utf8")) as { plugins: unknown[] }
+    expect(doc.plugins).toHaveLength(1)
+
+    // 同一批目录起第二个实例，模拟重启
+    const second = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } }, {}, first)
+    expect(await second.market.entry("demo")).toMatchObject({
+      name: "demo",
+      custom: true,
+      setup: { scripts: ["build"], dev: true }
+    })
+  })
+
+  it("列得出全部登记", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } })
+    await h.market.registerCustom({ url: "https://github.com/demo/one.git" })
+    await h.market.registerCustom({ url: "https://github.com/demo/two.git" })
+
+    expect((await h.market.customs()).map(item => item.name)).toEqual(["one", "two"])
+  })
+
+  it("同名再登记一次即改掉那一条，不叠成两条", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } })
+    await h.market.registerCustom({ url: "https://github.com/demo/demo.git" })
+    await h.market.registerCustom({ url: "https://github.com/other/demo.git", name: "demo" })
+
+    const customs = await h.market.customs()
+    expect(customs).toHaveLength(1)
+    expect(customs[0]?.install.url).toBe("https://github.com/other/demo.git")
+  })
+
+  /*
+   * 索引里已有同名条目时不许登记
+   *
+   * 两份来源指向同一个目录名，谁生效取决于 `#apply` 的优先级 —— 而使用者看到的是
+   * 「我填的地址没生效」，一句无从查证的话。故当场拒绝，并说明两条出路。
+   */
+  it("**索引里已有同名的一条时拒绝登记**，并说明该怎么办", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: INDEX } })
+
+    await expect(h.market.registerCustom({ url: "https://github.com/other/demo.git" })).rejects.toThrow(
+      /索引里已有/
+    )
+    // 拒绝就该什么都没写下
+    expect(await h.market.customs()).toEqual([])
+  })
+
+  it("换一个目录名即可登记同一个仓库", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: INDEX } })
+
+    await h.market.registerCustom({ url: "https://github.com/other/demo.git", name: "demo-fork" })
+
+    expect(await h.market.entry("demo-fork")).toMatchObject({ custom: true })
+    // 索引那条一字未动：`custom` 单独断言，`toMatchObject` 里写 undefined 要求那个键存在
+    const indexed = await h.market.entry("demo")
+    expect(indexed).toMatchObject({ official: true })
+    expect(indexed?.custom).toBeUndefined()
+  })
+
+  /*
+   * 断网时自登记的那几条仍要在
+   *
+   * `#fetchAll` 有三个出口（缓存新鲜、全部源不可达而沿用缓存、正常取到），三处都经
+   * `#apply`。少一处的表现是「自定义插件平时在、断网时不见了」，而那种缺失极难与
+   * 网络问题区分开。
+   */
+  it("**全部索引源不可达时自登记的仍在** —— 它与网络无关", async () => {
+    const first = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } })
+    await first.market.registerCustom({ url: "https://github.com/demo/demo.git" })
+
+    const second = await makeHarness(
+      { "https://example.com/index.json": { error: "ENOTFOUND" } },
+      { cacheTtl: 0 },
+      first
+    )
+    const snapshot = await second.market.list(true)
+
+    expect(snapshot.plugins.map(item => item.name)).toContain("demo")
+  })
+
+  it("撤掉登记之后 entry() 再也找不到它", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } })
+    await h.market.registerCustom({ url: "https://github.com/demo/demo.git" })
+
+    expect(await h.market.removeCustom("demo")).toBe(true)
+    expect(await h.market.entry("demo")).toBeUndefined()
+    expect(await h.market.customs()).toEqual([])
+  })
+
+  /*
+   * 撤登记不删目录
+   *
+   * 两件事分开，才使得「我想改一下这条的地址」不必先把插件卸载掉。反过来说
+   * `remove()` 之后登记还在 —— 那时它在市场页上显示为「未安装」，点安装即按原地址重装。
+   */
+  it("**撤登记不动插件目录** —— 删目录是卸载的事", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } })
+    await h.market.registerCustom({ url: "https://github.com/demo/demo.git" })
+    const dir = await makeGitRepo(h.pluginsDir)
+
+    await h.market.removeCustom("demo")
+
+    expect(await isDirectory(dir)).toBe(true)
+  })
+
+  it("没有这一条登记时给 false，不报错", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } })
+    expect(await h.market.removeCustom("nothing")).toBe(false)
+  })
+
+  it("撤登记时的名字同样要过校验", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } })
+    await expect(h.market.removeCustom("../evil")).rejects.toThrow()
+  })
+
+  /*
+   * 登记文件按不可信输入对待
+   *
+   * 它就在使用者手边（`data/market-custom.json`），手改坏一处不该让整个市场页打不开。
+   * 与索引缓存同一道理，故同样经 `parseIndex` 校验。
+   */
+  it("**登记文件坏掉时当作没有登记**，不让市场页整个打不开", async () => {
+    const first = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } })
+    await first.market.registerCustom({ url: "https://github.com/demo/demo.git" })
+    await writeFile(first.customFile, "{ 这不是 JSON", "utf8")
+
+    const second = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } }, {}, first)
+
+    expect(await second.market.customs()).toEqual([])
+    expect((await second.market.list()).plugins).toEqual([])
   })
 })
