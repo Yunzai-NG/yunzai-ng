@@ -194,6 +194,11 @@ jobs:
       #
       # 只核对**本次发出**的包：未改动的包留在旧版本，而 0.1.1 及更早是从本机发的，
       # 本来就没有 attestation，拿它们来核对只会得到一条必然失败的断言。
+      #
+      # **重试窗口放到约 3 分钟**：attestation 生成后到公开只读端点有传播延迟，v0.6.0 那次
+      # 30 秒（5×6s）没等到、报了一次假 404，而包其实都带着 provenance。窗口太短会让这道
+      # 「防绿灯骗人」的校验反过来自己骗人——把一次成功的发布判红。仍保留硬失败：真没挂上
+      # 时（如 pnpm 吞掉 --provenance 那种）等再久也是 404。
       - name: 核对 provenance 真的挂上了
         run: |
           if [ ! -s .tarballs/published.txt ]; then
@@ -203,11 +208,11 @@ jobs:
           while read -r p v; do
             url="https://registry.npmjs.org/-/npm/v1/attestations/@yunzai-ng%2F$p@$v"
             code=000
-            # registry 有短暂的传播延迟，重试几次再判定
-            for _ in 1 2 3 4 5; do
+            # registry 有传播延迟，最多等约 3 分钟（12×15s）再判定
+            for _ in $(seq 1 12); do
               code=$(curl -sS -o /dev/null -w '%{http_code}' "$url" || echo 000)
               [ "$code" = "200" ] && break
-              sleep 6
+              sleep 15
             done
             if [ "$code" != "200" ]; then
               echo "::error::@yunzai-ng/$p@$v 没有 attestation（$url → $code）"
