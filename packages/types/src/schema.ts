@@ -24,6 +24,7 @@ export type SchemaWidget =
   | "duration"
   | "uid"
   | "keyValue"
+  | "color"
 
 /** 枚举项 */
 export interface SchemaEnumItem {

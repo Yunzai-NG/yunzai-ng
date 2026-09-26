@@ -242,6 +242,20 @@ export interface BotApi {
   getMessage?(messageId: string): Promise<MessageRecord | undefined>
 
   /**
+   * 把平台侧的文件 id 换成一个可取用的地址（需 `caps` 含 `getFileUrl`）
+   *
+   * 有些平台在文件（乃至图片、语音、视频）消息里只给一个 `file_id`，不给可下载的
+   * 链接 —— 插件要拿到内容（识图、存档、转发到别处）就得先把这个 id 换成真正能取的东西。
+   * 本方法屏蔽这层平台差异：给一个 id，回一个**可下载的 URL 或本机绝对路径**。
+   *
+   * 返回哪一种取决于平台与部署：能给直链就给直链（在任意机器上都可下载），否则给同机可读的
+   * 本地绝对路径。两种都拿不到时 reject —— 不返回空串,空串会被下游当成一个合法但指向空的地址。
+   * @param fileId 平台侧的文件 id（消息段里 `kind: "id"` 的那个 id）
+   * @returns 可下载的 URL，或本机文件的绝对路径
+   */
+  getFileUrl?(fileId: string): Promise<string>
+
+  /**
    * 上传群文件（需 `caps` 含 `groupFile`）
    * @param gid 群 id
    * @param file 本地文件绝对路径

@@ -53,7 +53,8 @@ const OPTIONAL_METHODS = [
   "fetchHistory",
   "getMessage",
   "uploadGroupFile",
-  "setReaction"
+  "setReaction",
+  "getFileUrl"
 ] as const satisfies readonly (keyof BotApi)[]
 
 /** 需要套用 `sendTimeout` 的可选方法 */
