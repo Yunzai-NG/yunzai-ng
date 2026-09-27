@@ -501,11 +501,14 @@ export interface MaintenanceView {
   readonly supervisor: SupervisorKind | undefined
 
   /**
-   * 请求重启是否真能生效
+   * 请求重启是否真能生效，即「宿主有没有注册过重启处理器」
    *
-   * 即「有没有人注册过重启处理器」。裸 `node` 起的实例上为 false —— 此时
-   * {@link requestRestart} 只会记一条日志而不停机，插件应据此告知使用者，
-   * 而不是把机器人关掉再也起不来。
+   * **它不说明有没有外部守护。** `yzng start` 一律注册处理器，故它起的实例上恒为真，
+   * 裸启动也一样 —— 那种实例停机后没人拉起。为假只出现在内核被嵌进别的程序、或单元
+   * 测试里，此时 {@link requestRestart} 只记一条日志而不停机。
+   *
+   * 判断「停机后会不会被拉起来」只能参考 {@link supervisor}，而它探测不到亦不等于没有
+   * 守护（Windows 服务不留痕迹），故适合用来问一句，不适合用来拦。
    */
   readonly canRestart: boolean
 

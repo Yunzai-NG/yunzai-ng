@@ -240,21 +240,21 @@ describe("reloadPlugin", () => {
 })
 
 describe("requestRestart", () => {
-  it("**没有守护时不停机**，只留一条日志", async () => {
+  it("**宿主没接管时不停机**，只留一条日志", async () => {
     vi.useFakeTimers()
     try {
       const { view, stopped, warns } = make({ restartHandler: () => undefined })
       await view.requestRestart({ reason: "更新了内核" })
-      // 即便把时间推到底也不该有停机：这一条是「机器人关掉再也起不来」的唯一防线
+      // 即便把时间推到底也不该有停机：停机之后没人负责退出与拉起，进程会卡在已停机状态
       await vi.advanceTimersByTimeAsync(10_000)
       expect(stopped).toEqual([])
-      expect(warns.some(m => m.includes("没有外部守护"))).toBe(true)
+      expect(warns.some(m => m.includes("宿主没有接管重启"))).toBe(true)
     } finally {
       vi.useRealTimers()
     }
   })
 
-  it("没有守护时也**不抛错** —— 插件不该把一句技术错误抄给使用者", async () => {
+  it("宿主没接管时也**不抛错** —— 插件不该把一句技术错误抄给使用者", async () => {
     const { view } = make({ restartHandler: () => undefined })
     await expect(view.requestRestart()).resolves.toBeUndefined()
   })
