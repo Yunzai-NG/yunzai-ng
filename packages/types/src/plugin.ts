@@ -421,10 +421,140 @@ export interface PluginsView {
 }
 
 /**
- * 应用只读视图
+ * 撞上本地改动时怎么办
  *
- * 插件通过 `ctx.app` 观察全局，但不能通过它改全局——想改就得走各自的
- * 具名 API（`ctx.config.patch` 等），便于审计。
+ * 与内核市场的同名取值一一对应。缺省 `abort`：不给出处置方式时不该有任何磁盘动作。
+ */
+export type PluginDirtyAction = "abort" | "stash" | "discard"
+
+/** 一次更新探测的结果 */
+export interface PluginUpdateProbe {
+  /** 这次更新会不会走就地拉取；为假即整目录重装那条路 */
+  readonly willPull: boolean
+  /** 目录里有没有未提交的改动（含未跟踪文件）。`willPull` 为假时恒为假 */
+  readonly dirty: boolean
+}
+
+/**
+ * 一次插件更新的结果
+ *
+ * 刻意比内核市场的 `InstallResult` 窄：那里还带着安装目录、取源方式一类只有面板用得上的
+ * 字段，而维护面要的是「更新到了哪一版、有没有真的变、本地改动去哪了」。
+ */
+export interface PluginUpdateOutcome {
+  /** 插件名（安装目录名） */
+  readonly name: string
+  /** 更新后的版本 */
+  readonly version: string
+  /** 更新前的版本，仅就地拉取时存在 */
+  readonly fromVersion?: string
+  /** 是否确实有新提交；`false` 表示已是最新 */
+  readonly changed?: boolean
+  /** 本次是否暂存过本地改动；可 `git stash pop` 取回 */
+  readonly stashed?: boolean
+  /**
+   * 本次是否按调用方的选择丢弃了本地改动
+   *
+   * 与 {@link stashed} 互斥，且必须分开报：这一路没有任何可取回的东西，
+   * 而对一个刚把改动丢掉的人说「可以 stash pop 取回」会让他以为改动还在。
+   */
+  readonly discarded?: boolean
+}
+
+/** 更新一个插件的选项 */
+export interface PluginUpdateOptions {
+  /** 是否装依赖，缺省装 */
+  readonly dependencies?: boolean
+  /** 撞上本地改动时怎么办，缺省 `abort` */
+  readonly onDirty?: PluginDirtyAction
+}
+
+/** 请求重启时的说明 */
+export interface RestartRequest {
+  /** 为什么要重启，会写进停机日志 —— 事后翻日志时「谁让它重启的」是第一个问题 */
+  readonly reason?: string
+}
+
+/**
+ * 外部进程守护
+ *
+ * `undefined` **不证明没有守护**：Windows 服务（nssm）一类不留可识别的环境痕迹。
+ * 故它只用于「能确认有守护时给使用者一句准话」，不可用于拒绝重启 ——
+ * 那会让一批装了守护的人用不了这个功能。
+ */
+export type SupervisorKind = "pm2" | "systemd"
+
+/**
+ * 维护面：更新插件与请求重启
+ *
+ * 与 `AppView` 其余部分的只读性质不同，**这里是能改变实例状态的具名 API**，
+ * 独立成面正是为了让「插件动了什么」在类型上一眼看得出（见 `AppView` 的说明）。
+ *
+ * **刻意不开放安装与删除。** 市场能装任意 git 仓库，等于在这台机器上执行任意代码；
+ * 而「更新已装插件」是就地 `fetch` + `reset`，目标仓库早被使用者信任过一次。
+ * 两者的信任边界不同，故只开后者。
+ */
+export interface MaintenanceView {
+  /**
+   * 探测到的外部进程守护；探测不到时 undefined（见 {@link SupervisorKind}）
+   */
+  readonly supervisor: SupervisorKind | undefined
+
+  /**
+   * 请求重启是否真能生效
+   *
+   * 即「有没有人注册过重启处理器」。裸 `node` 起的实例上为 false —— 此时
+   * {@link requestRestart} 只会记一条日志而不停机，插件应据此告知使用者，
+   * 而不是把机器人关掉再也起不来。
+   */
+  readonly canRestart: boolean
+
+  /**
+   * 探测一次插件更新
+   * @param name 插件名（安装目录名）
+   * @returns 会不会走就地拉取、目录里有没有改动
+   * @throws 名称不合法时
+   */
+  inspectUpdate(name: string): Promise<PluginUpdateProbe>
+
+  /**
+   * 更新一个已装插件（含装依赖与装后步骤）
+   * @param name 插件名（安装目录名）
+   * @param opts 选项
+   * @returns 更新结果
+   * @throws 名称不合法、目录不存在、有改动而未给出处置方式，或取源失败时
+   */
+  updatePlugin(name: string, opts?: PluginUpdateOptions): Promise<PluginUpdateOutcome>
+
+  /**
+   * 重载一个插件，使更新后的代码立即生效
+   *
+   * 多数插件更新后无须重启整个进程，重载即可。内核自身的更新不在此列。
+   * @param name 插件名
+   * @returns 是否重载成功
+   */
+  reloadPlugin(name: string): Promise<boolean>
+
+  /**
+   * 请求重启整个进程
+   *
+   * 内核**没有**自我重启的能力（`stop()` 是终态），本方法做的是「优雅停机后以一个
+   * 约定的退出码退出」，再由外部守护（pm2 / systemd / Windows 服务）把它拉起来。
+   * 因此 {@link canRestart} 为假时它只记一条日志、什么都不做。
+   *
+   * 调用后当前进程即进入停机流程，故**要先把话说完**：命令处理函数里应先
+   * `await e.reply(...)` 再调它，否则那句「正在重启」还在发送队列里就被停机带走了。
+   * @param req 说明
+   * @returns 已开始停机时兑现；无人接管时立即兑现
+   */
+  requestRestart(req?: RestartRequest): Promise<void>
+}
+
+/**
+ * 应用视图
+ *
+ * 插件通过 `ctx.app` 观察全局。除 {@link MaintenanceView} 之外一律只读 ——
+ * 想改就得走具名 API（`ctx.config.patch`、`app.maintenance.*` 等），便于审计。
  */
 export interface AppView {
   /** 内核版本 */
@@ -447,6 +577,12 @@ export interface AppView {
   readonly policy: PolicyView
   /** HTTP 服务器信息 */
   readonly server: ServerInfo
+  /**
+   * 维护面：更新插件与请求重启
+   *
+   * `AppView` 其余部分一律只读，这一面是唯一能改变实例状态的 —— 独立成面即为此。
+   */
+  readonly maintenance: MaintenanceView
 
   /**
    * 采样当前资源占用

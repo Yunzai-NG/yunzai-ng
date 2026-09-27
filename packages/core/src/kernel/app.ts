@@ -62,6 +62,7 @@ import { openKv, type KvStore } from "../store/index.js"
 import { withTimeout } from "../util/defer.js"
 import { parseDuration } from "../util/duration.js"
 import { createKvDriverSink } from "./kv-sink.js"
+import { createMaintenanceView } from "./maintenance.js"
 import { createPolicy, type KernelPolicy } from "./policy.js"
 import { installRuntime, type RuntimeParts } from "./runtime.js"
 import { createSqlSink, type ManagedSqlSink } from "./sql-sink.js"
@@ -226,6 +227,8 @@ interface AppParts {
   stopTimeout: number
   /** 共享服务器；`server.enable` 为 false 时是 undefined，见文件头第 3 条 */
   server: ManagedServer | undefined
+  /** 插件市场，维护面要用它更新插件 */
+  market: PluginMarket
 }
 
 /**
@@ -289,6 +292,15 @@ export class App {
   #status: AppStatus = "created"
   /** 启动时间戳；未启动时为创建时间 */
   #startedAt = Date.now()
+  /**
+   * 重启处理器；无人接管时 undefined
+   *
+   * 与 `handleSignals()` 同一条判断：内核不该私自决定进程什么时候退出，故「停机之后
+   * 做什么」由宿主注册（`yzng start` 注册成带约定退出码的 `process.exit`）。
+   * 没有它时 `maintenance.requestRestart()` 只出声不停机 —— 停掉一个没有守护的实例
+   * 等于把机器人关掉再也起不来。
+   */
+  #onRestart: (() => void | Promise<void>) | undefined
 
   /**
    * 内部构造函数，请用 `createApp()`
@@ -346,6 +358,19 @@ export class App {
         // 单一来源：服务器信息只存在于接缝里，避免"改了监听端口但视图还是旧的"
         return self.hooks.server.info
       },
+      /*
+       * 维护面：`AppView` 上唯一能改变实例状态的一面
+       *
+       * 取普通字段而非 getter：它自身不随子系统替换而变（内部各方法都是现读），
+       * 而 `canRestart` 那一项的「现读」由维护面自己经 `restartHandler` 完成。
+       */
+      maintenance: createMaintenanceView({
+        market: parts.market,
+        reload: name => parts.host.reload(name),
+        logger: parts.loggerHub.root.child({ scope: "maintenance" }),
+        stop: () => self.stop(),
+        restartHandler: () => self.#onRestart
+      }),
       usage: (): ResourceUsage => sampleUsage()
     }
   }
@@ -548,6 +573,26 @@ export class App {
    */
   own(dispose: Disposer): void {
     this.#disposers.push(dispose)
+  }
+
+  /**
+   * 接管「停机之后做什么」，使 `ctx.app.maintenance.requestRestart()` 真能生效
+   *
+   * 与 `handleSignals()` 同一条判断：**内核不该私自决定进程什么时候退出**，故这一步是
+   * 显式的 —— `yzng start` 调它（退出后由 pm2 / systemd 一类的守护拉起），单元测试与
+   * 嵌进别人程序里的内核不调。没有它时 `requestRestart()` 只记一条日志、不停机，
+   * 因为停掉一个没有守护的实例等于把机器人关掉再也起不来。
+   *
+   * 处理器在停机**之后**调用，故它该做的就是退出进程本身。
+   * @param handler 停机后执行的动作
+   * @returns 撤回接管
+   */
+  onRestartRequest(handler: () => void | Promise<void>): Disposer {
+    this.#onRestart = handler
+    return () => {
+      // 只撤自己那一个：后来者换掉处理器之后，先前那个句柄不该把它一起摘了
+      if (this.#onRestart === handler) this.#onRestart = undefined
+    }
   }
 
   /**
@@ -757,6 +802,7 @@ export async function createApp(opts: CreateAppOptions = {}): Promise<App> {
     runtime,
     disposers,
     server,
+    market,
     stopTimeout: opts.stopTimeout ?? DEFAULT_STOP_TIMEOUT
   })
   selfRef.app = app

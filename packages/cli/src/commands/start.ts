@@ -18,6 +18,18 @@ import { bold, cyan, dim, green, print, printErr, printRows, red, yellow } from 
 /** 兜底定时器的间隔：取值足够大以避免产生可测量的开销，同时不超出 32 位范围 */
 const KEEPALIVE_MS = 0x7fffffff
 
+/**
+ * 因重启请求而退出时的退出码
+ *
+ * **刻意非零。** pm2 与 `Restart=always` 的 systemd 单元对任何退出码都会拉起，但
+ * `Restart=on-failure`（systemd 单元里很常见的一种写法）只在非零时拉起 —— 用 0 退出
+ * 会让那批实例「关掉之后再也不起来」，而那正是本功能最不该有的失败方式。
+ *
+ * 取 75：sysexits.h 里的 `EX_TEMPFAIL`（暂时性失败，可重试），语义最接近「我这就下去，
+ * 请把我拉起来」。它与 Node 自身的退出码不冲突（Node 用 1~12 与 128+n）。
+ */
+const RESTART_EXIT_CODE = 75
+
 /** 启动参数 */
 export interface StartOptions {
   /** 应用主目录 */
@@ -99,6 +111,22 @@ export async function runStart(opts: StartOptions = {}): Promise<number> {
   // 信号接管须在 start() 之前装配：插件加载可能耗时数秒，其间按下 Ctrl+C
   // 亦应能够优雅停机，而不是残留一个半初始化状态的数据目录
   app.handleSignals()
+
+  /*
+   * 接管重启请求：停机之后退出，由外部守护拉起
+   *
+   * 内核只做到「优雅停机」为止（`stop()` 是终态），**退出这一步归宿主** —— 与
+   * `handleSignals()` 同一条判断：嵌进别人程序里的内核不该私自决定进程什么时候退出。
+   * 注册在这里，于是 `yzng start` 起的实例上 `canRestart` 为真，而单元测试与嵌入
+   * 场景不注册、插件据此得知「这台实例重启不了」。
+   *
+   * 日志先落盘再退出：那句「正在重启」是事后排查「谁让它重启的」的唯一线索，而
+   * `process.exit` 不等待挂起的写入。
+   */
+  app.onRestartRequest(() => {
+    app.loggerHub.flush()
+    process.exit(RESTART_EXIT_CODE)
+  })
 
   // 链接结果延至此处报告：createApp 之前尚无 logger，而该事项的重要程度不足以直接写入终端
   if (link.linked.length > 0) app.logger.debug(`已将框架包链接至主目录：${link.linked.join("、")}`)
