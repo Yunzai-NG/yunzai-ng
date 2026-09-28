@@ -25,6 +25,7 @@ import {
   assertPluginName,
   compareVersion,
   customEntry,
+  parseCommitLog,
   parseIndex,
   repoNameOf,
   tarballFromGit,
@@ -98,6 +99,8 @@ interface StubGitOptions {
   heads?: readonly string[]
   /** `status --porcelain` 的输出，非空即视为工作区有改动 */
   status?: string
+  /** `log` 的输出 */
+  log?: string
   /** 令某个子命令失败 */
   fail?: { cmd: string; message: string }
   /** 某条命令执行后的副作用，用于模拟 reset 改写了工作区 */
@@ -132,6 +135,7 @@ function stubGit(options: StubGitOptions = {}): StubGit {
     await options.effect?.(args)
     if (cmd === "rev-parse") return `${heads.length > 1 ? heads.shift() : heads[0]}\n`
     if (cmd === "status") return options.status ?? ""
+    if (cmd === "log") return options.log ?? ""
     if (cmd === "--version") return "git version 2.44.0\n"
     if (cmd === "stash" || cmd === "fetch" || cmd === "reset" || cmd === "clone" || cmd === "clean") return ""
     throw new Error(`替身未编程该命令：git ${args.join(" ")}`)
@@ -295,6 +299,19 @@ describe("compareVersion", () => {
 
   it("忽略预发布标识", () => {
     expect(compareVersion("1.0.0-beta.1", "1.0.0")).toBe(0)
+  })
+})
+
+describe("parseCommitLog", () => {
+  it("逐行切出 提交号 / 秒级时间 / 标题，时间换成毫秒", () => {
+    expect(parseCommitLog("abc1234\t1759000000\tfeat: 加命令\r\n")).toEqual([
+      { hash: "abc1234", time: 1759000000_000, subject: "feat: 加命令" }
+    ])
+  })
+
+  it("标题里的制表符原样保留，空行与坏行跳过", () => {
+    const out = parseCommitLog("\nabc1234\t1\ta\tb\nbroken-line\n")
+    expect(out).toEqual([{ hash: "abc1234", time: 1000, subject: "a\tb" }])
   })
 })
 
@@ -681,8 +698,8 @@ describe("PluginMarket 就地拉取", () => {
       fromVersion: "1.0.0",
       changed: true
     })
-    // 整条序列逐字钉住：多一条、少一条、次序错一处都算失败
-    expect(git.cmds()).toEqual(["--version", "rev-parse", "status", "fetch", "reset", "rev-parse"])
+    // 整条序列逐字钉住：多一条、少一条、次序错一处都算失败。末两条是为报更新日志补拉历史再取 log
+    expect(git.cmds()).toEqual(["--version", "rev-parse", "status", "fetch", "reset", "rev-parse", "fetch", "log"])
     // 那份依赖是这一批的全部意义所在
     expect(await isDirectory(join(dir, "node_modules", "lodash"))).toBe(true)
     expect(h.logger.lines.some(line => line.includes("已就地更新至 1.1.0"))).toBe(true)
@@ -750,6 +767,56 @@ describe("PluginMarket 就地拉取", () => {
     expect(result).toMatchObject({ via: "pull", changed: false, version: "1.0.0" })
     expect(h.logger.lines.some(line => line.includes("已是最新版本"))).toBe(true)
     expect(h.logger.lines.some(line => line.includes("已就地更新"))).toBe(false)
+    // 没有新提交就不补拉、不取日志
+    expect(git.cmds()).not.toContain("log")
+    expect("commits" in result).toBe(false)
+  })
+
+  it("有新提交时带上更新日志：区间取自更新前的提交号，新的在前", async () => {
+    const git = stubGit({ log: "2222222\t1759000000\t修一个 bug\n1a2b3c4\t1758990000\t加一条命令\n" })
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, git.run)
+    await makeGitRepo(h.pluginsDir)
+
+    const result = await h.market.update("demo")
+
+    expect(result.commits).toEqual([
+      { hash: "2222222", time: 1759000000_000, subject: "修一个 bug" },
+      { hash: "1a2b3c4", time: 1758990000_000, subject: "加一条命令" }
+    ])
+    const fetches = git.calls.filter(item => item.args[0] === "fetch")
+    // 第二次 fetch 是补拉历史：--depth 1 的父链不在本地，区间 log 算不出来
+    expect(fetches[1]?.args.slice(0, 3)).toEqual(["fetch", "--depth", "30"])
+    expect(git.calls.find(item => item.args[0] === "log")?.args.at(-1)).toBe("1111111aaa..HEAD")
+  })
+
+  it("区间取不到时退回只报最新一条，补拉失败也不挡更新", async () => {
+    const base = stubGit()
+    let fetches = 0
+    const run: GitRunner = async (args, cwd, timeout) => {
+      if (args[0] === "fetch" && ++fetches === 2) throw new Error("补拉超时")
+      if (args[0] === "log") {
+        if (args.at(-1)?.includes("..") === true) throw new Error("bad revision")
+        return "2222222\t1759000000\t最新一条\n"
+      }
+      return base.run(args, cwd, timeout)
+    }
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, run)
+    await makeGitRepo(h.pluginsDir)
+
+    const result = await h.market.update("demo")
+
+    expect(result).toMatchObject({ changed: true, commits: [{ hash: "2222222", subject: "最新一条" }] })
+  })
+
+  it("日志全取不到时照常更新，只是不带 commits", async () => {
+    const git = stubGit({ fail: { cmd: "log", message: "坏了" } })
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, git.run)
+    await makeGitRepo(h.pluginsDir)
+
+    const result = await h.market.update("demo")
+
+    expect(result.changed).toBe(true)
+    expect("commits" in result).toBe(false)
   })
 
   /*
@@ -1483,7 +1550,7 @@ describe("PluginMarket 自定义登记", () => {
 
     expect(result).toMatchObject({ via: "pull" })
     // 与索引插件那批用例逐字相同的一串命令
-    expect(git.cmds()).toEqual(["--version", "rev-parse", "status", "fetch", "reset", "rev-parse"])
+    expect(git.cmds()).toEqual(["--version", "rev-parse", "status", "fetch", "reset", "rev-parse", "fetch", "log"])
     expect(git.calls.find(item => item.args[0] === "fetch")?.args).toEqual([
       "fetch",
       "--depth",

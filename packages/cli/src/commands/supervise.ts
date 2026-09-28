@@ -77,6 +77,8 @@ export function runSupervisor(): Promise<number> {
   let childReady = false
   /** 时间窗内的崩溃时刻 */
   const crashes: number[] = []
+  /** 退避等待中的重拉定时器；此时没有活着的子进程 */
+  let respawnTimer: NodeJS.Timeout | undefined
 
   /** fork 一个子进程跑内核 */
   const spawn = (): void => {
@@ -140,7 +142,11 @@ export function runSupervisor(): Promise<number> {
 
     const backoff = Math.min(1000 * 2 ** (crashes.length - 1), BACKOFF_CAP_MS)
     printErr(yellow(`  实例意外退出（${how}），${Math.round(backoff / 1000)} 秒后拉起（第 ${crashes.length} 次）`))
-    setTimeout(spawn, backoff).unref?.()
+    // 不能 unref：子进程已退出，这个定时器是父进程唯一的 handle，unref 了进程当场排空
+    respawnTimer = setTimeout(() => {
+      respawnTimer = undefined
+      spawn()
+    }, backoff)
   }
 
   /**
@@ -158,6 +164,11 @@ export function runSupervisor(): Promise<number> {
       process.exit(1)
     }
     leaving = true
+    // 退避等待中没有子进程可等，也就不会有 onExit 来收尾：撤掉重拉，当场退出
+    if (respawnTimer !== undefined) {
+      clearTimeout(respawnTimer)
+      process.exit(0)
+    }
     if (child !== undefined && process.platform !== "win32") {
       try {
         child.kill(signal)

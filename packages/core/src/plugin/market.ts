@@ -13,7 +13,7 @@
 import { execFile } from "node:child_process"
 import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
-import type { HttpClient, Logger } from "@yunzai-ng/types"
+import type { HttpClient, Logger, PluginCommit } from "@yunzai-ng/types"
 import { isDirectory, isFile } from "../util/fs.js"
 import {
   INSTALL_TIMEOUT_MS,
@@ -41,6 +41,9 @@ const TRANSFER_TIMEOUT_MS = 5 * 60 * 1000
 
 /** 只读本地仓库的 git 命令超时毫秒；不含网络往返，故与传输超时分开取值 */
 const GIT_LOCAL_TIMEOUT_MS = 10_000
+
+/** 一次更新最多报多少条新提交；也是为取日志补拉历史的深度 */
+const COMMIT_LOG_LIMIT = 30
 
 /**
  * 自定义条目的 `source` 取值
@@ -236,6 +239,8 @@ export interface InstallResult extends SetupOutcome {
   readonly fromVersion?: string
   /** 就地拉取时是否确实有新提交，`false` 表示已是最新 */
   readonly changed?: boolean
+  /** 就地拉取带来的新提交，新的在前；取不到历史时可能只有最新一条或缺省 */
+  readonly commits?: readonly PluginCommit[]
   /**
    * 此后的更新会走哪条路
    *
@@ -635,6 +640,22 @@ const runGit: GitRunner = (args, cwd, timeout) => {
       }
     )
   })
+}
+
+/**
+ * 解析 `git log --format=%h%x09%ct%x09%s` 的输出
+ * @param stdout 标准输出，每行「短号\t秒级时间\t首行说明」
+ * @returns 提交列表，顺序同输出；格式不对的行跳过
+ */
+export function parseCommitLog(stdout: string): PluginCommit[] {
+  const commits: PluginCommit[] = []
+  for (const line of stdout.split(/\r?\n/)) {
+    const [hash, time, ...rest] = line.split("\t")
+    const seconds = Number(time)
+    if (hash === undefined || hash === "" || !Number.isFinite(seconds)) continue
+    commits.push({ hash, time: seconds * 1000, subject: rest.join("\t").trim() })
+  }
+  return commits
 }
 
 /** 磁盘缓存的文档结构 */
@@ -1252,6 +1273,8 @@ export class PluginMarket {
     if (changed) this.#deps.logger.info(`插件 ${name} 已就地更新至 ${version}（${wasAt.slice(0, 7)} → ${nowAt.slice(0, 7)}）`)
     else this.#deps.logger.info(`插件 ${name} 已是最新版本 ${version}`)
 
+    const commits = changed ? await this.#newCommits(name, dir, url, ref, wasAt) : undefined
+
     // 没有新提交时跳过收尾，重跑 `build` 只是白等；缺依赖是例外，与有没有新提交无关
     const missing =
       Object.keys(manifest?.dependencies ?? {}).length > 0 && !(await isDirectory(join(dir, "node_modules")))
@@ -1263,6 +1286,7 @@ export class PluginMarket {
       via: "pull",
       version,
       changed,
+      ...(commits === undefined || commits.length === 0 ? {} : { commits }),
       // 就地拉取过一次，说明目录确实是 git 仓库，此后照旧走这条路
       updatable: "pull",
       // 判据取 onDirty 而非 dirty：discard 那一路同样 dirty，却没有 stash 可 pop
@@ -1270,6 +1294,38 @@ export class PluginMarket {
       ...(dirty && onDirty === "discard" ? { discarded: true } : {}),
       ...(before === undefined ? {} : { fromVersion: before }),
       ...done
+    }
+  }
+
+  /**
+   * 取就地拉取带来的新提交
+   *
+   * 拉取用的是 `--depth 1`，新提交的父链不在本地，直接 `log` 只得到最新一条，故先按上限补拉一次历史。
+   * 两步都只为「报更新日志」，失败一律不挡更新：补拉失败退回只报最新一条，`log` 也失败就不报。
+   * @param name 插件名，用于日志
+   * @param dir 插件目录
+   * @param url 拉取地址
+   * @param ref 拉取的分支或 `HEAD`
+   * @param wasAt 更新前的提交号
+   * @returns 新的在前
+   */
+  async #newCommits(name: string, dir: string, url: string, ref: string, wasAt: string): Promise<PluginCommit[]> {
+    try {
+      await this.#git(["fetch", "--depth", String(COMMIT_LOG_LIMIT), url, ref], dir, TRANSFER_TIMEOUT_MS)
+    } catch (err) {
+      this.#deps.logger.debug(`插件 ${name} 补拉提交历史失败，更新日志只报最新一条`, err)
+    }
+    const log = (range: string): Promise<string> =>
+      this.#git(["log", "--format=%h%x09%ct%x09%s", "-n", String(COMMIT_LOG_LIMIT), range], dir, GIT_LOCAL_TIMEOUT_MS)
+    try {
+      return parseCommitLog(await log(`${wasAt}..HEAD`))
+    } catch {
+      // 旧提交已不在本地（远端改写过历史）时区间无从算起，只报最新一条
+      try {
+        return parseCommitLog(await log("-1"))
+      } catch {
+        return []
+      }
     }
   }
 

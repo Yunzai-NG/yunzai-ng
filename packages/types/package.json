@@ -1,6 +1,6 @@
 {
   "name": "@yunzai-ng/types",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Yunzai NG 公共类型契约（纯类型，零运行时依赖）",
   "type": "module",
   "license": "AGPL-3.0-or-later",

@@ -435,6 +435,16 @@ export interface PluginUpdateProbe {
   readonly dirty: boolean
 }
 
+/** 一次更新带来的一条提交 */
+export interface PluginCommit {
+  /** 短提交号 */
+  readonly hash: string
+  /** 提交时间（毫秒时间戳） */
+  readonly time: number
+  /** 提交说明的首行 */
+  readonly subject: string
+}
+
 /**
  * 一次插件更新的结果
  *
@@ -450,6 +460,12 @@ export interface PluginUpdateOutcome {
   readonly fromVersion?: string
   /** 是否确实有新提交；`false` 表示已是最新 */
   readonly changed?: boolean
+  /** 这次拉来的新提交，新的在前；仅就地拉取且取得到历史时存在 */
+  readonly commits?: readonly PluginCommit[]
+  /** 装依赖失败的原因；此时新代码多半跑不起来，不该重载 */
+  readonly dependencyError?: string
+  /** 装后步骤（如 build）失败的原因，带上失败的 script；此时产物仍是旧的，不该重载 */
+  readonly setupError?: string
   /** 本次是否暂存过本地改动；可 `git stash pop` 取回 */
   readonly stashed?: boolean
   /**

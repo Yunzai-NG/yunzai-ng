@@ -201,6 +201,9 @@ export function createMaintenanceView(deps: MaintenanceDeps): MaintenanceView {
         version: result.version,
         ...(result.fromVersion === undefined ? {} : { fromVersion: result.fromVersion }),
         ...(result.changed === undefined ? {} : { changed: result.changed }),
+        ...(result.commits === undefined ? {} : { commits: result.commits }),
+        ...(result.dependencyError === undefined ? {} : { dependencyError: result.dependencyError }),
+        ...(result.setupError === undefined ? {} : { setupError: result.setupError }),
         ...(result.stashed === undefined ? {} : { stashed: result.stashed }),
         ...(result.discarded === undefined ? {} : { discarded: result.discarded })
       }

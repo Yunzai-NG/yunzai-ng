@@ -229,6 +229,28 @@ describe("updatePlugin", () => {
     })
   })
 
+  it("新提交与装依赖 / 编译的失败原因透给插件 —— 据此决定报什么日志、要不要重载", async () => {
+    const commits = [{ hash: "abc1234", time: 1000, subject: "fix: 修一处" }]
+    const { market } = fakeMarket({
+      name: "a",
+      version: "1.1.0",
+      dir: "/p/a",
+      via: "pull",
+      updatable: "pull",
+      changed: true,
+      commits,
+      needsDependencies: false,
+      setupError: "build：tsc 报错"
+    })
+    expect(await make({ market }).view.updatePlugin("a")).toEqual({
+      name: "a",
+      version: "1.1.0",
+      changed: true,
+      commits,
+      setupError: "build：tsc 报错"
+    })
+  })
+
   it("没发生的事不出现在结果里，而不是给一个 undefined 字段", async () => {
     const { market } = fakeMarket({ name: "a", version: "1.0.0", dir: "/p/a", via: "archive", updatable: "reinstall" })
     const out = await make({ market }).view.updatePlugin("a")
