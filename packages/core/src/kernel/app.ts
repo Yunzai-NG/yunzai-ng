@@ -301,6 +301,13 @@ export class App {
    * 等于把机器人关掉再也起不来。
    */
   #onRestart: (() => void | Promise<void>) | undefined
+  /**
+   * 关机处理器；无人接管时 undefined
+   *
+   * 与 `#onRestart` 完全对称，区别只在宿主给的退出码：那一个要让守护把进程拉起来，
+   * 这一个要让守护认作「别重启」。内核不关心具体取值。
+   */
+  #onShutdown: (() => void | Promise<void>) | undefined
 
   /**
    * 内部构造函数，请用 `createApp()`
@@ -369,7 +376,8 @@ export class App {
         reload: name => parts.host.reload(name),
         logger: parts.loggerHub.root.child({ scope: "maintenance" }),
         stop: () => self.stop(),
-        restartHandler: () => self.#onRestart
+        restartHandler: () => self.#onRestart,
+        shutdownHandler: () => self.#onShutdown
       }),
       usage: (): ResourceUsage => sampleUsage()
     }
@@ -592,6 +600,21 @@ export class App {
     return () => {
       // 只撤自己那一个：后来者换掉处理器之后，先前那个句柄不该把它一起摘了
       if (this.#onRestart === handler) this.#onRestart = undefined
+    }
+  }
+
+  /**
+   * 接管「关机之后做什么」，使 `ctx.app.maintenance.requestShutdown()` 真能生效
+   *
+   * 与 `onRestartRequest()` 对称，区别只在处理器该给的退出码：重启要让守护把进程拉起来，
+   * 关机要让守护认作「别重启」（`yzng start` 取 0）。内核不关心具体取值。
+   * @param handler 停机后执行的动作
+   * @returns 撤回接管
+   */
+  onShutdownRequest(handler: () => void | Promise<void>): Disposer {
+    this.#onShutdown = handler
+    return () => {
+      if (this.#onShutdown === handler) this.#onShutdown = undefined
     }
   }
 

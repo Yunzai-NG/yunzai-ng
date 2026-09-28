@@ -8,17 +8,17 @@
  *
  *          未知命令返回 1 并输出帮助，而非静默无响应：命令名拼写错误是最常见的
  *          使用者错误，此时"无任何反馈"是最差的处理方式。
+ *
+ *          **命令实现一律动态 import。** 守护父进程只会命中 start 分支且走 supervise.js
+ *          （不认识 core），若在顶部静态 import 任何一个 import 了 core 的命令，父进程就会
+ *          连带把整个内核加载进来 —— 那正是自带守护要省掉的一份常驻内存。
  */
 import { createRequire } from "node:module"
 import type { LogLevel } from "@yunzai-ng/types"
 import { flagBoolean, flagString, parseArgs, type ParsedArgs } from "./args.js"
 import { printHelp } from "./help.js"
 import { cyan, dim, print, printErr, red } from "./terminal.js"
-import { runStart } from "./commands/start.js"
-import { runInit } from "./commands/init.js"
-import { runDoctor } from "./commands/doctor.js"
-import { runPluginNew } from "./commands/plugin.js"
-import { runUpdateCommand } from "./commands/update.js"
+import type { StartOptions } from "./commands/start.js"
 
 /**
  * 读取自身版本号
@@ -53,6 +53,22 @@ function pluginDirs(args: ParsedArgs): string[] | undefined {
 }
 
 /**
+ * 派发 `start` / `dev`：该由本进程担任守护还是直接跑内核
+ *
+ * 两条路都**动态 import**：担任守护时只加载 supervise.js（它不认识 core），父进程因此不会
+ * 背上一份内核；反过来单进程或子进程才加载 start.js 把 core 拉进来。故这里不能在文件顶部
+ * 静态 import 二者中的任何一个。
+ * @param opts 启动参数
+ * @returns 退出码
+ */
+async function dispatchStart(opts: StartOptions): Promise<number> {
+  const { shouldSupervise, runSupervisor } = await import("./commands/supervise.js")
+  if (shouldSupervise(opts)) return runSupervisor()
+  const { runStart } = await import("./commands/start.js")
+  return runStart(opts)
+}
+
+/**
  * 执行一次命令
  * @param argv `process.argv.slice(2)`
  * @returns 退出码
@@ -75,31 +91,38 @@ export async function run(argv: readonly string[]): Promise<number> {
   const debug = flagBoolean(args, "debug")
 
   switch (args.command) {
-    case "init":
-      return runInit({ home })
+    case "init": {
+      const { runInit } = await import("./commands/init.js")
+      // 三态：--webui / --no-webui 显式给出，未给时传 undefined 交由 init 决定（询问或跳过）
+      const webui = args.flags["webui"] === undefined ? undefined : flagBoolean(args, "webui")
+      return runInit({ home, webui })
+    }
 
     case "start":
-      return runStart({
+      return dispatchStart({
         home,
         extraDirs: pluginDirs(args),
         logLevel: debug ? ("debug" as LogLevel) : undefined,
-        console: flagBoolean(args, "console", true)
+        console: flagBoolean(args, "console", true),
+        supervise: flagBoolean(args, "supervise", true)
       })
 
     case "dev":
       // dev 与 start 的唯一区别在于缺省日志级别。刻意不提供文件监听自动重载：
       // Node 的 ESM 模块缓存无法真正清除（见 plugin/host.ts 第 4 条注意事项），
       // 提供名义上的热重载会使"修改未生效"成为常态性困惑
-      return runStart({
+      return dispatchStart({
         home,
         extraDirs: pluginDirs(args),
         logLevel: "debug" as LogLevel,
-        console: flagBoolean(args, "console", true)
+        console: flagBoolean(args, "console", true),
+        supervise: flagBoolean(args, "supervise", true)
       })
 
     case "doctor": {
       const port = flagString(args, "port")
       const parsed = port === undefined ? undefined : Number.parseInt(port, 10)
+      const { runDoctor } = await import("./commands/doctor.js")
       return runDoctor({
         home,
         host: flagString(args, "host"),
@@ -107,11 +130,13 @@ export async function run(argv: readonly string[]): Promise<number> {
       })
     }
 
-    case "update":
+    case "update": {
+      const { runUpdateCommand } = await import("./commands/update.js")
       return runUpdateCommand({
         to: flagString(args, "to"),
         prune: flagBoolean(args, "prune", true)
       })
+    }
 
     case "plugin": {
       const sub = args.positional[0] ?? ""
@@ -120,6 +145,7 @@ export async function run(argv: readonly string[]): Promise<number> {
         printErr(red("用法：yzng plugin new <名称>"))
         return 1
       }
+      const { runPluginNew } = await import("./commands/plugin.js")
       return runPluginNew({ name, home })
     }
 

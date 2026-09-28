@@ -42,8 +42,10 @@ function make(over: Partial<MaintenanceDeps> = {}) {
   const { warns, infos, logger } = collectingLogger()
   const stopped: number[] = []
   const handled: number[] = []
+  const shutdownHandled: number[] = []
   /** 当前的重启处理器，可在用例中途换掉以验证「现读」 */
   let handler: (() => void | Promise<void>) | undefined = () => void handled.push(Date.now())
+  let shutdownHandler: (() => void | Promise<void>) | undefined = () => void shutdownHandled.push(Date.now())
 
   const deps: MaintenanceDeps = {
     market: {} as unknown as PluginMarket,
@@ -54,6 +56,7 @@ function make(over: Partial<MaintenanceDeps> = {}) {
       return Promise.resolve()
     },
     restartHandler: () => handler,
+    shutdownHandler: () => shutdownHandler,
     env: {},
     ...over
   }
@@ -64,12 +67,20 @@ function make(over: Partial<MaintenanceDeps> = {}) {
     infos,
     stopped,
     handled,
+    shutdownHandled,
     /**
      * 换掉重启处理器
      * @param next 新的处理器
      */
     setHandler: (next: (() => void | Promise<void>) | undefined): void => {
       handler = next
+    },
+    /**
+     * 换掉关机处理器
+     * @param next 新的处理器
+     */
+    setShutdownHandler: (next: (() => void | Promise<void>) | undefined): void => {
+      shutdownHandler = next
     }
   }
 }
@@ -81,6 +92,12 @@ describe("detectSupervisor", () => {
 
   it("systemd 注入 INVOCATION_ID", () => {
     expect(detectSupervisor({ INVOCATION_ID: "abc123" })).toBe("systemd")
+  })
+
+  it("自带守护注入 YZNG_SUPERVISOR，且最贴身、优先于其余", () => {
+    expect(detectSupervisor({ YZNG_SUPERVISOR: "12345" })).toBe("yzng")
+    // 万一同时出现（不该发生：自带守护只在无外部守护时启动），以最贴身的自带守护为准
+    expect(detectSupervisor({ YZNG_SUPERVISOR: "1", pm_id: "0" })).toBe("yzng")
   })
 
   it("什么都没有时 undefined —— 这不是「没有守护」的证明", () => {
@@ -118,6 +135,31 @@ describe("canRestart", () => {
     expect(view.canRestart).toBe(false)
     setHandler(() => undefined)
     expect(view.canRestart).toBe(true)
+  })
+})
+
+describe("canShutdown", () => {
+  it("有人接管时为真", () => {
+    expect(make().view.canShutdown).toBe(true)
+  })
+
+  it("无人接管时为假", () => {
+    expect(make({ shutdownHandler: () => undefined }).view.canShutdown).toBe(false)
+  })
+
+  it("**与 canRestart 各自独立** —— 宿主可以只接管一件", () => {
+    // 内核不替宿主假定两者成对注册：只接了重启的宿主上，关机该老实说做不到
+    const { view } = make({ shutdownHandler: () => undefined })
+    expect(view.canRestart).toBe(true)
+    expect(view.canShutdown).toBe(false)
+  })
+
+  it("现读而非快照，与 canRestart 同理", () => {
+    const { view, setShutdownHandler } = make()
+    setShutdownHandler(undefined)
+    expect(view.canShutdown).toBe(false)
+    setShutdownHandler(() => undefined)
+    expect(view.canShutdown).toBe(true)
   })
 })
 
@@ -296,6 +338,81 @@ describe("requestRestart", () => {
       await view.requestRestart()
       await vi.advanceTimersByTimeAsync(1_000)
       expect(infos.some(m => m.includes("：") && m.includes("重启请求"))).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe("canShutdown", () => {
+  it("有人接管时为真，无人接管时为假", () => {
+    expect(make().view.canShutdown).toBe(true)
+    expect(make({ shutdownHandler: () => undefined }).view.canShutdown).toBe(false)
+  })
+
+  it("与 canRestart 各看各的处理器 —— 宿主可以只接管其中一个", () => {
+    const { view } = make({ shutdownHandler: () => undefined })
+    expect(view.canRestart).toBe(true)
+    expect(view.canShutdown).toBe(false)
+  })
+
+  it("同样现读", () => {
+    const { view, setShutdownHandler } = make()
+    setShutdownHandler(undefined)
+    expect(view.canShutdown).toBe(false)
+  })
+})
+
+describe("requestShutdown", () => {
+  it("宿主没接管时不停机，只留一条日志且不抛错", async () => {
+    vi.useFakeTimers()
+    try {
+      const { view, stopped, warns } = make({ shutdownHandler: () => undefined })
+      await expect(view.requestShutdown({ reason: "主人关机" })).resolves.toBeUndefined()
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(stopped).toEqual([])
+      expect(warns.some(m => m.includes("宿主没有接管关机"))).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("先停机再交给宿主退出，原因写进日志", async () => {
+    vi.useFakeTimers()
+    try {
+      const { view, stopped, shutdownHandled, infos } = make()
+      await view.requestShutdown({ reason: "主人关机" })
+      expect(stopped).toEqual([])
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(stopped).toHaveLength(1)
+      expect(shutdownHandled).toHaveLength(1)
+      expect(infos.some(m => m.includes("关机请求：主人关机"))).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("**走的是关机处理器，不是重启那个** —— 串了就会被守护拉起来", async () => {
+    vi.useFakeTimers()
+    try {
+      const { view, handled, shutdownHandled } = make()
+      await view.requestShutdown()
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(handled).toEqual([])
+      expect(shutdownHandled).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("停机出错仍继续退出", async () => {
+    vi.useFakeTimers()
+    try {
+      const { view, shutdownHandled, warns } = make({ stop: () => Promise.reject(new Error("KV 关不掉")) })
+      await view.requestShutdown()
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(shutdownHandled).toHaveLength(1)
+      expect(warns.some(m => m.includes("关机前的停机过程出错"))).toBe(true)
     } finally {
       vi.useRealTimers()
     }

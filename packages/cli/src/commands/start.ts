@@ -1,6 +1,6 @@
 /**
- * 模块职责：`yzng start` / `yzng dev` —— 装配内核、启动、接管信号、输出入口信息
- * 依赖方向：依赖 @yunzai-ng/core 的公开入口；不涉及其他命令
+ * 模块职责：`yzng start` / `yzng dev` 的**子进程侧** —— 装配内核、启动、接管信号、输出入口信息
+ * 依赖方向：依赖 @yunzai-ng/core 的公开入口；由 run.ts 动态 import，故父进程（守护）不会背上内核
  * 生命周期：进程的整个生命周期。返回时进程即将退出
  * 注意事项：**必须自行持有事件循环。** `app.start()` 之后，进程能否继续存活取决于
  *          是否存在活跃 handle：面板启用时存在监听 socket，账号连接时存在 TCP 连接。
@@ -8,27 +8,21 @@
  *          无待处理工作而直接退出 —— 使用者所见的现象是 `yzng start` 输出横幅后即
  *          返回终端提示符，且退出码为 0，无法据此判断属于异常终止还是既定行为。
  *          因此此处以一个长周期定时器兜底，并交由 `app.own()` 在停机时清除。
+ *
+ *          被守护启动时（父进程 fork，见 supervise.ts）多两件事：启动完成后发一条 `ready`
+ *          的 IPC，父进程据此区分「起不来」与「跑着崩了」；IPC 断开（父进程被强杀）时自行
+ *          优雅停机，否则会留下一个收不到指令的孤儿进程。
  */
 import { createApp, resolvePaths, type App } from "@yunzai-ng/core"
+import process from "node:process"
 import type { LogLevel } from "@yunzai-ng/types"
 import { linkFramework } from "../link.js"
 import { noteLegacyInstance } from "../legacy.js"
 import { bold, cyan, dim, green, print, printErr, printRows, red, yellow } from "../terminal.js"
+import { RESTART_EXIT_CODE, SHUTDOWN_EXIT_CODE } from "./exit-codes.js"
 
 /** 兜底定时器的间隔：取值足够大以避免产生可测量的开销，同时不超出 32 位范围 */
 const KEEPALIVE_MS = 0x7fffffff
-
-/**
- * 因重启请求而退出时的退出码
- *
- * **刻意非零。** pm2 与 `Restart=always` 的 systemd 单元对任何退出码都会拉起，但
- * `Restart=on-failure`（systemd 单元里很常见的一种写法）只在非零时拉起 —— 用 0 退出
- * 会让那批实例「关掉之后再也不起来」，而那正是本功能最不该有的失败方式。
- *
- * 取 75：sysexits.h 里的 `EX_TEMPFAIL`（暂时性失败，可重试），语义最接近「我这就下去，
- * 请把我拉起来」。它与 Node 自身的退出码不冲突（Node 用 1~12 与 128+n）。
- */
-const RESTART_EXIT_CODE = 75
 
 /** 启动参数 */
 export interface StartOptions {
@@ -40,6 +34,8 @@ export interface StartOptions {
   readonly logLevel?: LogLevel | undefined
   /** 是否输出至控制台 */
   readonly console?: boolean | undefined
+  /** 是否启用自带守护；缺省启用，被 `--no-supervise` 或外部守护关掉时为 false */
+  readonly supervise?: boolean | undefined
 }
 
 /**
@@ -128,6 +124,17 @@ export async function runStart(opts: StartOptions = {}): Promise<number> {
     process.exit(RESTART_EXIT_CODE)
   })
 
+  /*
+   * 接管关机请求：与上面同路，只换退出码
+   *
+   * 守护认不认这个码，取决于使用者的配置（见 `SHUTDOWN_EXIT_CODE`）—— 配错了的现象
+   * 是「关了又被拉起来」，比反过来（关掉再也起不来）轻，故仍以 0 为缺省。
+   */
+  app.onShutdownRequest(() => {
+    app.loggerHub.flush()
+    process.exit(SHUTDOWN_EXIT_CODE)
+  })
+
   // 链接结果延至此处报告：createApp 之前尚无 logger，而该事项的重要程度不足以直接写入终端
   if (link.linked.length > 0) app.logger.debug(`已将框架包链接至主目录：${link.linked.join("、")}`)
   for (const [name, reason] of link.failed) {
@@ -136,6 +143,24 @@ export async function runStart(opts: StartOptions = {}): Promise<number> {
 
   const keepalive = setInterval(() => undefined, KEEPALIVE_MS)
   app.own(() => clearInterval(keepalive))
+
+  // 「我是不是被自带守护 fork 出来的子进程」看的是注入的环境变量加 IPC 通道，**不看
+  // opts.supervise** —— 子进程会重新解析 argv，没传 --no-supervise 时该项是 undefined 而非
+  // true，据它判会漏掉子进程。supervise.js fork 时注入 YZNG_SUPERVISOR 并开 ipc
+  const supervised = typeof process.env["YZNG_SUPERVISOR"] === "string" && typeof process.send === "function"
+
+  // 被守护时，父进程断开 IPC（自己被强杀）等于「没人再看着我了」—— 自行优雅停机，否则留下
+  // 一个收不到任何指令的孤儿进程。探针证实：单独强杀父进程后子进程不会自动消失，只有这条
+  // disconnect 能救它。以退出码 0 退出：这不是重启
+  if (supervised) {
+    process.once("disconnect", () => {
+      app.logger.warn("与守护进程的连接断开，自行停机")
+      void app.stop().then(
+        () => process.exit(SHUTDOWN_EXIT_CODE),
+        () => process.exit(1)
+      )
+    })
+  }
 
   try {
     await app.start()
@@ -146,6 +171,10 @@ export async function runStart(opts: StartOptions = {}): Promise<number> {
   }
 
   printBanner(app)
+  // 启动成功后才报 ready：父进程据此区分「起不来」（配置错、端口占用，不该重拉）
+  // 与「跑着崩了」（该退避后重拉）。发送失败无所谓，父进程有兜底超时
+  if (supervised) process.send?.({ type: "ready" })
+
   // 不返回：进程由 handleSignals() 中的 process.exit 结束。
   // 该 promise 永不兑现是刻意的 —— 参见文件头
   return new Promise<number>(() => undefined)

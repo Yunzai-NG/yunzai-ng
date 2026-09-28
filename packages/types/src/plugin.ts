@@ -475,14 +475,24 @@ export interface RestartRequest {
   readonly reason?: string
 }
 
+/** 请求关机时的说明 */
+export interface ShutdownRequest {
+  /** 为什么要关机，会写进停机日志 */
+  readonly reason?: string
+}
+
 /**
- * 外部进程守护
+ * 进程守护
  *
- * `undefined` **不证明没有守护**：Windows 服务（nssm）一类不留可识别的环境痕迹。
- * 故它只用于「能确认有守护时给使用者一句准话」，不可用于拒绝重启 ——
- * 那会让一批装了守护的人用不了这个功能。
+ * - `pm2` / `systemd`：外部守护，按启动器注入的环境变量探测。
+ * - `yzng`：CLI 自带的守护 —— `yzng start` 缺省会 fork 一个子进程跑内核，父进程按子进程
+ *   的退出码决定重启还是收工。它对插件而言与外部守护无异（重启拉得起、关机拉不起）。
+ *
+ * `undefined` **不证明没有守护**：Windows 服务（nssm）一类不留可识别的环境痕迹，且
+ * 使用者可能以 `--no-supervise` 关掉自带守护而另接一层探测不到的守护。故它只用于
+ * 「能确认有守护时给使用者一句准话」，不可用于拒绝重启 —— 那会让那批人用不了这个功能。
  */
-export type SupervisorKind = "pm2" | "systemd"
+export type SupervisorKind = "pm2" | "systemd" | "yzng"
 
 /**
  * 维护面：更新插件与请求重启
@@ -551,6 +561,28 @@ export interface MaintenanceView {
    * @returns 已开始停机时兑现；无人接管时立即兑现
    */
   requestRestart(req?: RestartRequest): Promise<void>
+
+  /**
+   * 请求关机是否真能生效，即「宿主有没有注册过关机处理器」
+   *
+   * 与 {@link canRestart} 同理，它也不说明有没有外部守护 —— 关机之后不被拉起来，
+   * 靠的是宿主用一个守护认得的退出码退出（`yzng start` 用 0），而非靠没有守护。
+   */
+  readonly canShutdown: boolean
+
+  /**
+   * 请求关掉整个进程，且**不期望被拉起来**
+   *
+   * 与 {@link requestRestart} 走同一条路（优雅停机 + 交给宿主退出），区别只在退出码：
+   * 宿主该用一个守护认作「别重启」的码（`yzng start` 用 0，配合 pm2 的
+   * `stop_exit_codes: [0]` 或 systemd 的 `Restart=on-failure`）。
+   *
+   * **关掉之后没有任何聊天指令能把它启动回来**，故调用方应先向使用者确认。
+   * 同样要先把话说完，见 {@link requestRestart}。
+   * @param req 说明
+   * @returns 已开始停机时兑现；无人接管时立即兑现
+   */
+  requestShutdown(req?: ShutdownRequest): Promise<void>
 }
 
 /**
