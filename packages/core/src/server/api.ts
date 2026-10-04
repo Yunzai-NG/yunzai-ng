@@ -47,7 +47,14 @@ import type { EventDispatcher } from "../pipeline/dispatch.js"
 import type { PluginHost } from "../plugin/host.js"
 import type { DirtyAction, PluginMarket } from "../plugin/market.js"
 import type { SystemInfo } from "../platform/system.js"
-import type { ServerSink } from "../plugin/hooks.js"
+import { SubsystemUnavailableError, type ServerSink } from "../plugin/hooks.js"
+import {
+  StorageError,
+  listSqlTables,
+  type KvInspector,
+  type SqlInspectSource,
+  type SqlPanelParam
+} from "../store/inspect.js"
 import { isDurationLike, parseDuration } from "../util/duration.js"
 import { isLoopbackAddress } from "./auth.js"
 import { browseDirectory } from "./browse.js"
@@ -170,6 +177,17 @@ export interface ApiDeps {
   readonly dispatcher: EventDispatcher
   /** 共享服务器（读监听信息与路由表） */
   readonly server: ManagedServer
+  /**
+   * 存储检视器
+   *
+   * 可选：缺省时 `storage/*` 一律返回 501，同 `market`。
+   */
+  readonly storage?: {
+    /** KV 检视器 */
+    readonly kv: KvInspector
+    /** SQLite 库来源 */
+    readonly sql: SqlInspectSource
+  }
 
   /**
    * 取应用状态
@@ -1072,6 +1090,123 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     websockets: deps.server.listWebsockets(),
     static: deps.server.listStatic()
   }))
+
+  /* ────────────────────────── 存储检视 ────────────────────────── */
+
+  /*
+   * KV 与 SQLite 的浏览与编辑
+   *
+   * KV 键含 `:` 与 `/`，故经查询串与请求体传递，不作路径参数。
+   * 只读模式下 SQL 查询仍可执行，写语句由 `exec` 依据 SQLite 的 `stmt.readonly` 拒绝，不按首个关键字推断。
+   */
+  const storage = (): NonNullable<ApiDeps["storage"]> => {
+    if (deps.storage === undefined) throw fail(501, "当前部署未接入存储检视")
+    return deps.storage
+  }
+
+  /** 将存储层错误转换为带状态码的错误 */
+  const viaStorage = async <T>(task: () => Promise<T>): Promise<T> => {
+    try {
+      return await task()
+    } catch (err) {
+      if (err instanceof StorageError) throw fail(err.statusCode, err.message)
+      if (err instanceof SubsystemUnavailableError) throw fail(503, err.message)
+      throw err
+    }
+  }
+
+  /** 取请求体里的 SQL 绑定参数 */
+  const sqlParamsOf = (body: Record<string, unknown>): SqlPanelParam[] => {
+    const raw = body.params
+    if (raw === undefined || raw === null) return []
+    if (!Array.isArray(raw)) throw fail(400, "字段 params 必须是数组")
+    return raw.map((value: unknown, i) => {
+      if (value === null || typeof value === "string") return value
+      if (typeof value === "number" && Number.isFinite(value)) return value
+      throw fail(400, `params[${i}] 只能是字符串、有限数字或 null`)
+    })
+  }
+
+  add("GET", "storage/kv", async req => {
+    const inspector = storage().kv
+    const after = queryOf(req.query, "after")
+    const page = await inspector.browse({
+      prefix: queryOf(req.query, "prefix") ?? "",
+      ...(after === undefined || after === "" ? {} : { after }),
+      limit: countOf(req.query, "limit", 100, 500)
+    })
+    return { driver: inspector.driver, readonly: deps.config.get().server.readonly, ...page }
+  })
+
+  add("GET", "storage/kv/entry", async req => {
+    const key = queryOf(req.query, "key") ?? ""
+    if (key === "") throw fail(400, "缺少查询参数 key")
+    const entry = await viaStorage(() => storage().kv.read(key))
+    if (entry === undefined) throw fail(404, `键 ${key} 不存在或已过期`)
+    return entry
+  })
+
+  add("PUT", "storage/kv/entry", async req => {
+    requireWritable()
+    const body = objectOf(req.body)
+    const key = requireString(body, "key")
+    if (!("value" in body)) throw fail(400, "字段 value 必填")
+    const raw = optionalNumber(body, "expireAt", { min: Date.now() + 1, max: Number.MAX_SAFE_INTEGER })
+    const expireAt = raw === undefined ? undefined : Math.trunc(raw)
+    await viaStorage(() => storage().kv.write(key, body.value, expireAt))
+    deps.logger.info(`面板写入了 KV 键 ${key}`)
+    return { key, value: body.value, ...(expireAt === undefined ? {} : { expireAt }) }
+  })
+
+  add("DELETE", "storage/kv/entry", async req => {
+    requireWritable()
+    const key = queryOf(req.query, "key") ?? ""
+    if (key === "") throw fail(400, "缺少查询参数 key")
+    const removed = await viaStorage(() => storage().kv.remove(key))
+    if (!removed) throw fail(404, `键 ${key} 不存在或已过期`)
+    deps.logger.info(`面板删除了 KV 键 ${key}`)
+    return { removed: true, key }
+  })
+
+  add("POST", "storage/kv/clear", async req => {
+    requireWritable()
+    const prefix = requireString(objectOf(req.body), "prefix")
+    const removed = await viaStorage(() => storage().kv.removePrefix(prefix))
+    deps.logger.warn(`面板清空了 KV 前缀 ${prefix}（${removed} 个键）`)
+    return { removed, prefix }
+  })
+
+  add("GET", "storage/sql", async () => {
+    const source = storage().sql
+    return {
+      enabled: source.enabled,
+      readonly: deps.config.get().server.readonly,
+      databases: await viaStorage(() => source.databases())
+    }
+  })
+
+  add("GET", "storage/sql/:plugin/:name/tables", req =>
+    viaStorage(async () => {
+      const db = await storage().sql.store(req.params.plugin ?? "", req.params.name ?? "")
+      return { tables: await listSqlTables(db.handle) }
+    })
+  )
+
+  add("POST", "storage/sql/:plugin/:name/query", async req => {
+    const body = objectOf(req.body)
+    const sql = requireString(body, "sql")
+    const params = sqlParamsOf(body)
+    const limit = Math.trunc(optionalNumber(body, "limit", { min: 1, max: 1000 }) ?? 200)
+    const allowWrite = !deps.config.get().server.readonly
+    const plugin = req.params.plugin ?? ""
+    const name = req.params.name ?? ""
+    const result = await viaStorage(async () => {
+      const db = await storage().sql.store(plugin, name)
+      return db.exec(sql, params, { limit, allowWrite })
+    })
+    if (!result.readonly) deps.logger.info(`面板在 ${plugin}/${name} 上执行了写语句（影响 ${result.changes ?? 0} 行）`)
+    return result
+  })
 
   /* ────────────────────────── 目录浏览 ────────────────────────── */
 

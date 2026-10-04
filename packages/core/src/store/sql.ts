@@ -13,9 +13,19 @@
  */
 import type { SqlHandle, SqlMigration, SqlParam } from "@yunzai-ng/types"
 import { dirname } from "node:path"
+import { performance } from "node:perf_hooks"
 import { LruCache } from "../util/lru.js"
 import { Semaphore } from "../util/queue.js"
 import { ensureDir } from "../util/fs.js"
+import {
+  StorageError,
+  guardStatement,
+  sqlCellOf,
+  type SqlExecOptions,
+  type SqlExecResult,
+  type SqlInspectStore,
+  type SqlPanelParam
+} from "./inspect.js"
 
 /** 语句缓存条目上限 */
 const STMT_CACHE_MAX = 200
@@ -25,12 +35,22 @@ const MIGRATION_TABLE = "_yzng_migrations"
 
 /** better-sqlite3 的语句最小面 */
 interface SqliteStatement {
+  /** 是否返回行 */
+  readonly reader: boolean
+  /** 是否为只读语句 */
+  readonly readonly: boolean
   /** 执行不取行 */
   run(...params: SqlParam[]): { changes: number; lastInsertRowid: number | bigint }
   /** 取全部行 */
   all(...params: SqlParam[]): unknown[]
   /** 取首行 */
   get(...params: SqlParam[]): unknown
+  /** 逐行迭代 */
+  iterate(...params: SqlParam[]): IterableIterator<unknown>
+  /** 结果列 */
+  columns(): { name: string }[]
+  /** 切换为按数组返回行 */
+  raw(toggle?: boolean): SqliteStatement
 }
 
 /** better-sqlite3 的连接最小面 */
@@ -248,7 +268,7 @@ export interface OpenSqlOptions {
 }
 
 /** 已打开的 SQL 存储 */
-export interface SqlStore {
+export interface SqlStore extends SqlInspectStore {
   /** 句柄 */
   readonly handle: SqlHandle
   /** 数据库文件路径 */
@@ -288,11 +308,64 @@ export async function openSql(opts: OpenSqlOptions): Promise<SqlStore | undefine
   return {
     handle: new SqliteHandle(state),
     file: opts.file,
+    // 与插件事务共用互斥锁，避免面板语句落入插件未结束的事务
+    exec: (sql, params, execOpts) => state.mutex.use(async () => execPanel(db, sql, params, execOpts)),
     close: () => {
       // 缓存里的语句必须先丢掉：连接关了之后再用它们会直接崩进程
       state.stmts.clear()
       db.close()
     }
+  }
+}
+
+/**
+ * 执行一条面板语句
+ *
+ * 不使用语句缓存：`raw()` 会修改语句对象，而缓存中的语句由插件复用。
+ * @param db 连接
+ * @param sql 单条 SQL
+ * @param params 绑定参数
+ * @param opts 选项
+ * @returns 执行结果
+ * @throws StorageError 语句被拦下、只读模式下写库，或 SQLite 报错时
+ */
+function execPanel(db: SqliteDb, sql: string, params: readonly SqlPanelParam[], opts: SqlExecOptions): SqlExecResult {
+  const text = guardStatement(sql)
+  if (isMultiStatement(text)) throw new StorageError(400, "一次只执行一条语句")
+
+  const started = performance.now()
+  const cost = (): number => Math.round((performance.now() - started) * 100) / 100
+  const reason = (err: unknown): string => (err instanceof Error ? err.message : String(err))
+
+  let stmt: SqliteStatement
+  try {
+    stmt = db.prepare(text)
+  } catch (err) {
+    throw new StorageError(400, reason(err))
+  }
+  if (!stmt.readonly && !opts.allowWrite) {
+    throw new StorageError(403, "面板处于只读模式（配置项 server.readonly 为 true），只能执行只读语句")
+  }
+
+  try {
+    if (stmt.reader) {
+      const columns = stmt.columns().map(c => c.name)
+      const rows: unknown[][] = []
+      let truncated = false
+      for (const row of stmt.raw(true).iterate(...params)) {
+        if (rows.length >= opts.limit) {
+          truncated = true
+          break
+        }
+        rows.push((row as unknown[]).map(sqlCellOf))
+      }
+      return { readonly: stmt.readonly, columns, rows, truncated, cost: cost() }
+    }
+    const result = stmt.run(...params)
+    const rowid = sqlCellOf(result.lastInsertRowid) as number | string
+    return { readonly: stmt.readonly, changes: result.changes, lastInsertRowid: rowid, cost: cost() }
+  } catch (err) {
+    throw new StorageError(400, reason(err))
   }
 }
 

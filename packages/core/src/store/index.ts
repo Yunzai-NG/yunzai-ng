@@ -14,6 +14,7 @@ import { Kv } from "./kv.js"
 import { MemoryKvDriver } from "./memory.js"
 import { JsonKvDriver } from "./json.js"
 import { LevelKvDriver, loadLevel } from "./level.js"
+import { createKvInspector, type KvInspector } from "./inspect.js"
 
 /** 内置驱动 id */
 export type BuiltinDriverId = "auto" | "level" | "json" | "memory"
@@ -63,6 +64,8 @@ export interface KvStore {
    * @returns KV 视图
    */
   namespace(name: string): KvNamespace
+  /** 不经命名空间的检视器，仅供面板 API 使用 */
+  readonly inspector: KvInspector
   /** 关闭并落盘 */
   close(): Promise<void>
 }
@@ -112,6 +115,7 @@ export async function openKv(opts: OpenKvOptions): Promise<KvStore> {
     driver: driver.id,
     root,
     namespace: (name: string) => root.sub(name),
+    inspector: createKvInspector(driver),
     close: async () => {
       await driver.close()
     }

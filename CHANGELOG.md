@@ -9,6 +9,40 @@
 `package.json`，而插件索引里的 `minCore` 说的也是内核版本。两者若脱节，使用者在面板上看到
 一个号、在发布说明与 tag 上看到另一个，无从对账。
 
+## 0.6.4 — 2026-10-04
+
+| 包 | 版本 |
+|---|---|
+| `@yunzai-ng/core` | 0.6.3 → **0.6.4** |
+| `@yunzai-ng/cli` | 0.6.1 → **0.6.2** |
+
+> CLI 无代码改动，抬号用于将其依赖表中锁定的 core 版本更新为 0.6.4。
+
+### 新增
+
+- **面板 API 新增存储检视接口 `/api/storage/*`，用于浏览、编辑与删除 KV 及 SQLite 数据。**
+  - KV
+    - `GET storage/kv`：按前缀浏览。下级子命名空间归并为组并给出键数，直属键分页返回类型、大小、预览与过期时间。
+    - `GET` / `PUT` / `DELETE storage/kv/entry`：读、写、删单个键。键含 `:` 与 `/`，故经查询串或请求体传递。
+    - `POST storage/kv/clear`：清空指定前缀，拒绝空前缀。
+    - 单次最多扫描 50000 个键，超出时返回 `truncated: true`。
+  - SQLite
+    - `GET storage/sql`：列出数据目录中的库文件。
+    - `GET storage/sql/:plugin/:name/tables`：列出表、视图及其列。
+    - `POST storage/sql/:plugin/:name/query`：执行单条语句，结果最多 1000 行；二进制单元格返回字节数与前 32 字节的十六进制。
+    - 仅打开已存在的库，不新建文件。
+
+  约束：
+  - 检视器不经命名空间直接读写驱动，故仅开放于面板 API，不进入 `AppView`。经此修改插件命名空间下的键，插件不会收到通知。
+  - 只读模式（`server.readonly`）下 KV 写入返回 403；SQL 查询仍可执行，写语句由 SQLite 依据 `stmt.readonly` 拒绝。
+  - 拒绝 ATTACH、DETACH、VACUUM 及事务控制语句：前者可读写数据目录之外的文件，后者会使与插件共用的连接停留在未结束的事务中。
+  - 面板与插件共用同一连接与事务锁，避免 SQLITE_BUSY 及面板语句落入插件事务。
+  - 写操作均记录日志，清空前缀记为 warn。
+  - 未接入存储检视（`ApiDeps.storage` 缺省）时返回 501；SQLite 未启用或原生模块缺失时返回 503。
+
+- `KvStore` 新增 `inspector`；`ManagedSqlSink` 实现 `SqlInspectSource`（`databases()` / `store()`）。
+  检视层类型与 `StorageError` 由 `store/inspect.ts` 导出。
+
 ## 0.6.3 — 2026-09-29
 
 | 包 | 版本 |

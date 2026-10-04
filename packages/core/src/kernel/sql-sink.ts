@@ -12,10 +12,13 @@
  *          于是同一个文件被打开两次 —— SQLite 允许，但两个连接各有一套
  *          语句缓存和 WAL 视图，写入会互相 SQLITE_BUSY。
  */
+import { readdir, stat } from "node:fs/promises"
 import { join } from "node:path"
 import type { Logger, SqlHandle } from "@yunzai-ng/types"
 import { SubsystemUnavailableError, type SqlSink } from "../plugin/hooks.js"
+import { StorageError, type SqlDatabaseInfo, type SqlInspectSource, type SqlInspectStore } from "../store/inspect.js"
 import { openSql, type SqlStore } from "../store/sql.js"
+import { errorCode } from "../util/fs.js"
 
 /** 库名与插件名的合法形式：不含路径分隔符，避免写到目录外面去 */
 const SAFE_NAME = /^[a-z0-9][a-z0-9._-]*$/i
@@ -30,8 +33,12 @@ export interface SqlSinkOptions {
   enabled: boolean
 }
 
-/** 带生命周期管理的 SQL 接缝 */
-export interface ManagedSqlSink extends SqlSink {
+/**
+ * 带生命周期管理的 SQL 接缝
+ *
+ * 同时实现面板的 `SqlInspectSource`：面板与插件共用同一连接表，避免同一文件上的两条连接相互 SQLITE_BUSY。
+ */
+export interface ManagedSqlSink extends SqlSink, SqlInspectSource {
   /** 当前打开的库数量 */
   readonly size: number
 
@@ -91,9 +98,53 @@ export function createSqlSink(opts: SqlSinkOptions): ManagedSqlSink {
     }
   }
 
+  /**
+   * 取得一个库：已打开则复用，否则打开并登记
+   * @param plugin 插件名（已校验）
+   * @param name 库名（已校验）
+   * @returns 已打开的库
+   */
+  const acquire = async (plugin: string, name: string): Promise<SqlStore> => {
+    if (!opts.enabled) {
+      throw new SubsystemUnavailableError("SQL", "配置项 store.sqlite 为 false，在 WebUI 里开启后重启即可")
+    }
+
+    const key = `${plugin}/${name}`
+    const cached = opened.get(key)
+    if (cached) return cached
+
+    const pending = (async (): Promise<SqlStore> => {
+      const file = join(opts.dir, plugin, `${name}.db`)
+      const store = await openSql({ file })
+      if (!store) {
+        throw new SubsystemUnavailableError(
+          "SQL",
+          "可选依赖 better-sqlite3 不可用（Termux 等环境常编译失败）。" +
+            "执行 pnpm rebuild better-sqlite3 重装，或让插件降级用 ctx.kv"
+        )
+      }
+      logger.debug(`已打开 ${key} → ${store.file}`)
+      return store
+    })()
+
+    opened.set(key, pending)
+    try {
+      return await pending
+    } catch (err) {
+      // 失败的 Promise 不留在表里：磁盘满、权限不对这类问题修好之后
+      // 插件重载应该能重新打开，而不是一直拿到同一个陈旧的 rejection
+      opened.delete(key)
+      throw err
+    }
+  }
+
   return {
     get size(): number {
       return opened.size
+    },
+
+    get enabled(): boolean {
+      return opts.enabled
     },
 
     list(): string[] {
@@ -103,38 +154,55 @@ export function createSqlSink(opts: SqlSinkOptions): ManagedSqlSink {
     async open(plugin: string, name: string): Promise<SqlHandle> {
       assertSafe("插件名", plugin)
       assertSafe("库名", name)
+      return (await acquire(plugin, name)).handle
+    },
 
-      if (!opts.enabled) {
-        throw new SubsystemUnavailableError("SQL", "配置项 store.sqlite 为 false，在 WebUI 里开启后重启即可")
-      }
-
-      const key = `${plugin}/${name}`
-      const cached = opened.get(key)
-      if (cached) return (await cached).handle
-
-      const pending = (async (): Promise<SqlStore> => {
-        const file = join(opts.dir, plugin, `${name}.db`)
-        const store = await openSql({ file })
-        if (!store) {
-          throw new SubsystemUnavailableError(
-            "SQL",
-            "可选依赖 better-sqlite3 不可用（Termux 等环境常编译失败）。" +
-              "执行 pnpm rebuild better-sqlite3 重装，或让插件降级用 ctx.kv"
-          )
-        }
-        logger.debug(`已打开 ${key} → ${store.file}`)
-        return store
-      })()
-
-      opened.set(key, pending)
+    async databases(): Promise<SqlDatabaseInfo[]> {
+      const out: SqlDatabaseInfo[] = []
+      let plugins: string[]
       try {
-        return (await pending).handle
+        plugins = (await readdir(opts.dir, { withFileTypes: true })).filter(d => d.isDirectory()).map(d => d.name)
       } catch (err) {
-        // 失败的 Promise 不留在表里：磁盘满、权限不对这类问题修好之后
-        // 插件重载应该能重新打开，而不是一直拿到同一个陈旧的 rejection
-        opened.delete(key)
+        if (errorCode(err) === "ENOENT") return []
         throw err
       }
+      for (const plugin of plugins) {
+        if (!SAFE_NAME.test(plugin)) continue
+        const files = await readdir(join(opts.dir, plugin)).catch(() => [] as string[])
+        for (const file of files) {
+          if (!file.endsWith(".db")) continue
+          const name = file.slice(0, -".db".length)
+          if (!SAFE_NAME.test(name)) continue
+          const size = await stat(join(opts.dir, plugin, file)).then(
+            s => s.size,
+            () => 0
+          )
+          out.push({ plugin, name, size, open: opened.has(`${plugin}/${name}`) })
+        }
+      }
+      return out.sort((a, b) => {
+        const ka = `${a.plugin}/${a.name}`
+        const kb = `${b.plugin}/${b.name}`
+        return ka < kb ? -1 : ka > kb ? 1 : 0
+      })
+    },
+
+    async store(plugin: string, name: string): Promise<SqlInspectStore> {
+      try {
+        assertSafe("插件名", plugin)
+        assertSafe("库名", name)
+      } catch (err) {
+        throw new StorageError(400, err instanceof Error ? err.message : String(err))
+      }
+      // 仅打开已存在的库：openSql 会为不存在的文件新建库
+      if (!opened.has(`${plugin}/${name}`)) {
+        const exists = await stat(join(opts.dir, plugin, `${name}.db`)).then(
+          s => s.isFile(),
+          () => false
+        )
+        if (!exists) throw new StorageError(404, `库 ${plugin}/${name} 不存在`)
+      }
+      return acquire(plugin, name)
     },
 
     async close(plugin: string): Promise<void> {

@@ -1,6 +1,6 @@
 {
   "name": "yunzai-ng",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "private": true,
   "type": "module",
   "description": "Yunzai NG - 面向 QQ 机器人的可插拔运行时内核（Windows / Android）",

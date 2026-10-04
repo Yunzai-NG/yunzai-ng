@@ -38,6 +38,9 @@ import { ConfigStore } from "../config/store.js"
 import { defineCoreConfig, type CoreConfigHandle } from "../config/core-config.js"
 import { createManagedServer, type ManagedServer } from "./index.js"
 import { API_SCOPE, registerApi, type ApiDeps } from "./api.js"
+import { MemoryKvDriver } from "../store/memory.js"
+import { StorageError, createKvInspector, type SqlInspectSource } from "../store/inspect.js"
+import { SubsystemUnavailableError } from "../plugin/hooks.js"
 
 /** 本机对端，light-my-request 默认也是这个 */
 const LOCAL_IP = "127.0.0.1"
@@ -1158,6 +1161,108 @@ describe("面板 API", () => {
       expect(routes.some(r => r.pattern === "/plugin/demo/ping")).toBe(true)
       expect(routes.some(r => r.scope === API_SCOPE)).toBe(true)
       expect((body.websockets as Array<{ pattern: string }>).some(w => w.pattern === `${API_SCOPE}/logs`)).toBe(true)
+    })
+  })
+
+  describe("存储检视", () => {
+    let driver: MemoryKvDriver
+    let sqlExec: ReturnType<typeof vi.fn>
+
+    beforeEach(async () => {
+      driver = new MemoryKvDriver()
+      await driver.open()
+      await driver.set("plugin:demo:a", { v: { n: 1 } })
+      await driver.set("plugin:demo:b", { v: "文本" })
+      await driver.set("accounts:x", { v: 1 })
+
+      sqlExec = vi.fn(async (_sql: string, _params: unknown[], opts: { allowWrite: boolean }) => ({
+        readonly: true,
+        columns: ["n"],
+        rows: [[1]],
+        truncated: false,
+        cost: 0,
+        allowWrite: opts.allowWrite
+      }))
+      const sql: SqlInspectSource = {
+        enabled: true,
+        databases: async () => [{ plugin: "demo", name: "gacha", size: 4096, open: false }],
+        store: async (plugin, name) => {
+          if (plugin === "bad!") throw new StorageError(400, "插件名不合法")
+          if (name === "none") throw new StorageError(404, `没有库 ${plugin}/${name}`)
+          if (name === "nomod") throw new SubsystemUnavailableError("SQL", "缺原生模块")
+          return { handle: { all: async () => [] } as never, exec: sqlExec as never }
+        }
+      }
+
+      off()
+      off = registerApi(server, { ...deps, storage: { kv: createKvInspector(driver), sql } })
+    })
+
+    it("浏览根前缀时按子命名空间归并", async () => {
+      const res = await call("GET", "storage/kv")
+      expect(res.statusCode).toBe(200)
+      const body = res.json() as { driver: string; groups: Array<{ name: string; count: number }> }
+      expect(body.driver).toBe("memory")
+      expect(body.groups).toEqual([
+        { name: "accounts:", count: 1 },
+        { name: "plugin:", count: 2 }
+      ])
+    })
+
+    it("键走查询串，读写删往返一致", async () => {
+      const key = encodeURIComponent("plugin:demo:a")
+      expect((await call("GET", `storage/kv/entry?key=${key}`)).json().value).toEqual({ n: 1 })
+
+      const put = await call("PUT", "storage/kv/entry", { key: "plugin:demo:c", value: [1, 2] })
+      expect(put.statusCode).toBe(200)
+      expect((await driver.get("plugin:demo:c"))?.v).toEqual([1, 2])
+
+      expect((await call("DELETE", `storage/kv/entry?key=${key}`)).statusCode).toBe(200)
+      expect((await call("GET", `storage/kv/entry?key=${key}`)).statusCode).toBe(404)
+    })
+
+    it("清空前缀不收空串", async () => {
+      expect((await call("POST", "storage/kv/clear", { prefix: "" })).statusCode).toBe(400)
+      const res = await call("POST", "storage/kv/clear", { prefix: "plugin:demo:" })
+      expect(res.json().removed).toBe(2)
+    })
+
+    it("过去的过期时间点以 400 拒绝", async () => {
+      const res = await call("PUT", "storage/kv/entry", { key: "k", value: 1, expireAt: 1 })
+      expect(res.statusCode).toBe(400)
+    })
+
+    it("存储层错误映射为对应状态码", async () => {
+      expect((await call("GET", "storage/sql/bad!/x/tables")).statusCode).toBe(400)
+      expect((await call("GET", "storage/sql/demo/none/tables")).statusCode).toBe(404)
+      expect((await call("GET", "storage/sql/demo/nomod/tables")).statusCode).toBe(503)
+    })
+
+    it("SQL 参数只收 JSON 能表达的标量", async () => {
+      const bad = await call("POST", "storage/sql/demo/gacha/query", { sql: "SELECT ?", params: [{ a: 1 }] })
+      expect(bad.statusCode).toBe(400)
+      expect(sqlExec).not.toHaveBeenCalled()
+    })
+
+    it("只读模式下 KV 写一律 403，读与 SQL 查询照常（写语句由 exec 拦）", async () => {
+      await config.patch({ server: { readonly: true } }, "api")
+
+      expect((await call("GET", "storage/kv")).statusCode).toBe(200)
+      expect((await call("PUT", "storage/kv/entry", { key: "k", value: 1 })).statusCode).toBe(403)
+      expect((await call("DELETE", "storage/kv/entry?key=plugin%3Ademo%3Aa")).statusCode).toBe(403)
+      expect((await call("POST", "storage/kv/clear", { prefix: "plugin:" })).statusCode).toBe(403)
+      expect((await driver.get("plugin:demo:a"))?.v).toEqual({ n: 1 })
+
+      const query = await call("POST", "storage/sql/demo/gacha/query", { sql: "SELECT 1" })
+      expect(query.statusCode).toBe(200)
+      expect(sqlExec.mock.calls[0]?.[2]).toMatchObject({ allowWrite: false })
+    })
+
+    it("未接入存储检视的部署一律 501", async () => {
+      off()
+      off = registerApi(server, deps)
+      expect((await call("GET", "storage/kv")).statusCode).toBe(501)
+      expect((await call("GET", "storage/sql")).statusCode).toBe(501)
     })
   })
 

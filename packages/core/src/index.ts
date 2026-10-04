@@ -71,6 +71,7 @@ export * from "./logger/rotate.js"
 
 /* ────────────────────────────── 存储 ────────────────────────────── */
 export * from "./store/index.js"
+export * from "./store/inspect.js"
 export * from "./store/kv.js"
 export * from "./store/sql.js"
 export * from "./store/memory.js"

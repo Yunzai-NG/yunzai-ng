@@ -858,6 +858,7 @@ export async function createApp(opts: CreateAppOptions = {}): Promise<App> {
         renderers: runtime.renderers,
         dispatcher: runtime.dispatcher,
         server,
+        storage: { kv: kv.inspector, sql },
         status: () => app.status,
         startedAt: () => app.startedAt,
         usage: () => sampleUsage(),

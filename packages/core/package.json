@@ -1,6 +1,6 @@
 {
   "name": "@yunzai-ng/core",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "description": "Yunzai NG 内核：插件宿主、统一事件模型、中间件管线、存储与渲染抽象",
   "type": "module",
   "license": "AGPL-3.0-or-later",
