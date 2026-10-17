@@ -7,7 +7,8 @@
  *          编译于旧类型而运行于新内核；误删已有目录在开发机上将直接破坏仓库自身的
  *          node_modules，而此时的错误信息仅提示"找不到模块"。
  */
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { realpathSync } from "node:fs"
+import { mkdir, mkdtemp, readFile, rm, rmdir, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
@@ -68,6 +69,21 @@ describe("框架包链接", () => {
     expect((JSON.parse(raw) as { name: string }).name).toBe("@yunzai-ng/types")
     // 摘除链接不得动到它原先所指的目录，否则一次升级就把 .pnpm 里的旧版本连带删了
     await expect(readFile(join(stale, "标记.txt"), "utf8")).resolves.toBe("旧目标不该被删")
+  })
+
+  it.runIf(process.platform === "win32")("只差盘符大小写的链接被重建 —— 否则插件经它加载到第二份内核", async () => {
+    await linkFramework(home)
+    const link = join(home, "node_modules", "@yunzai-ng", "core")
+    // JS 版 realpathSync 与模块解析一样保留链接原文的大小写
+    const right = realpathSync(link)
+    const flipped = (right[0] === right[0]?.toUpperCase() ? right[0]?.toLowerCase() : right[0]?.toUpperCase()) + right.slice(1)
+    await rmdir(link)
+    await symlink(flipped, link, "junction")
+    expect(realpathSync(link)).toBe(flipped)
+
+    const report = await linkFramework(home)
+    expect(report.linked).toEqual(["@yunzai-ng/core"])
+    expect(realpathSync(link)).toBe(right)
   })
 
   it("目标已消失的链接被重建 —— 框架被移动或重装后会出现该情形", async () => {

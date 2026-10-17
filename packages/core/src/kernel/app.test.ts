@@ -140,6 +140,22 @@ describe("createApp", () => {
     expect(text).toContain("9.9.9-test")
   })
 
+  it("进程里有第二份内核时启动记一条警告", async () => {
+    const copies = (globalThis as Record<symbol, Set<string>>)[Symbol.for("yunzai-ng.core-copies")]!
+    const fake = join(tmpdir(), "另一份内核")
+    copies.add(fake)
+    try {
+      const app = await makeApp()
+      await app.start()
+      app.loggerHub.flush()
+      const text = await readFile(app.loggerHub.file!, "utf8")
+      expect(text).toContain("份内核")
+      expect(text).toContain(JSON.stringify(fake).slice(1, -1))
+    } finally {
+      copies.delete(fake)
+    }
+  })
+
   it("AppView 是活的：后填的子系统立刻可见", async () => {
     const app = await makeApp()
 

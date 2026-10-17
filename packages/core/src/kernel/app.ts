@@ -20,6 +20,7 @@
  */
 import { createRequire } from "node:module"
 import { isAbsolute, join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 import type {
   AccountsView,
   AdapterRegistryView,
@@ -78,6 +79,12 @@ const DEFAULT_STOP_TIMEOUT = 5000
 
 /** 用于读自身 package.json（ESM 里没有 __dirname，也不能 import 到 rootDir 之外） */
 const requireFromHere = createRequire(import.meta.url)
+
+/** 本进程里加载过的每一份内核的包根，跨份共享，见 `#warnDuplicateCore()` */
+const CORE_COPIES: Set<string> = ((globalThis as Record<symbol, Set<string> | undefined>)[
+  Symbol.for("yunzai-ng.core-copies")
+] ??= new Set())
+CORE_COPIES.add(fileURLToPath(new URL("../..", import.meta.url)))
 
 /**
  * 读内核版本
@@ -441,6 +448,7 @@ export class App {
       )
     }
     this.logger.info(`插件就绪：成功 ${report.loaded.length} 个，失败 ${report.failed.length} 个，耗时 ${report.cost}ms`)
+    this.#warnDuplicateCore()
 
     // 监听要卡在这两步中间：
     // - 在 loadAll() 之后，插件的路由才齐，不会出现"面板半截可用"的窗口期；
@@ -464,6 +472,21 @@ export class App {
       this.http.warmup().catch((err: unknown) => this.logger.warn("HTTP 客户端预载失败，首个请求时再试", err))
     })
     return report
+  }
+
+  /**
+   * 插件经另一条路径 import 到另一份内核时警告一次
+   *
+   * 两份内核互不认识：`instanceof` 判不出对方的错误类，模块级状态各存一份，启动还要多付一次加载。
+   * 常见成因是链接目标与内核所在路径只差盘符大小写（`c:\` / `C:\`），或插件目录自带了一份内核。
+   */
+  #warnDuplicateCore(): void {
+    if (CORE_COPIES.size < 2) return
+    this.logger.warn(
+      `进程里加载了 ${CORE_COPIES.size} 份内核，插件与内核拿到的不是同一份：${[...CORE_COPIES].join("、")}。` +
+        "请让插件经主目录的 node_modules/@yunzai-ng 解析内核（重新执行 yzng start 会重建链接），" +
+        "开发中的插件仓库重新执行 pnpm run link:framework"
+    )
   }
 
   /**

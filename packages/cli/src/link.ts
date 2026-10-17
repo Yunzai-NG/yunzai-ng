@@ -24,7 +24,8 @@
  *          绝不覆盖真实目录：开发时主目录可能即为仓库本身，其中的 `node_modules/@yunzai-ng`
  *          由 pnpm 建立，改动它将破坏开发环境。
  */
-import { lstat, mkdir, realpath, rmdir, symlink, unlink } from "node:fs/promises"
+import { realpathSync } from "node:fs"
+import { lstat, mkdir, rmdir, symlink, unlink } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { createRequire } from "node:module"
 
@@ -75,11 +76,11 @@ function packageDir(name: string): string | undefined {
  * @param expected 期望指向的目录
  * @returns 指向一致时 true
  */
-async function pointsTo(link: string, expected: string): Promise<boolean> {
+function pointsTo(link: string, expected: string): boolean {
   try {
-    const [actual, want] = await Promise.all([realpath(link), realpath(expected)])
-    // Windows 与 macOS 的文件系统不区分大小写，仅 Linux/Android 区分
-    return process.platform === "linux" ? actual === want : actual.toLowerCase() === want.toLowerCase()
+    // 大小写也要一致：文件系统不分，Node 的模块缓存却分，`c:\` 与 `C:\` 下的内核会加载成两份。
+    // 故用 JS 版 realpathSync —— 它与模块解析一样保留链接原文的大小写，native 版会把大小写校正掉
+    return realpathSync(link) === realpathSync(expected)
   } catch {
     return false
   }
@@ -129,7 +130,7 @@ export async function linkFramework(home: string): Promise<LinkReport> {
       // 于是既不会摘除它，随后的 symlink 又因它仍在盘上而以 EEXIST 失败
       const existing = await lstat(link).catch(() => undefined)
       if (existing !== undefined) {
-        if (!existing.isSymbolicLink() || (await pointsTo(link, target))) {
+        if (!existing.isSymbolicLink() || pointsTo(link, target)) {
           kept.push(name)
           continue
         }
