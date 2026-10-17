@@ -522,8 +522,9 @@ export class CommandRouter implements CommandSink {
    * @returns 候选条目数组
    */
   #candidates(text: string): readonly Entry[] {
-    const first = [...text][0]
-    const bucket = first === undefined ? undefined : this.#buckets.get(first)
+    // 按码点取首字符（与分桶时 `[...pattern][0]` 同一口径），但不把整条消息摊成数组
+    const cp = text.codePointAt(0)
+    const bucket = cp === undefined ? undefined : this.#buckets.get(String.fromCodePoint(cp))
     const loose = this.#unbucketed
 
     // 绝大多数消息走这两条零分配的捷径

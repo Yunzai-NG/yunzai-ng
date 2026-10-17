@@ -88,10 +88,11 @@ export class MiddlewarePipeline implements MiddlewareSink {
     for (const kind of this.#kindsOf(reg)) {
       const list = this.#byKind.get(kind)
       if (list === undefined) continue
-      // 插入排序：同优先级时后注册的排在后面，符合"先装的插件先跑"的直觉
+      // 插入排序：同优先级时后注册的排在后面，符合"先装的插件先跑"的直觉。
+      // 写时复制：正在执行的链拿着旧数组，不受影响，见 `run()`
       let at = list.length
       while (at > 0 && byPriority(list[at - 1]!, reg) > 0) at--
-      list.splice(at, 0, reg)
+      this.#byKind.set(kind, [...list.slice(0, at), reg, ...list.slice(at)])
     }
 
     return () => this.#remove(reg)
@@ -107,16 +108,14 @@ export class MiddlewarePipeline implements MiddlewareSink {
    * @throws 任一中间件或 core 抛错时原样冒泡（由 dispatch 统一处理）
    */
   async run(e: AnyEvent, core: () => Promise<void>): Promise<void> {
-    const chain = this.#byKind.get(e.kind)
+    // 数组是写时复制的（见 `register()`）：中间件里再注册新中间件不会让本次执行的链变长，
+    // 故直接拿引用即是快照，不必每条消息复制一份
+    const list = this.#byKind.get(e.kind)
     // 没有中间件时直接执行核心逻辑，一个闭包都不分配
-    if (chain === undefined || chain.length === 0) {
+    if (list === undefined || list.length === 0) {
       if (!e.stopped) await core()
       return
     }
-
-    // 取快照：中间件里调 ctx.middleware() 注册新中间件不该影响本次执行，
-    // 否则同一条消息的处理链会在跑的过程中变长，行为不可复现
-    const list = chain.slice()
 
     /**
      * 递归执行第 i 层
@@ -171,7 +170,7 @@ export class MiddlewarePipeline implements MiddlewareSink {
   /** 清空全部登记 */
   clear(): void {
     this.#all.clear()
-    for (const list of this.#byKind.values()) list.length = 0
+    for (const kind of ALL_KINDS) this.#byKind.set(kind, [])
   }
 
   /**
@@ -191,9 +190,8 @@ export class MiddlewarePipeline implements MiddlewareSink {
    */
   #remove(reg: MiddlewareRegistration): void {
     if (!this.#all.delete(reg)) return
-    for (const list of this.#byKind.values()) {
-      const at = list.indexOf(reg)
-      if (at >= 0) list.splice(at, 1)
+    for (const [kind, list] of this.#byKind) {
+      if (list.includes(reg)) this.#byKind.set(kind, list.filter(item => item !== reg))
     }
   }
 }

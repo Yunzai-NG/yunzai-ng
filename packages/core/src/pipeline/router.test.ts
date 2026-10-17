@@ -179,6 +179,16 @@ describe("正则模式", () => {
 })
 
 describe("首字符分桶", () => {
+  it("以 emoji 等代理对字符开头的命令照样分得进桶、命中得了", () => {
+    const { router } = make()
+    router.register(reg("🎲掷骰"))
+    router.register(reg("🎮", {}, "other"))
+
+    expect(hits(router, "🎲掷骰 2d6")).toEqual(["p"])
+    // 两个 emoji 的高位代理相同（都是 \uD83C），按 UTF-16 单元分桶会把它们分进同一个桶
+    expect(hits(router, "🎮")).toEqual(["other"])
+  })
+
   it("首字符不同的命令连 exec 都不会被调到", () => {
     const { router } = make()
     const re = /^#ping/

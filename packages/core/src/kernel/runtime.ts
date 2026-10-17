@@ -227,7 +227,9 @@ export function installRuntime(deps: RuntimeDeps): RuntimeParts {
 
   // ── 1. 消息管线 ───────────────────────────────────────────────────────
   const prompts = new PromptRegistry()
-  const factory = new EventFactory({ logger, policy, prompts })
+  // Bot 注册表提到最前：事件要靠它把处理途中失效的 Bot 换成新的，见 EventFactoryOptions.bots
+  const bots = new BotRegistry({ logger })
+  const factory = new EventFactory({ logger, policy, prompts, bots })
   const middlewares = new MiddlewarePipeline(logger)
   const router = new CommandRouter({ logger })
   const cooldown = new CooldownStore()
@@ -257,7 +259,6 @@ export function installRuntime(deps: RuntimeDeps): RuntimeParts {
 
   // ── 3. 适配器与账号 ───────────────────────────────────────────────────
   const adapters = new AdapterRegistry({ logger })
-  const bots = new BotRegistry({ logger })
   const createHost = createAdapterHostFactory({
     logger,
     kv: kv.namespace(KV_ADAPTER),

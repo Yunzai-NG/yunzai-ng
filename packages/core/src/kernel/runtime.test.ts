@@ -59,6 +59,13 @@ export default {
       const next = await e.prompt({ tip: "要改成什么？" })
       await e.reply(next ? "已改为 " + next.text : "没等到")
     })
+    // 处理途中把提供适配器的插件（就是自己）重载掉，再回复：#更新插件 更新了适配器插件时就是这样
+    ctx.command("#换号").action(async e => {
+      const before = e.bot
+      await globalThis.__yzngReload()
+      globalThis.__yzngStale = before.closed
+      await e.reply("重连后照样回得出来")
+    })
 
     // 改写型中间件：验证改写 message 后 refresh() 的结果确实被命令路由看见
     ctx.middleware(async (e, next) => {
@@ -152,8 +159,8 @@ describe("installRuntime 装配", () => {
     expect(app.subsystems.adapters).toBe(app.runtime.adapters)
     expect(app.subsystems.bots).toBe(app.runtime.bots)
     expect(app.subsystems.accounts).toBe(app.runtime.accounts)
-    // registries 是新造的闭包，只能验行为：夹具插件注册了 5 条命令
-    expect(app.subsystems.registries.commands()).toHaveLength(5)
+    // registries 是新造的闭包，只能验行为：夹具插件注册了 6 条命令
+    expect(app.subsystems.registries.commands()).toHaveLength(6)
 
     // AppView 是活的：装配期填的子系统立刻能从插件那一侧看到
     expect(app.view.adapters.list().map(a => a.id)).toEqual(["mock"])
@@ -281,6 +288,31 @@ describe("消息链路", () => {
 })
 
 describe("适配器生命周期", () => {
+  /*
+   * 处理途中账号重连，回复照样发得出去
+   *
+   * 真实例子：`#更新插件` 更新了 adapter-napcat 并重载它，账号随之断开重连，命令最后那句
+   * 「已重载」用的还是事件构造时的 Bot —— 它已关闭，报「账号已断开，这个 Bot 句柄失效了」。
+   */
+  it("命令处理途中适配器插件被重载，e.reply 换用同一账号的新 Bot", async () => {
+    const { app, mock } = await boot()
+    await login(app)
+    const g = globalThis as unknown as { __yzngReload?: () => Promise<boolean>; __yzngStale?: boolean }
+    g.__yzngReload = () => app.plugins.reload(PLUGIN)
+    try {
+      mock.driver.receivePrivate("#换号")
+
+      const [reply] = await mock.waitForSend()
+      expect(reply?.text).toBe("重连后照样回得出来")
+      // 确认真的经历了一次失效：事件起初那个 Bot 已关闭，重连建了一个新驱动
+      expect(g.__yzngStale).toBe(true)
+      expect(mock.driver.disconnects).toBe(1)
+    } finally {
+      delete g.__yzngReload
+      delete g.__yzngStale
+    }
+  })
+
   it("适配器插件卸载后账号自动下线", async () => {
     const { app, mock } = await boot()
     const id = await login(app)

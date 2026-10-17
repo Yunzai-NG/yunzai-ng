@@ -355,6 +355,33 @@ describe("注册表维护", () => {
     expect(trace).toEqual(["乙>", "core", "乙<"])
   })
 
+  it("执行途中注册与注销中间件，只影响下一条事件，不改本次的链", async () => {
+    const { pipe } = make()
+    const trace: string[] = []
+    const late = reg("丙", tracer("丙", trace))
+    let off: (() => void) | undefined
+    const second = reg("乙", tracer("乙", trace))
+    pipe.register(
+      reg("甲", async (_e, next) => {
+        trace.push("甲>")
+        // 本次执行中：加一个新的、摘掉排在后面的那个
+        off ??= pipe.register(late)
+        pipe.removePlugin("乙")
+        await next()
+        trace.push("甲<")
+      })
+    )
+    pipe.register(second)
+
+    await run(pipe, ev(), core(trace))
+    expect(trace).toEqual(["甲>", "乙>", "core", "乙<", "甲<"])
+
+    trace.length = 0
+    await run(pipe, ev(), core(trace))
+    expect(trace).toEqual(["甲>", "丙>", "core", "丙<", "甲<"])
+    off?.()
+  })
+
   it("clear 清空全部大类的桶", async () => {
     const { pipe } = make()
     const trace: string[] = []

@@ -98,6 +98,8 @@ export interface BotFacadeOptions {
 export interface BotFacade extends BotApi {
   /** 账号记录 id（`BotApi` 里没有，注册表与 WebUI 用它定位） */
   readonly accountId: string
+  /** 是否已关闭（账号断开过）；关闭后同一账号重连会得到一个新门面 */
+  readonly closed: boolean
   /**
    * 关闭门面
    *
@@ -358,6 +360,9 @@ export function createBotFacade(opts: BotFacadeOptions): BotFacade {
     get caps(): ReadonlySet<BotCapability> {
       return driver.caps
     },
+    get closed(): boolean {
+      return closed
+    },
     sendMessage,
     // 以下透传方法全部写成 async：`ensureAlive()` 若同步抛出，
     // 调用方的 `.catch()` 接不住，会变成一个 unhandled 异常
@@ -420,6 +425,40 @@ export function createBotFacade(opts: BotFacadeOptions): BotFacade {
   return facade
 }
 
+/** 门面关闭后，等同一账号重连的上限毫秒；适配器插件重载后连回来通常一两秒 */
+const LIVE_WAIT_MS = 10_000
+
+/**
+ * 把手里可能已失效的 Bot 换成同一账号当前在用的那个
+ *
+ * 事件对象靠它跨过「处理途中账号重连」：一条长命令跑到一半，适配器插件被重载（`#更新插件`
+ * 就会这样），事件里那个门面已关，回复却还该发到同一个会话。
+ */
+export interface LiveBotResolver {
+  /**
+   * 取可用的 Bot，账号重连中时等一会儿
+   * @param bot 原 Bot
+   * @returns 可用的 Bot；等不到时原样返回
+   */
+  live(bot: BotApi): Promise<BotApi>
+  /**
+   * 取可用的 Bot，不等
+   * @param bot 原 Bot
+   * @returns 可用的 Bot；账号还没连回来时原样返回
+   */
+  current(bot: BotApi): BotApi
+}
+
+/**
+ * 已关闭门面的账号记录 id
+ * @param bot 任意 Bot（测试里的假 Bot 没有 `closed`）
+ * @returns 账号记录 id；没关闭或不是门面时 undefined
+ */
+function closedAccountOf(bot: BotApi): string | undefined {
+  const facade = bot as Partial<BotFacade>
+  return facade.closed === true && typeof facade.accountId === "string" ? facade.accountId : undefined
+}
+
 /** 注册表内部条目 */
 interface BotEntry {
   /** 门面 */
@@ -446,13 +485,15 @@ export interface BotRegistryOptions {
  * 因此账号管理器在 `connect()` 成功后才 `add`，断开时立刻 `remove`。
  * 让离线账号留在表里会让插件的 `pickBot()` 拿到一个永远发不出消息的壳子。
  */
-export class BotRegistry implements BotRegistryView {
+export class BotRegistry implements BotRegistryView, LiveBotResolver {
   /** 日志器 */
   readonly #logger: Logger
   /** 账号记录 id → 条目 */
   readonly #byAccount = new Map<string, BotEntry>()
   /** 平台 selfId → 条目（同一个 QQ 可能有两条账号记录，例如正向 WS 与 HTTP 各一条） */
   readonly #bySelfId = new Map<string, BotEntry[]>()
+  /** 账号记录 id → 等它重新登记的回调，见 `live()` */
+  readonly #waiters = new Map<string, Set<(facade: BotFacade) => void>>()
 
   /**
    * @param opts 构造参数
@@ -499,7 +540,61 @@ export class BotRegistry implements BotRegistryView {
       // 但这意味着 bySelfId 存在歧义，此处提示一句，以免排障时误判至他处
       this.#logger.info(`账号 ${facade.selfId} 有 ${list.length} 条链路在线，bySelfId 只会返回其中一条`)
     }
+
+    const waiters = this.#waiters.get(facade.accountId)
+    if (waiters !== undefined) {
+      this.#waiters.delete(facade.accountId)
+      for (const wake of waiters) wake(facade)
+    }
     return previous
+  }
+
+  /**
+   * 换成同一账号当前在用的门面
+   *
+   * 门面没关就原样返回。关了（账号断开过：适配器插件被重载、连接掉线）就取这个账号的新门面；
+   * 还在重连就等它一会儿 —— 适配器重载后账号是异步连回来的。等不到就交回原门面，
+   * 由它报「已断开」那句明确的错。
+   * @param bot 事件或插件手里的 Bot
+   * @param timeout 最多等多少毫秒
+   * @returns 可用的 Bot
+   */
+  async live(bot: BotApi, timeout = LIVE_WAIT_MS): Promise<BotApi> {
+    const accountId = closedAccountOf(bot)
+    if (accountId === undefined) return bot
+    const now = this.#byAccount.get(accountId)?.facade
+    if (now !== undefined) return now
+
+    return await new Promise<BotApi>(resolve => {
+      let bucket = this.#waiters.get(accountId)
+      if (bucket === undefined) {
+        bucket = new Set()
+        this.#waiters.set(accountId, bucket)
+      }
+      const wake = (facade: BotFacade): void => {
+        clearTimeout(timer)
+        resolve(facade)
+      }
+      const timer = setTimeout(() => {
+        bucket.delete(wake)
+        if (bucket.size === 0 && this.#waiters.get(accountId) === bucket) this.#waiters.delete(accountId)
+        resolve(bot)
+      }, timeout)
+      // 等重连不该拖住停机
+      timer.unref?.()
+      bucket.add(wake)
+    })
+  }
+
+  /**
+   * `live()` 的同步版：不等，只换已经在线的那个
+   * @param bot 事件或插件手里的 Bot
+   * @returns 可用的 Bot；账号还没连回来时原样返回
+   */
+  current(bot: BotApi): BotApi {
+    const accountId = closedAccountOf(bot)
+    if (accountId === undefined) return bot
+    return this.#byAccount.get(accountId)?.facade ?? bot
   }
 
   /**

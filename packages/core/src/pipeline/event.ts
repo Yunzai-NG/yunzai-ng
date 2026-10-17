@@ -109,6 +109,26 @@ export interface RuntimeMessageEvent extends MessageEvent {
   bind(view: PluginRuntimeView | undefined): void
 }
 
+/**
+ * 把可能已失效的 Bot 换成同一账号当前在用的那个
+ *
+ * 由 Bot 注册表实现（`adapter/bots.ts`），此处只声明用到的形状。
+ */
+export interface LiveBotView {
+  /**
+   * 取可用的 Bot，账号重连中时等一会儿
+   * @param bot 原 Bot
+   * @returns 可用的 Bot；等不到时原样返回
+   */
+  live(bot: BotApi): Promise<BotApi>
+  /**
+   * 取可用的 Bot，不等
+   * @param bot 原 Bot
+   * @returns 可用的 Bot
+   */
+  current(bot: BotApi): BotApi
+}
+
 /** 事件工厂构造参数 */
 export interface EventFactoryOptions {
   /** 日志器 */
@@ -117,6 +137,23 @@ export interface EventFactoryOptions {
   readonly policy: EventPolicyView
   /** `prompt` 等待者登记表 */
   readonly prompts: PromptRegistry
+  /**
+   * 换新失效 Bot 的入口；省略则事件始终用构造时那个 Bot
+   *
+   * 一条命令跑到一半账号重连了（适配器插件被重载就会），事件手里的 Bot 已关闭，
+   * 回复却还该发到同一个会话 —— 没有它，`e.reply()` 报「账号已断开」。
+   */
+  readonly bots?: LiveBotView
+}
+
+/**
+ * 取可用于发送的 Bot
+ * @param bot 事件构造时的 Bot
+ * @param bots 换新入口
+ * @returns 可用的 Bot
+ */
+async function liveBot(bot: BotApi, bots: LiveBotView | undefined): Promise<BotApi> {
+  return bots === undefined ? bot : await bots.live(bot)
 }
 
 /**
@@ -155,12 +192,13 @@ class MessageEventImpl implements RuntimeMessageEvent {
   readonly platform: string
   /** 接收该事件的账号 id */
   readonly selfId: string
-  /** 接收该事件的 Bot */
-  readonly bot: BotApi
   /** 平台原始报文 */
   readonly raw: unknown
   /** 本次事件的临时状态袋 */
   readonly state: Record<string, unknown> = {}
+
+  /** 构造时的 Bot；账号重连后换新，见 `bot` */
+  #bot: BotApi
 
   /** 场景 */
   readonly scene: MessageScene
@@ -188,6 +226,8 @@ class MessageEventImpl implements RuntimeMessageEvent {
   /** 命令匹配结果 */
   command?: CommandMatch
 
+  /** 工厂依赖 */
+  readonly #opts: EventFactoryOptions
   /** 日志器 */
   readonly #logger: Logger
   /** 策略视图 */
@@ -219,6 +259,7 @@ class MessageEventImpl implements RuntimeMessageEvent {
    * @param opts 工厂依赖
    */
   constructor(incoming: IncomingMessageEvent, bot: BotApi, opts: EventFactoryOptions) {
+    this.#opts = opts
     this.#logger = opts.logger
     this.#policy = opts.policy
     this.#prompts = opts.prompts
@@ -227,7 +268,7 @@ class MessageEventImpl implements RuntimeMessageEvent {
     this.time = incoming.time ?? Date.now()
     this.platform = bot.platform
     this.selfId = bot.selfId
-    this.bot = bot
+    this.#bot = bot
     this.raw = incoming.raw
 
     this.scene = incoming.scene
@@ -246,6 +287,17 @@ class MessageEventImpl implements RuntimeMessageEvent {
     this.#isMaster = opts.policy.isMaster(incoming.sender.uid)
     this.#target = this.#computeTarget()
     this.refresh()
+  }
+
+  /**
+   * 接收该事件的 Bot
+   *
+   * 账号在处理途中重连过（如适配器插件被重载），给的是同一账号的新 Bot，而不是那个已关闭的。
+   */
+  get bot(): BotApi {
+    const bots = this.#opts.bots
+    if (bots !== undefined) this.#bot = bots.current(this.#bot)
+    return this.#bot
   }
 
   /** 是否 @ 了自己（含 @全体、含昵称呼唤） */
@@ -372,7 +424,8 @@ class MessageEventImpl implements RuntimeMessageEvent {
     if (opts.autoForward !== undefined) send.autoForward = opts.autoForward
     if (opts.splitLength !== undefined) send.splitLength = opts.splitLength
 
-    return this.bot.sendMessage(this.#target, payload, send)
+    this.#bot = await liveBot(this.#bot, this.#opts.bots)
+    return this.#bot.sendMessage(this.#target, payload, send)
   }
 
   /**
@@ -462,9 +515,10 @@ class MessageEventImpl implements RuntimeMessageEvent {
    * @returns 是否成功
    */
   async recall(): Promise<boolean> {
-    if (!this.bot.caps.has("recall")) return false
+    this.#bot = await liveBot(this.#bot, this.#opts.bots)
+    if (!this.#bot.caps.has("recall")) return false
     try {
-      return await this.bot.recallMessage(this.messageId)
+      return await this.#bot.recallMessage(this.messageId)
     } catch (err) {
       // 撤回失败是家常便饭（超过 2 分钟、没有管理权限），不值得往上抛
       this.#logger.debug(`撤回消息 ${this.messageId} 失败：${errText(err)}`)
@@ -593,6 +647,7 @@ export class EventFactory {
    */
   createNotice(incoming: IncomingNoticeEvent, bot: BotApi): NoticeEvent {
     const target = noticeTargetOf(incoming)
+    const bots = this.#opts.bots
     let stopped = false
     const event = {
       ...incoming,
@@ -620,7 +675,7 @@ export class EventFactory {
         if (target === undefined) {
           throw new Error(`通知事件 ${incoming.noticeType} 没有可回复的会话（既无群号也无用户 id）`)
         }
-        return bot.sendMessage(target, content)
+        return (await liveBot(bot, bots)).sendMessage(target, content)
       }
     }
     return event as NoticeEvent
@@ -643,18 +698,20 @@ export class EventFactory {
      * @param approve 是否同意
      * @param extra 备注或理由
      */
+    const bots = this.#opts.bots
     const handle = async (approve: boolean, extra?: string): Promise<void> => {
+      const live = await liveBot(bot, bots)
       if (incoming.requestType === "friend") {
-        if (bot.handleFriendRequest === undefined) {
-          throw new Error(`账号 ${bot.selfId} 的适配器未实现处理好友请求`)
+        if (live.handleFriendRequest === undefined) {
+          throw new Error(`账号 ${live.selfId} 的适配器未实现处理好友请求`)
         }
-        await bot.handleFriendRequest(incoming.flag, approve, approve ? extra : undefined)
+        await live.handleFriendRequest(incoming.flag, approve, approve ? extra : undefined)
         return
       }
-      if (bot.handleGroupRequest === undefined) {
-        throw new Error(`账号 ${bot.selfId} 的适配器未实现处理加群请求`)
+      if (live.handleGroupRequest === undefined) {
+        throw new Error(`账号 ${live.selfId} 的适配器未实现处理加群请求`)
       }
-      await bot.handleGroupRequest(incoming.flag, approve, approve ? undefined : extra)
+      await live.handleGroupRequest(incoming.flag, approve, approve ? undefined : extra)
     }
 
     const event = {
