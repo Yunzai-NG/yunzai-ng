@@ -7,8 +7,8 @@
  *          若予放行，症状将表现为写入配置时一个无从解释的 ENOENT，或更为严重的情形：
  *          一个插件读写到了其他插件的 KV 命名空间。
  */
-import { describe, expect, it } from "vitest"
-import { definePlugin, isPluginDefinition, looksLikePlugin } from "./define.js"
+import { describe, expect, expectTypeOf, it } from "vitest"
+import { authorOf, definePlugin, isPluginDefinition, looksLikePlugin, resolvePlugin } from "./define.js"
 import { s } from "../config/schema.js"
 
 /** 品牌标记用的注册表符号（插件与内核可能来自不同模块实例，故用 Symbol.for） */
@@ -53,9 +53,32 @@ describe("definePlugin", () => {
     }).toThrow()
   })
 
-  it("缺 name 就抛错", () => {
-    expect(() => definePlugin({ setup: () => undefined } as never)).toThrow(/缺少 name/)
+  it("返回类型随 name 写没写而定，配置类型照旧推到 setup 里", () => {
+    const named = definePlugin({ name: "demo", setup: () => undefined })
+    expectTypeOf(named.name).toEqualTypeOf<string>()
+
+    const anon = definePlugin({
+      configSchema: s.object({ cookie: s.string().default("") }),
+      setup(ctx) {
+        expectTypeOf(ctx.config.get().cookie).toEqualTypeOf<string>()
+      }
+    })
+    expectTypeOf(anon.name).toEqualTypeOf<string | undefined>()
+  })
+
+  it("**name 可省**：留给宿主从 package.json 补，产物照样带品牌", () => {
+    const def = definePlugin({ setup: () => undefined })
+    expect(def.name).toBeUndefined()
+    expect(isPluginDefinition(def)).toBe(true)
+  })
+
+  it("写了 name 却是空串或不是字符串仍抛错 —— 那是写错了，不是省略", () => {
     expect(() => definePlugin({ name: "", setup: () => undefined })).toThrow(/缺少 name/)
+    expect(() => definePlugin({ name: 1, setup: () => undefined } as never)).toThrow(/必须是字符串/)
+  })
+
+  it("省了 name 时报错里说「这个插件」，不印出 undefined", () => {
+    expect(() => definePlugin({ priority: Number.NaN, setup: () => undefined })).toThrow(/这个插件的 priority/)
   })
 
   it("非法插件名抛错并说明规则", () => {
@@ -86,6 +109,67 @@ describe("definePlugin", () => {
     expect(() => definePlugin({ name: "demo", priority: Number.NaN, setup: () => undefined })).toThrow(
       /priority 必须是数字/
     )
+  })
+})
+
+describe("resolvePlugin", () => {
+  const FALLBACK = {
+    name: "from-pkg",
+    version: "2.0.0",
+    description: "包里的说明",
+    author: "包作者",
+    homepage: "https://example.com"
+  }
+
+  it("省掉的几项从 package.json 补齐，品牌标记照旧", () => {
+    const def = resolvePlugin(definePlugin({ setup: () => undefined }), FALLBACK)
+    expect(def).toMatchObject(FALLBACK)
+    expect(isPluginDefinition(def)).toBe(true)
+  })
+
+  it("**定义里写了的一律优先** —— 升级内核不改变已装插件的名字与版本", () => {
+    const def = resolvePlugin(definePlugin({ name: "mine", version: "1.0.0", setup: () => undefined }), FALLBACK)
+    expect(def.name).toBe("mine")
+    expect(def.version).toBe("1.0.0")
+    expect(def.description).toBe("包里的说明")
+  })
+
+  it("返回冻结的新对象，不动原定义 —— 热重载会再 import 同一个模块", () => {
+    const declared = definePlugin({ setup: () => undefined })
+    const def = resolvePlugin(declared, FALLBACK)
+    expect(def).not.toBe(declared)
+    expect(declared.name).toBeUndefined()
+    expect(Object.isFrozen(def)).toBe(true)
+  })
+
+  it("**补来的名字也要合法**：目录名能带中文与空格，报错指出名字从哪来、怎么办", () => {
+    expect(() => resolvePlugin(definePlugin({ setup: () => undefined }), { name: "我的小功能" })).toThrow(
+      /取自 package\.json 或目录名.*不合法/
+    )
+  })
+
+  it("两边都没有名字时抛错", () => {
+    expect(() => resolvePlugin(definePlugin({ setup: () => undefined }), {})).toThrow(/没有名字/)
+  })
+
+  it("补来的名字撞上自己的依赖时抛错", () => {
+    expect(() => resolvePlugin(definePlugin({ dependencies: ["from-pkg"], setup: () => undefined }), FALLBACK)).toThrow(
+      /依赖了自己/
+    )
+  })
+
+  it("package.json 里的空串不算有值", () => {
+    const def = resolvePlugin(definePlugin({ setup: () => undefined }), { name: "x", description: "" })
+    expect(def).not.toHaveProperty("description")
+  })
+})
+
+describe("authorOf", () => {
+  it("字符串与 { name } 两种写法都认，其余给 undefined", () => {
+    expect(authorOf("someone")).toBe("someone")
+    expect(authorOf({ name: "someone", email: "a@b" })).toBe("someone")
+    expect(authorOf({ email: "a@b" })).toBeUndefined()
+    expect(authorOf(undefined)).toBeUndefined()
   })
 })
 

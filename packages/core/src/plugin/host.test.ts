@@ -277,6 +277,75 @@ describe("PluginHost 加载", () => {
     expect(h.host.get("real-name")).toBeDefined()
   })
 
+  it("**定义里只写 setup 时，名字、版本、说明、作者都取 package.json**", async () => {
+    const h = await makeHarness()
+    await writePlugin(
+      h,
+      "anon-dir",
+      `${BRAND}export default {
+        setup(ctx) { globalThis.__yzngMarks.push(ctx.name + "@" + ctx.version) },
+        [brand]: true
+      }`,
+      {
+        name: "@scope/anon-plugin",
+        version: "3.1.4",
+        description: "包里的说明",
+        author: { name: "包作者", email: "a@b" },
+        yunzai: { name: "anon" }
+      }
+    )
+
+    const report = await h.host.loadAll()
+
+    expect(report.loaded).toEqual(["anon"])
+    expect(h.host.get("anon")).toMatchObject({ version: "3.1.4", description: "包里的说明", author: "包作者" })
+    expect(marks()).toEqual(["anon@3.1.4"])
+  })
+
+  it("没有 yunzai.name 时取去掉 scope 的包名", async () => {
+    const h = await makeHarness()
+    await writePlugin(h, "some-dir", `${BRAND}export default { setup() {}, [brand]: true }`, {
+      name: "@scope/pkg-name",
+      version: "1.0.0"
+    })
+
+    expect((await h.host.loadAll()).loaded).toEqual(["pkg-name"])
+  })
+
+  it("没有 package.json 的单文件插件取文件名", async () => {
+    const h = await makeHarness()
+    await writeFile(join(h.pluginsDir, "tiny.js"), `${BRAND}export default { setup() {}, [brand]: true }`, "utf8")
+
+    expect((await h.host.loadAll()).loaded).toEqual(["tiny"])
+  })
+
+  it("**补来的名字不合法时只废掉这一个**，报错指出名字从哪来", async () => {
+    const h = await makeHarness()
+    await writePlugin(h, "bad-dir", `${BRAND}export default { setup() {}, [brand]: true }`, {
+      name: "bad-dir",
+      yunzai: { name: "1bad" }
+    })
+    await writePlugin(h, "fine", `export default { name: "fine", setup() {} }`)
+
+    const report = await h.host.loadAll()
+
+    expect(report.loaded).toEqual(["fine"])
+    expect(report.failed.find(item => item.name === "1bad")?.reason).toMatch(/取自 package\.json 或目录名.*不合法/)
+  })
+
+  it("入口写的版本与 package.json 不一致时以入口为准，并警告删掉入口那一份", async () => {
+    const h = await makeHarness()
+    await writePlugin(h, "drift", `export default { name: "drift", version: "1.0.0", setup() {} }`, {
+      name: "drift",
+      version: "1.2.0"
+    })
+
+    await h.host.loadAll()
+
+    expect(h.host.get("drift")?.version).toBe("1.0.0")
+    expect(h.logger.lines.some(l => l.includes("1.0.0") && l.includes("1.2.0") && l.includes("删掉"))).toBe(true)
+  })
+
   it("被禁用的插件不加载", async () => {
     const h = await makeHarness({ disabled: ["nope"] })
     await writePlugin(h, "nope", `export default { name: "nope", setup() {} }`)
@@ -379,7 +448,7 @@ describe("PluginHost 失败隔离", () => {
     await writePlugin(h, "weird", `export default 42`)
 
     const report = await h.host.loadAll()
-    expect(report.failed[0]?.reason).toContain("definePlugin({ name, setup })")
+    expect(report.failed[0]?.reason).toContain("definePlugin({ setup })")
   })
 
   it("依赖没安装的插件被跳过，原因说清怎么办", async () => {

@@ -59,10 +59,10 @@ interface PackageManifest {
 /** 一个待加载的插件候选 */
 export interface PluginCandidate {
   /**
-   * 名字线索（目录名或包名）
+   * 名字线索（`yunzai.name`、去 scope 的包名或目录名）
    *
-   * 真正的插件名以 `definePlugin({ name })` 为准；这个只用于导入失败时的日志，
-   * 因为那时候还读不到定义。
+   * 定义里写了 `name` 时以那个为准；没写时插件名就是这个（见 define.ts 的 `resolvePlugin`）。
+   * 导入失败时的日志也用它，因为那时候还读不到定义。
    */
   id: string
   /** 插件根目录绝对路径 */

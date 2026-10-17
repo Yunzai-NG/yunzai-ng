@@ -40,9 +40,8 @@ function scaffold(name: string): string {
  * 内核将各项能力经由 ctx 注入，插件无需（亦无法取得）任何全局变量。
  */
 export default definePlugin({
+  // 版本、说明与作者取自 package.json，发版时只改那一处；name 也可省（取 package.json 的 name）
   name: "${name}",
-  version: "0.1.0",
-  description: "Yunzai NG 插件骨架",
 
   // 声明配置 schema 即自动获得 config/${name}.yaml 以及面板中的一张表单，
   // 无需自行编写文件读写代码，亦无需为面板编写任何前端代码

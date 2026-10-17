@@ -620,7 +620,8 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
   /**
    * 找出装在 `plugins/<dir>` 里的那个插件的声明名
    *
-   * 市场按安装目录寻址，插件宿主按 `definePlugin({ name })` 的声明名寻址，两者常常不同。
+   * 市场按安装目录寻址，插件宿主按插件名寻址（`definePlugin({ name })`，省略时取 package.json），
+   * 两者常常不同。
    * 把目录名直接交给 `plugins.unload()` 会静默卸错对象或该卸的没卸，故按目录比对而非按名字。
    * @param dir 安装目录名
    * @returns 声明名；该目录下没有已知插件时 undefined

@@ -9,6 +9,25 @@
 `package.json`，而插件索引里的 `minCore` 说的也是内核版本。两者若脱节，使用者在面板上看到
 一个号、在发布说明与 tag 上看到另一个，无从对账。
 
+## 0.6.5 — 未发布
+
+| 包 | 版本 |
+|---|---|
+| `@yunzai-ng/core` | 0.6.4 → **0.6.5** |
+| `@yunzai-ng/cli` | 0.6.2 → **0.6.3** |
+
+### 变更
+
+- **`definePlugin` 的 `name` 可省，`version` / `description` / `author` / `homepage` 缺省一律取
+  package.json。** 这几项在 package.json 里本就有，在入口里再抄一份，发版时多半只记得改一处。
+  - 名字的来源依次是 `yunzai.name`、去掉 scope 的包名、目录名（单文件插件取文件名），与发现阶段
+    去重、禁用名单用的同一个名字。补来的名字不合法时只废掉这一个插件，报错说明名字从哪来。
+  - **入口里写了的照旧优先**，升级内核不改变任何已装插件的名字与版本。入口写的版本与
+    package.json 不一致时记一条警告，提示删掉入口那一份。
+  - 写了 `name` 的插件，`definePlugin` 的返回类型不变；省了的返回 `PluginDeclaration`（`name` 可空）。
+  - 依赖本行为的插件须把 `@yunzai-ng/core` 的下限抬到 0.6.5：更早的内核在 import 时就报「缺少 name」。
+- `yzng plugin new` 生成的入口不再重复写版本与说明。
+
 ## 0.6.4 — 2026-10-04
 
 | 包 | 版本 |

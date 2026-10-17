@@ -32,7 +32,14 @@ import { DisposalRegistry } from "../util/dispose.js"
 import { TimeoutError, withTimeout } from "../util/defer.js"
 import { ensureDir } from "../util/fs.js"
 import { createPluginContext, type PluginContextHandle, type PluginCounters } from "./context.js"
-import { isPluginDefinition, looksLikePlugin } from "./define.js"
+import {
+  authorOf,
+  isPluginDefinition,
+  looksLikePlugin,
+  resolvePlugin,
+  type PluginDeclaration,
+  type PluginFallback
+} from "./define.js"
 import { discoverPlugins, resolveLoadOrder, type PluginCandidate, type SkippedPlugin } from "./discover.js"
 import type { CoreEventBus } from "./events.js"
 import type { KernelHooks } from "./hooks.js"
@@ -397,16 +404,18 @@ export class PluginHost {
       const mod = (await import(spec)) as Record<string, unknown>
       const exported = mod["default"] ?? mod["plugin"]
 
-      if (isPluginDefinition(exported)) return exported
-      if (looksLikePlugin(exported)) {
+      let declared: PluginDeclaration | undefined
+      if (isPluginDefinition(exported)) declared = exported
+      else if (looksLikePlugin(exported)) {
         this.#logger.debug(`插件 ${candidate.id} 的定义没走 definePlugin，已按宽松规则接受（建议改用 definePlugin 以获得类型推导与校验）`)
-        return exported
+        declared = exported
       }
+      if (declared !== undefined) return this.#resolve(declared, candidate)
 
       const hint =
         exported === undefined
           ? "没有默认导出。请 `export default definePlugin({ ... })`"
-          : "默认导出不是插件定义。请确认用了 `definePlugin({ name, setup })`"
+          : "默认导出不是插件定义。请确认用了 `definePlugin({ setup })`"
       this.#markFailed(candidate.id, hint, candidate)
       this.#logger.error(`插件 ${candidate.id} 导入失败：${hint}（${candidate.entry}）`)
       return undefined
@@ -416,6 +425,37 @@ export class PluginHost {
       this.#logger.error(`插件 ${candidate.id} 导入出错：${reason}`, err)
       return undefined
     }
+  }
+
+  /**
+   * 用 package.json 补齐定义里省掉的元信息
+   *
+   * 名字缺省取 `candidate.id`（`yunzai.name` → 去 scope 的包名 → 目录名 / 文件名），与发现阶段
+   * 去重、禁用名单用的是同一个名字。补齐失败（多半是名字不合法）抛错，由 `#import` 记为导入失败。
+   *
+   * **入口写了版本、又与 package.json 不一致时记一条警告**：发版只改了一处是常事，而两处都显示在
+   * 面板上，读的人看不出该信哪个。仍以入口为准，不改已装插件的行为。
+   * @param declared 插件定义，可以省了名字
+   * @param candidate 候选，含 package.json
+   * @returns 补齐后的定义
+   */
+  #resolve(declared: PluginDeclaration, candidate: PluginCandidate): PluginDefinition {
+    const manifest = candidate.manifest
+    const fallback: PluginFallback = { name: candidate.id }
+    if (manifest?.version !== undefined) fallback.version = manifest.version
+    if (manifest?.description !== undefined) fallback.description = manifest.description
+    const author = authorOf(manifest?.author)
+    if (author !== undefined) fallback.author = author
+    if (typeof manifest?.homepage === "string") fallback.homepage = manifest.homepage
+
+    const definition = resolvePlugin(declared, fallback)
+    if (declared.version !== undefined && manifest?.version !== undefined && declared.version !== manifest.version) {
+      this.#logger.warn(
+        `插件 ${definition.name} 的入口里写的版本 ${declared.version} 与 package.json 的 ${manifest.version} 不一致，` +
+          `以入口为准。删掉 definePlugin 里的 version 即自动取 package.json 的版本`
+      )
+    }
+    return definition
   }
 
   /**
@@ -628,8 +668,7 @@ export class PluginHost {
     configured: boolean
   ): PluginState {
     const manifest = candidate.manifest
-    const author =
-      definition.author ?? (typeof manifest?.author === "string" ? manifest.author : manifest?.author?.name)
+    const author = definition.author ?? authorOf(manifest?.author)
 
     const state: PluginState = {
       name: definition.name,
