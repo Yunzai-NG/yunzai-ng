@@ -65,10 +65,12 @@ export interface PluginCandidate {
    * 导入失败时的日志也用它，因为那时候还读不到定义。
    */
   id: string
-  /** 插件根目录绝对路径 */
+  /** 插件根目录绝对路径；单文件插件是它所在的目录（`ctx.root` 即此） */
   dir: string
   /** 入口文件绝对路径 */
   entry: string
+  /** 是否单文件插件：没有属于自己的安装目录，`dir` 可能与别的插件共用 */
+  single?: boolean
   /** 是否为随发行版预置的插件 */
   builtin: boolean
   /** package.json 内容（若有） */
@@ -183,7 +185,13 @@ async function scanDir(root: string, builtin: boolean, logger: Logger): Promise<
     }
 
     const entry = await resolveEntry(dir, manifest)
-    if (!entry) {
+    if (entry) {
+      out.push({ id: idOf(dir, manifest), dir, entry, builtin, manifest })
+      continue
+    }
+
+    // 有 package.json 却没入口：是个没编译的包，不能把它的 eslint.config.js 之类当插件加载
+    if (manifest) {
       logger.warn(
         `插件目录 ${name} 里找不到入口文件：请提供 ${ENTRY_CANDIDATES.join(" / ")} 之一，` +
           `或在 package.json 的 main / yunzai.entry 里指明。若是 TypeScript 插件，请先编译`
@@ -191,19 +199,36 @@ async function scanDir(root: string, builtin: boolean, logger: Logger): Promise<
       continue
     }
 
-    out.push({ id: idOf(dir, manifest), dir, entry, builtin, manifest })
+    // 既无 package.json 也无入口：单文件插件的合集（plugins/example/ 那种），里面每个 js 各算一个
+    const files = await singleFiles(dir, builtin)
+    if (files.length === 0) logger.debug(`插件目录 ${name} 里没有入口文件，也没有单文件插件，跳过`)
+    out.push(...files)
   }
 
   // 顶层单文件插件：plugins/我的小功能.js。给"就想加个几十行小功能"的用户留的口子，
   // 不必为此建目录和 package.json
+  out.push(...(await singleFiles(root, builtin)))
+
+  return out
+}
+
+/**
+ * 列出一个目录顶层的单文件插件
+ *
+ * 只看顶层：子目录与 `_` 开头的文件留给插件之间共用的代码。
+ * @param dir 目录
+ * @param builtin 是否标记为内置
+ * @returns 候选数组，名字线索取文件名
+ */
+async function singleFiles(dir: string, builtin: boolean): Promise<PluginCandidate[]> {
+  const out: PluginCandidate[] = []
   for (const ext of SINGLE_FILE_EXT) {
-    for (const file of await listFiles(root, ext)) {
+    for (const file of await listFiles(dir, ext)) {
       const name = basename(file, ext)
       if (name.startsWith(".") || name.startsWith("_")) continue
-      out.push({ id: name, dir: root, entry: join(root, file), builtin })
+      out.push({ id: name, dir, entry: join(dir, file), single: true, builtin })
     }
   }
-
   return out
 }
 

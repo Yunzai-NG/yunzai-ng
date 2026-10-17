@@ -93,18 +93,25 @@ describe("discoverPlugins", () => {
     expect(found).toHaveLength(0)
   })
 
-  it("找不到入口时给出照着能解决的警告，而不是静默跳过", async () => {
+  it("有 package.json 却找不到入口时给出照着能解决的警告，而不是静默跳过", async () => {
     const dir = join(root, "broken")
     await mkdir(dir, { recursive: true })
-    await writeFile(join(dir, "readme.md"), "# 忘了写 index.js")
+    await writeFile(join(dir, "package.json"), JSON.stringify({ name: "broken" }))
 
     const logger = fakeLogger()
     const found = await discoverPlugins({ dirs: [root], logger })
 
     expect(found).toHaveLength(0)
-    const line = logger.lines.find(l => l.includes("broken"))
+    const line = logger.lines.find(l => l.startsWith("warn ") && l.includes("broken"))
     expect(line).toBeDefined()
     expect(line).toContain("index.js")
+  })
+
+  it("**没编译的包不把顶层的 js 当插件**：eslint.config.js 之类不是插件", async () => {
+    await makePlugin(root, "ts-plugin", { pkg: { name: "ts-plugin", main: "dist/index.js" }, entry: "eslint.config.js" })
+
+    const found = await discoverPlugins({ dirs: [root], logger: fakeLogger() })
+    expect(found).toEqual([])
   })
 
   it("支持顶层单文件插件", async () => {
@@ -113,7 +120,42 @@ describe("discoverPlugins", () => {
 
     const found = await discoverPlugins({ dirs: [root], logger: fakeLogger() })
     expect(found.map(f => f.id)).toEqual(["小功能"])
-    expect(found[0]?.dir).toBe(root)
+    expect(found[0]).toMatchObject({ dir: root, single: true })
+  })
+
+  it("**没有 package.json 也没有入口的目录是单文件合集**：顶层每个 js 各算一个，与 plugins/example 同用法", async () => {
+    const dir = join(root, "example")
+    await mkdir(join(dir, "lib"), { recursive: true })
+    await writeFile(join(dir, "早报.js"), "export default {}\n")
+    await writeFile(join(dir, "dice.mjs"), "export default {}\n")
+    await writeFile(join(dir, "_util.js"), "export const x = 1\n")
+    await writeFile(join(dir, "lib", "helper.js"), "export const y = 1\n")
+
+    const found = await discoverPlugins({ dirs: [root], logger: fakeLogger() })
+
+    expect(found.map(f => f.id).sort()).toEqual(["dice", "早报"])
+    for (const item of found) expect(item).toMatchObject({ dir, single: true, builtin: false })
+    expect(found.find(f => f.id === "dice")?.entry).toBe(join(dir, "dice.mjs"))
+  })
+
+  it("空的合集目录不出警告：plugins/example 默认就是空的", async () => {
+    await mkdir(join(root, "example"), { recursive: true })
+    await writeFile(join(root, "example", "readme.md"), "把 js 放这里")
+
+    const logger = fakeLogger()
+    const found = await discoverPlugins({ dirs: [root], logger })
+
+    expect(found).toEqual([])
+    expect(logger.lines.some(l => l.startsWith("warn "))).toBe(false)
+  })
+
+  it("带 index.js 的目录是一个插件，不再把同层的 js 各算一个", async () => {
+    await makePlugin(root, "pkg")
+    await writeFile(join(root, "pkg", "other.js"), "export default {}\n")
+
+    const found = await discoverPlugins({ dirs: [root], logger: fakeLogger() })
+    expect(found.map(f => f.id)).toEqual(["pkg"])
+    expect(found[0]?.single).toBeUndefined()
   })
 
   it("同名插件先扫到的胜出，并给出警告", async () => {

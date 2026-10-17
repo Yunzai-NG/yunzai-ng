@@ -319,6 +319,57 @@ describe("PluginHost 加载", () => {
     expect((await h.host.loadAll()).loaded).toEqual(["tiny"])
   })
 
+  it("**plugins/example 里的每个 js 各是一个插件**：根目录是 example，状态带上文件路径", async () => {
+    const h = await makeHarness()
+    const dir = join(h.pluginsDir, "example")
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "dice.js"), `${BRAND}export default { setup(ctx) { globalThis.__yzngMarks.push(ctx.root) }, [brand]: true }`, "utf8")
+    await writeFile(join(dir, "named.js"), `export default { name: "greet", setup() {} }`, "utf8")
+
+    const report = await h.host.loadAll()
+
+    expect(report.loaded.sort()).toEqual(["dice", "greet"])
+    expect(marks()).toEqual([dir])
+    expect(h.host.get("dice")).toMatchObject({ root: dir, file: join(dir, "dice.js") })
+    expect(h.host.get("greet")?.file).toBe(join(dir, "named.js"))
+  })
+
+  it("目录插件的状态里没有 file 字段", async () => {
+    const h = await makeHarness()
+    await writePlugin(h, "dirplug", `export default { name: "dirplug", setup() {} }`)
+
+    await h.host.loadAll()
+
+    expect(h.host.get("dirplug")).not.toHaveProperty("file")
+  })
+
+  it("**旧框架写法的插件导入失败时说清原因**：没有全局 plugin，要改写成 definePlugin", async () => {
+    const h = await makeHarness()
+    await mkdir(join(h.pluginsDir, "example"), { recursive: true })
+    await writeFile(
+      join(h.pluginsDir, "example", "legacy.js"),
+      `export class legacy extends plugin { constructor() { super({ name: "旧插件", rule: [] }) } }`,
+      "utf8"
+    )
+
+    const report = await h.host.loadAll()
+
+    const reason = report.failed.find(item => item.name === "legacy")?.reason
+    expect(reason).toMatch(/plugin is not defined.*Miao-Yunzai.*definePlugin/)
+    expect(h.host.get("legacy")?.file).toBe(join(h.pluginsDir, "example", "legacy.js"))
+  })
+
+  it("与旧框架无关的 ReferenceError 原样报出", async () => {
+    const h = await makeHarness()
+    await writeFile(join(h.pluginsDir, "oops.js"), `nope.call()\nexport default {}`, "utf8")
+
+    const report = await h.host.loadAll()
+
+    const reason = report.failed.find(item => item.name === "oops")?.reason ?? ""
+    expect(reason).toMatch(/nope is not defined/)
+    expect(reason).not.toMatch(/Miao-Yunzai/)
+  })
+
   it("**补来的名字不合法时只废掉这一个**，报错指出名字从哪来", async () => {
     const h = await makeHarness()
     await writePlugin(h, "bad-dir", `${BRAND}export default { setup() {}, [brand]: true }`, {
@@ -330,7 +381,7 @@ describe("PluginHost 加载", () => {
     const report = await h.host.loadAll()
 
     expect(report.loaded).toEqual(["fine"])
-    expect(report.failed.find(item => item.name === "1bad")?.reason).toMatch(/取自 package\.json 或目录名.*不合法/)
+    expect(report.failed.find(item => item.name === "1bad")?.reason).toMatch(/取自 package\.json、目录名或文件名.*不合法/)
   })
 
   it("入口写的版本与 package.json 不一致时以入口为准，并警告删掉入口那一份", async () => {

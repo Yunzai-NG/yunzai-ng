@@ -1139,6 +1139,45 @@ describe("面板 API", () => {
       expect(spies.plugins.unload).toHaveBeenCalledWith("relay-checkin")
     })
 
+    /*
+     * 单文件合集不归市场管
+     *
+     * `plugins/example/` 里装着好几个插件，`rm -rf` 那个目录会把它们一起带走 —— 而面板上点的
+     * 只是其中一个的「删除目录」。
+     */
+    it("目录里是单文件插件时，删除、更新、装依赖一律回 400，且不卸载、不动磁盘", async () => {
+      const example = join(dir, "example")
+      spies.plugins.list.mockReturnValue([
+        { name: "dice", version: "0.0.0", root: example, file: join(example, "dice.js"), status: "loaded" },
+        { name: "greet", version: "0.0.0", root: example, file: join(example, "greet.js"), status: "loaded" }
+      ])
+
+      for (const [method, url] of [
+        ["DELETE", "market/example"],
+        ["POST", "market/example/update"],
+        ["POST", "market/example/setup"]
+      ] as const) {
+        const res = await call(method, url, {})
+        expect(res.statusCode).toBe(400)
+        expect(String(res.json().error)).toMatch(/单文件插件（dice、greet）/)
+      }
+      expect(spies.plugins.unload).not.toHaveBeenCalled()
+      expect(spies.market.remove).not.toHaveBeenCalled()
+      expect(spies.market.update).not.toHaveBeenCalled()
+      expect(spies.market.setup).not.toHaveBeenCalled()
+    })
+
+    it("拿单文件插件的名字请求更新：回 400 说它不归市场管", async () => {
+      spies.plugins.list.mockReturnValue([
+        { name: "tiny", version: "0.0.0", root: dir, file: join(dir, "tiny.js"), status: "loaded" }
+      ])
+
+      const res = await call("POST", "market/tiny/update", {})
+      expect(res.statusCode).toBe(400)
+      expect(String(res.json().error)).toMatch(/单文件插件.*不归市场管/)
+      expect(spies.market.update).not.toHaveBeenCalled()
+    })
+
     it("未启用市场的部署一律回 501", async () => {
       off()
       const without: ApiDeps = { ...deps }

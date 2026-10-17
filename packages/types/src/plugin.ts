@@ -366,8 +366,14 @@ export interface PluginState {
   author?: string
   /** 仓库或主页地址，取自 `package.json` 的 `homepage` 或 `definePlugin` 同名字段；取不到时不出现 */
   homepage?: string
-  /** 安装目录 */
+  /** 安装目录；单文件插件是它所在的目录，可能与别的单文件插件共用 */
   root: string
+  /**
+   * 单文件插件的文件绝对路径；目录插件没有这个字段
+   *
+   * 有它即说明 `root` 不归这一个插件所有，按目录动手的操作（更新、删除目录）对它不适用。
+   */
+  file?: string
   /** 当前状态 */
   status: PluginStatus
   /** 出错时的信息 */

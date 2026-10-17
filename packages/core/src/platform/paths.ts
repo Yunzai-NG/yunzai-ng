@@ -251,10 +251,14 @@ export function resolvePaths(opts: ResolvePathsOptions = {}): RuntimePaths {
   })
 }
 
+/** 单文件插件的合集目录，在 `plugins/` 下；与 Miao-Yunzai 的 `plugins/example/` 同名同用法 */
+export const SINGLE_FILE_DIR = "example"
+
 /**
  * 创建目录布局里的所有目录
  *
- * `runtime` 不创建（它是安装目录，理应已存在且可能只读）。
+ * `runtime` 不创建（它是安装目录，理应已存在且可能只读）。`plugins/example/` 一并建好：
+ * 从旧框架过来的人第一反应是把 js 丢进那里。
  * @param paths 目录布局
  * @returns 传入的布局本身，便于链式使用
  * @throws 目录无法创建时抛出（磁盘只读、权限不足），此时应终止启动
@@ -266,7 +270,7 @@ export async function ensurePaths(paths: RuntimePaths): Promise<RuntimePaths> {
     ensureDir(paths.data),
     ensureDir(paths.logs),
     ensureDir(paths.temp),
-    ensureDir(paths.plugins),
+    ensureDir(join(paths.plugins, SINGLE_FILE_DIR)),
     ensureDir(paths.cache)
   ])
   return paths

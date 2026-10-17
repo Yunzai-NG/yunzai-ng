@@ -105,12 +105,15 @@ export interface PluginFallback {
  * 校验插件名
  * @param name 插件名
  * @param where 报错里说明这个名字从哪来，如「definePlugin：」
+ * @param advice 不合法时追加的办法
  * @throws 名字为空或不合法时
  */
-function checkName(name: string, where: string): void {
+function checkName(name: string, where: string, advice = ""): void {
   if (name.length === 0) throw new Error(`${where}缺少 name，插件必须有名字`)
   if (!NAME_RE.test(name)) {
-    throw new Error(`${where}插件名 ${name} 不合法。需以字母开头，只含字母、数字与 . - _（它同时是配置文件名与存储命名空间）`)
+    throw new Error(
+      `${where}插件名 ${name} 不合法。需以字母开头，只含字母、数字与 . - _（它同时是配置文件名与存储命名空间）${advice}`
+    )
   }
 }
 
@@ -174,7 +177,7 @@ export function definePlugin<
  * 用 package.json 一类来源补齐插件定义里省掉的元信息
  *
  * **定义里写了的一律优先**：老插件在入口里写的名字、版本照旧生效，升级内核不改变任何已装插件的身份。
- * 补齐之后才校验名字 —— 省了名字的插件，名字来自目录名时也可能不合法（目录名能带中文与空格）。
+ * 补齐之后才校验名字 —— 省了名字的插件，名字来自目录名或文件名时也可能不合法（两者都能带中文与空格）。
  *
  * 返回新对象而不改原定义：`definePlugin` 的产物是冻结的，且热重载会再 import 一次同一个模块。
  * @param declaration 插件定义，可以省了名字
@@ -193,7 +196,7 @@ export function resolvePlugin(declaration: PluginDeclaration, fallback: PluginFa
   }
   // 只校验补来的名字：写明的名字 definePlugin 已校验过，宽松接受的手写定义历来不校验，此处不改其行为
   if (declaration.name === undefined) {
-    checkName(name, `插件名取自 package.json 或目录名，`)
+    checkName(name, "插件名取自 package.json、目录名或文件名，", "。在 definePlugin 里写明 name 即可")
     if ((filled["dependencies"] as string[] | undefined)?.includes(name)) {
       throw new Error(`插件 ${name} 依赖了自己`)
     }

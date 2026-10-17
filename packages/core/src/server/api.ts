@@ -631,7 +631,27 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     const target = resolve(root, dir)
     // 只认 plugins 的直接子目录：空串、`..` 之类都在此挡下
     if (dirname(target) !== root) return undefined
-    return deps.plugins.list().find(state => state.root !== "" && resolve(state.root) === target)?.name
+    return deps.plugins
+      .list()
+      .find(state => state.file === undefined && state.root !== "" && resolve(state.root) === target)?.name
+  }
+
+  /**
+   * 目录里装的是单文件插件时，拒绝按目录动手
+   *
+   * `plugins/example/` 这种合集没有 package.json、不在索引里；删目录、整份重装会把里面每个插件一起带走。
+   * @param dir 安装目录名
+   * @throws 目录里有单文件插件时以 400 结束请求
+   */
+  const refuseSingles = (dir: string): void => {
+    const target = resolve(deps.paths.plugins, dir)
+    const singles = deps.plugins.list().filter(state => state.file !== undefined && resolve(state.root) === target)
+    if (singles.length === 0) return
+    throw fail(
+      400,
+      `目录 ${dir} 里是单文件插件（${singles.map(state => state.name).join("、")}），不是一个插件的安装目录。` +
+        `增删改直接动里面的 js 文件，改完在插件页重载`
+    )
   }
 
   /**
@@ -671,9 +691,13 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     onDirty: DirtyAction = "abort"
   ): Promise<Record<string, unknown>> => {
     const instance = market()
+    refuseSingles(name)
     const occupant = replace ? pluginInDir(name) : undefined
     // 市场按目录寻址，而插件列表显示的是声明名；两者不同名时改说该用哪个名字
     const mistaken = replace && occupant === undefined ? deps.plugins.list().find(s => s.name === name) : undefined
+    if (mistaken?.file !== undefined) {
+      throw fail(400, `插件 ${name} 是单文件插件（${mistaken.file}），没有安装目录，不归市场管。直接改那个文件即可`)
+    }
     if (mistaken !== undefined && mistaken.root !== "") {
       const dir = basename(mistaken.root)
       throw fail(400, `插件 ${name} 装在目录 ${dir} 里。市场按安装目录寻址，请改用 ${dir}`)
@@ -828,6 +852,7 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     const name = req.params.name ?? ""
     const body = req.body === undefined ? {} : objectOf(req.body)
     const load = optionalBoolean(body, "load") ?? true
+    refuseSingles(name)
     // 先卸载再跑：`build` 会覆盖 `dist/`，而旧模块还在内存里响应命令。
     // 卸的是这个目录里装着的那个插件，不是与目录同名的那个，见 `pluginInDir`
     const occupant = pluginInDir(name)
@@ -848,6 +873,7 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
   add("DELETE", "market/:name", async req => {
     requireWritable()
     const name = req.params.name ?? ""
+    refuseSingles(name)
     // 先卸载再删除目录：若目录已删除而插件仍在内存中运行，其命令仍会响应，
     // 而重启后则不再存在 —— 此类不一致比一次失败的卸载更难排查。
     // 同样按目录定位那个插件，见 `pluginInDir`

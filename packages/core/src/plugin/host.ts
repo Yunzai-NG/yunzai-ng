@@ -168,6 +168,24 @@ function describeError(err: unknown): string {
   return String(err)
 }
 
+/** Miao-Yunzai / TRSS 插件依赖的全局变量，本框架一个都不提供 */
+const LEGACY_GLOBALS = new Set(["plugin", "segment", "Bot", "redis", "logger", "Renderer"])
+
+/**
+ * 描述导入错误；撞上旧框架的全局变量时补一句该怎么办
+ *
+ * 旧插件放进来最常见的报错是 `plugin is not defined`（`class x extends plugin` 在模块顶层就求值），
+ * 单看这句猜不到原因是「框架换了」。
+ * @param err 错误
+ * @returns 错误描述
+ */
+function describeImportError(err: unknown): string {
+  const reason = describeError(err)
+  const missing = err instanceof ReferenceError ? /^(\w+) is not defined/.exec(err.message)?.[1] : undefined
+  if (missing === undefined || !LEGACY_GLOBALS.has(missing)) return reason
+  return `${reason}。这是 Miao-Yunzai / TRSS 写法的插件，本框架没有全局 ${missing}，须改写成 definePlugin（见文档「从 Miao-Yunzai 迁移」）`
+}
+
 /**
  * 插件宿主
  *
@@ -420,7 +438,7 @@ export class PluginHost {
       this.#logger.error(`插件 ${candidate.id} 导入失败：${hint}（${candidate.entry}）`)
       return undefined
     } catch (err) {
-      const reason = describeError(err)
+      const reason = describeImportError(err)
       this.#markFailed(candidate.id, reason, candidate)
       this.#logger.error(`插件 ${candidate.id} 导入出错：${reason}`, err)
       return undefined
@@ -636,7 +654,7 @@ export class PluginHost {
    * @param candidate 候选（有则能填出目录与内置标记）
    */
   #markFailed(name: string, reason: string, candidate?: PluginCandidate): void {
-    this.#states.set(name, {
+    const state: PluginState = {
       name,
       version: versionOf(undefined, candidate),
       root: candidate?.dir ?? "",
@@ -648,7 +666,9 @@ export class PluginHost {
       middlewares: 0,
       builtin: candidate?.builtin ?? false,
       configured: false
-    })
+    }
+    if (candidate?.single === true) state.file = candidate.entry
+    this.#states.set(name, state)
   }
 
   /**
@@ -682,6 +702,7 @@ export class PluginHost {
       builtin: candidate.builtin,
       configured
     }
+    if (candidate.single === true) state.file = candidate.entry
     const description = definition.description ?? manifest?.description
     if (description !== undefined) state.description = description
     if (author !== undefined) state.author = author

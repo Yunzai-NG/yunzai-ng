@@ -144,7 +144,7 @@ describe("resolvePlugin", () => {
 
   it("**补来的名字也要合法**：目录名能带中文与空格，报错指出名字从哪来、怎么办", () => {
     expect(() => resolvePlugin(definePlugin({ setup: () => undefined }), { name: "我的小功能" })).toThrow(
-      /取自 package\.json 或目录名.*不合法/
+      /取自 package\.json、目录名或文件名.*不合法.*写明 name/
     )
   })
 
