@@ -5,7 +5,7 @@
  * 注意事项：`resolveLoadOrder` 的**确定性**是重点断言对象 —— 同一份插件集合在任何机器上
  *          都须得到相同顺序，否则"甲机器正常、乙机器异常"会耗费大量排障时间。
  */
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
@@ -193,6 +193,24 @@ describe("discoverPlugins", () => {
     const found = await discoverPlugins({ dirs: ["./plugins"], logger })
     expect(found).toHaveLength(0)
     expect(logger.lines.some(l => l.includes("绝对路径"))).toBe(true)
+  })
+
+  it("**链进来的插件目录照样认**：开发时把仓库 junction / 软链进 plugins/ 是常态", async () => {
+    const elsewhere = await mkdtemp(join(tmpdir(), "yzng-linked-"))
+    try {
+      await makePlugin(elsewhere, "real-repo")
+      await symlink(join(elsewhere, "real-repo"), join(root, "linked"), "junction")
+      // 断链不报错、不出现
+      await symlink(join(elsewhere, "gone"), join(root, "dangling"), "junction")
+
+      const found = await discoverPlugins({ dirs: [root], logger: fakeLogger() })
+      expect(found.map(f => f.id)).toEqual(["linked"])
+      expect(found[0]?.entry).toBe(join(root, "linked", "index.js"))
+    } finally {
+      await unlink(join(root, "linked"))
+      await unlink(join(root, "dangling"))
+      await rm(elsewhere, { recursive: true, force: true })
+    }
   })
 
   it("目录不存在时安静返回空数组", async () => {

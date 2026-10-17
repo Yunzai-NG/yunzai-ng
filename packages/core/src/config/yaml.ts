@@ -9,8 +9,27 @@
  *          取舍：配置的主编辑面是 WebUI，文件是产物；换来的是注释永远与当前版本
  *          一致。文件里的**值**当然完整保留。
  */
-import { Document, isMap, isSeq, parse, type Node } from "yaml"
+import { createRequire } from "node:module"
+import type { Node } from "yaml"
 import type { SchemaDescriptor } from "@yunzai-ng/types"
+
+/** yaml 模块 */
+type YamlLib = typeof import("yaml")
+
+/** 已加载的 yaml；首次读写配置时才加载 */
+let yamlLib: YamlLib | undefined
+
+/**
+ * 取 yaml
+ *
+ * 首次用到时才 require（它是 CommonJS，同步取得的与 import 的是同一份）：约七十个模块、两百多毫秒，
+ * 而只用内核里一两个函数的进程（`yzng doctor`、`yzng update`）一个配置文件都不读。
+ * @returns yaml 模块
+ */
+function yaml(): YamlLib {
+  yamlLib ??= createRequire(import.meta.url)("yaml") as YamlLib
+  return yamlLib
+}
 
 /** 序列化选项 */
 export interface SerializeOptions {
@@ -28,7 +47,7 @@ export interface SerializeOptions {
  */
 export function parseYaml(text: string): unknown {
   if (text.trim() === "") return undefined
-  return parse(text, { merge: true })
+  return yaml().parse(text, { merge: true })
 }
 
 /**
@@ -38,7 +57,7 @@ export function parseYaml(text: string): unknown {
  * @returns YAML 文本（以换行结尾）
  */
 export function serializeYaml(value: unknown, opts: SerializeOptions = {}): string {
-  const doc = new Document(value)
+  const doc = new (yaml().Document)(value)
 
   if (opts.header && opts.header.length > 0) {
     doc.commentBefore = opts.header.map(line => ` ${line}`).join("\n")
@@ -57,6 +76,7 @@ export function serializeYaml(value: unknown, opts: SerializeOptions = {}): stri
  * @param descriptor 对应的表单描述
  */
 function annotate(node: Node, descriptor: SchemaDescriptor): void {
+  const { isMap, isSeq } = yaml()
   if (isMap(node) && descriptor.properties) {
     for (const item of node.items) {
       const key = item.key

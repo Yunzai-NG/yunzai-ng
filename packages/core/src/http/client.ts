@@ -16,7 +16,7 @@ import { dirname } from "node:path"
 import { pipeline as pipelineTo, type Readable } from "node:stream"
 import { pipeline } from "node:stream/promises"
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib"
-import { Agent, ProxyAgent, interceptors, request as undiciRequest, type Dispatcher } from "undici"
+import type { Agent, Dispatcher, ProxyAgent } from "undici"
 import type {
   HttpClient,
   HttpDefaults,
@@ -52,6 +52,23 @@ const MAX_RETRY_DELAY = 30_000
  * 取一个小值：够正在收尾的响应写完，又不至于让使用者在停机时干等。
  */
 const CLOSE_GRACE_MS = 500
+
+/** undici 模块 */
+type Undici = typeof import("undici")
+
+/** undici 的加载；首个请求时才发起 */
+let undiciLoad: Promise<Undici> | undefined
+
+/**
+ * 取 undici
+ *
+ * 动态 import：它有一百多个模块、约 0.45 秒，而多数进程（CLI 的多数命令、启动阶段）一个请求都不发。
+ * @returns undici 模块
+ */
+function undici(): Promise<Undici> {
+  undiciLoad ??= import("undici")
+  return undiciLoad
+}
 
 /** 查询串里需要打码的键（小写比对） */
 const SECRET_QUERY_KEYS: readonly string[] = [
@@ -143,6 +160,13 @@ export interface ManagedHttpClient extends HttpClient {
    * @returns 全部关闭后兑现
    */
   close(): Promise<void>
+  /**
+   * 预先加载底层 HTTP 实现
+   *
+   * 启动完成后调一次，首个请求就不必等它；不调也能用。
+   * @returns 加载完成后兑现
+   */
+  warmup(): Promise<void>
 }
 
 /** 一次请求最终生效的参数 */
@@ -452,15 +476,16 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
 
   /**
    * 取（或建）一个基础连接池
+   * @param lib undici 模块
    * @param proxy 代理地址；空串表示直连
    * @returns 连接池
    */
-  function baseAgent(proxy: string): Agent | ProxyAgent {
+  function baseAgent(lib: Undici, proxy: string): Agent | ProxyAgent {
     let agent = agents.get(proxy)
     if (agent) return agent
     agent = proxy
-      ? new ProxyAgent({ uri: proxy, connections, keepAliveTimeout: 10_000, keepAliveMaxTimeout: 60_000 })
-      : new Agent({ connections, keepAliveTimeout: 10_000, keepAliveMaxTimeout: 60_000 })
+      ? new lib.ProxyAgent({ uri: proxy, connections, keepAliveTimeout: 10_000, keepAliveMaxTimeout: 60_000 })
+      : new lib.Agent({ connections, keepAliveTimeout: 10_000, keepAliveMaxTimeout: 60_000 })
     agents.set(proxy, agent)
     return agent
   }
@@ -469,17 +494,18 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
    * 取（或建）一个带拦截器的派发器
    *
    * 拦截器只有「重定向次数」这一个变量，故每个代理最多缓存两份，不随请求数增长。
+   * @param lib undici 模块
    * @param proxy 代理地址；空串表示直连
    * @param redirections 跟随重定向次数
    * @returns 派发器
    */
-  function dispatcherFor(proxy: string, redirections: number): Dispatcher {
+  function dispatcherFor(lib: Undici, proxy: string, redirections: number): Dispatcher {
     const key = `${proxy}|${redirections}`
     let dispatcher = dispatchers.get(key)
     if (dispatcher) return dispatcher
     // 只装重定向拦截器。解压刻意不走 interceptors.decompress()，改在 once() 里
     // 手工套 zlib —— 理由见 decodeStream 的注释
-    dispatcher = baseAgent(proxy).compose(interceptors.redirect({ maxRedirections: redirections }))
+    dispatcher = baseAgent(lib, proxy).compose(lib.interceptors.redirect({ maxRedirections: redirections }))
     dispatchers.set(key, dispatcher)
     return dispatcher
   }
@@ -555,8 +581,11 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
 
       let res: Dispatcher.ResponseData
       try {
-        res = await undiciRequest(req.url, {
-          dispatcher: dispatcherFor(req.proxy === false ? "" : req.proxy, req.redirections),
+        const lib = await undici()
+        // 等加载的这一跳里 close() 可能已经发生：此时再建连接池就是关不掉的孤儿
+        if (closed) throw new Error("HTTP 客户端已关闭")
+        res = await lib.request(req.url, {
+          dispatcher: dispatcherFor(lib, req.proxy === false ? "" : req.proxy, req.redirections),
           method: req.method as Dispatcher.HttpMethod,
           headers: req.headers,
           ...(req.body === undefined ? {} : { body: req.body }),
@@ -757,6 +786,10 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
       },
 
       extend: (override: HttpDefaults): HttpClient => build({ ...defaults, ...override }),
+
+      warmup: async (): Promise<void> => {
+        await undici()
+      },
 
       close: async (): Promise<void> => {
         closed = true

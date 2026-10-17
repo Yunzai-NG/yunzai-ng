@@ -177,13 +177,21 @@ export async function writeJson(path: string, value: unknown, pretty = true): Pr
 
 /**
  * 列出目录下的子目录名
+ *
+ * 指向目录的符号链接与 junction 也算：开发时把插件仓库链进 `plugins/` 是常见做法，
+ * 而 `Dirent.isDirectory()` 对链接恒为假。断链静默跳过。
  * @param path 目录路径
  * @returns 子目录名数组；目录不存在时空数组
  */
 export async function listDirs(path: string): Promise<string[]> {
   try {
     const entries = await readdir(path, { withFileTypes: true })
-    return entries.filter(e => e.isDirectory()).map(e => e.name)
+    const out: string[] = []
+    for (const e of entries) {
+      if (e.isDirectory()) out.push(e.name)
+      else if (e.isSymbolicLink() && (await isDirectory(join(path, e.name)))) out.push(e.name)
+    }
+    return out
   } catch (err) {
     if (errorCode(err) === "ENOENT") return []
     throw err

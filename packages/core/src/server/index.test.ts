@@ -392,6 +392,33 @@ describe("ManagedServer", () => {
       expect(asset.headers["content-type"]).toMatch(/javascript/)
     })
 
+    it("缓存校验、Range 与 HEAD 照常：带 ETag 回 304，Range 回 206", async () => {
+      server.panel("plugin:webui", web)
+      const first = await server.raw.inject({ method: "GET", url: "/assets/app.js" })
+      const etag = first.headers["etag"]
+      expect(etag).toBeDefined()
+      expect(first.headers["last-modified"]).toBeDefined()
+
+      const again = await server.raw.inject({ method: "GET", url: "/assets/app.js", headers: { "if-none-match": String(etag) } })
+      expect(again.statusCode).toBe(304)
+
+      const part = await server.raw.inject({ method: "GET", url: "/assets/app.js", headers: { range: "bytes=0-6" } })
+      expect(part.statusCode).toBe(206)
+      expect(part.body).toBe("console")
+
+      const head = await server.raw.inject({ method: "HEAD", url: "/assets/app.js" })
+      expect(head.statusCode).toBe(200)
+      expect(head.headers["content-length"]).toBe(String("console.error(1)".length))
+    })
+
+    it("文件名带中文与空格照样取得到", async () => {
+      await writeFile(join(web, "assets", "图 1.txt"), "中文名", "utf8")
+      server.panel("plugin:webui", web)
+      const res = await server.raw.inject({ method: "GET", url: `/assets/${encodeURIComponent("图 1.txt")}` })
+      expect(res.statusCode).toBe(200)
+      expect(res.body).toBe("中文名")
+    })
+
     it("单页回退只对看起来像页面的路径生效", async () => {
       server.panel("plugin:webui", web)
       const page = await server.raw.inject({ method: "GET", url: "/plugins/list" })

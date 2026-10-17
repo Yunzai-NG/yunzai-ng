@@ -106,7 +106,7 @@ export class RotatingFileWriter {
   }
 
   /**
-   * 写入一行（调用方需自带换行符，pino 已带）
+   * 写入一行（调用方需自带换行符）
    * @param line 日志行
    */
   write(line: string): void {

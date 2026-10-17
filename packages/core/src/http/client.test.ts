@@ -219,6 +219,17 @@ beforeAll(async () => {
   const addr = server.address()
   if (addr === null || typeof addr === "string") throw new Error("测试服务器没拿到端口")
   base = `http://127.0.0.1:${addr.port}`
+  // undici 是首个请求时才加载的；先载好，免得这笔时间记在第一个用例的超时里
+  const warm = createHttpClient({ useEnvProxy: false })
+  await warm.warmup()
+  await warm.close()
+}, 30_000)
+
+it("warmup 之后 close，再发请求被拒而不是悄悄重建连接池", async () => {
+  const client = createHttpClient({ useEnvProxy: false })
+  await client.warmup()
+  await client.close()
+  await expect(client.get(`${base}/json`)).rejects.toThrow(/已关闭/)
 })
 
 afterEach(async () => {

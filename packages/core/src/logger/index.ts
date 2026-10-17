@@ -1,19 +1,65 @@
 /**
- * 模块职责：日志枢纽（pino 实例、控制台/文件双路输出、运行时改级别、尾部缓冲）
+ * 模块职责：日志枢纽（控制台/文件双路输出、运行时改级别、尾部缓冲）
  * 依赖方向：依赖 logger/format、logger/rotate、util
  * 生命周期：应用级单例，`close()` 时刷盘
  * 注意事项：三个不显然的决定 ——
- *          1) pino 实例常驻 trace，级别过滤放在包装层的 `#emit`：pino 的 child logger 在创建时
- *             固化 level，改父级不传播给已有子级，而面板上改级别必须立刻对所有插件生效
- *          2) 参数按 console.log 语义拼接（见 format.ts 的 `joinArgs`）：pino 原生只认第一个参数，
- *             `logger.info("查询", uid)` 会丢掉 uid
- *          3) 不用 pino.multistream：两路的级别过滤在自有 dispatcher 里做，同时写进环形缓冲，
- *             一次解析三处使用
+ *          1) 级别过滤只在枢纽一处：面板上改级别必须立刻对所有已派生的子日志器生效
+ *          2) 参数按 console.log 语义拼接（见 format.ts 的 `joinArgs`），`logger.info("查询", uid)` 不丢 uid
+ *          3) 直接构造记录、按需拼文件行，不经「序列化成 JSON 再解析回来」那一圈；文件行与 pino
+ *             的格式一致（`{"level":30,"time":…,…,"msg":…}`），旧日志与 `parseRecord` 照样通用
  */
-import pino from "pino"
 import type { Disposer, LogBindings, Logger, LogLevel } from "@yunzai-ng/types"
-import { LEVEL_VALUES, type LogRecord, formatRecord, joinArgs, parseRecord, supportsColor } from "./format.js"
+import {
+  LEVEL_VALUES,
+  RESERVED_KEYS,
+  type LogRecord,
+  formatRecord,
+  joinArgs,
+  safeStringify,
+  serializeError,
+  supportsColor
+} from "./format.js"
 import { RotatingFileWriter } from "./rotate.js"
+
+/** 一个日志器的固定字段，派生时算好，每条日志只拼接不重算 */
+interface Bound {
+  /** 作用域 */
+  scope?: string
+  /** 业务字段（不含保留键），给控制台与查看器 */
+  fields?: Record<string, unknown>
+  /** 文件行里 `"time":…` 之后、`"msg"` 之前那一段，形如 `,"scope":"x","n":5`；没有字段时空串 */
+  chunk: string
+}
+
+/** 根日志器的固定字段 */
+const ROOT_BOUND: Bound = { chunk: "" }
+
+/**
+ * 在已有固定字段上叠加一层
+ *
+ * 同名字段后者覆盖前者。值先过一遍 JSON 再取回：查看器与文件看到的是同一份东西，
+ * 也免得插件之后改了传进来的对象、日志跟着变。
+ * @param parent 上一层
+ * @param bindings 新增字段
+ * @returns 叠加后的固定字段
+ */
+function bind(parent: Bound, bindings: LogBindings): Bound {
+  const merged: Record<string, unknown> = { ...parent.fields }
+  if (parent.scope !== undefined) merged["scope"] = parent.scope
+  Object.assign(merged, bindings)
+  const plain = JSON.parse(safeStringify(merged)) as Record<string, unknown>
+  const fields: Record<string, unknown> = {}
+  let chunk = ""
+  for (const [key, value] of Object.entries(plain)) {
+    if (key === "level" || key === "time" || key === "msg") continue
+    chunk += `,${JSON.stringify(key)}:${JSON.stringify(value)}`
+    if (!RESERVED_KEYS.has(key)) fields[key] = value
+  }
+  const out: Bound = { chunk }
+  if (typeof plain["scope"] === "string") out.scope = plain["scope"]
+  if (Object.keys(fields).length > 0) out.fields = fields
+  return out
+}
 
 /** 日志配置 */
 export interface LoggerConfig {
@@ -73,8 +119,6 @@ function levelValue(level: LogLevel): number {
  * 内核只创建一个；插件通过 `ctx.logger`（即 `hub.root.child({ scope })`）取用。
  */
 export class LoggerHub {
-  /** pino 实例（级别恒为 trace，过滤在包装层做） */
-  readonly #pino: pino.Logger
   /** 文件写入器 */
   readonly #writer: RotatingFileWriter | undefined
   /** 环形缓冲 */
@@ -142,17 +186,7 @@ export class LoggerHub {
         })
       : undefined
 
-    this.#pino = pino(
-      {
-        level: "trace",
-        // 去掉 pid/hostname：单机机器人用不上，白占日志体积
-        base: undefined,
-        serializers: { err: pino.stdSerializers.err }
-      },
-      { write: (line: string) => this.#dispatch(line) }
-    )
-
-    this.root = new HubLogger(this, this.#pino)
+    this.root = new HubLogger(this, ROOT_BOUND)
   }
 
   /** 当前全局级别 */
@@ -245,18 +279,23 @@ export class LoggerHub {
   }
 
   /**
-   * 分发一行 pino 输出：一次解析，三处使用（控制台、文件、环形缓冲/订阅者）
-   * @param line pino 生成的 JSON 行
+   * 写一条日志：控制台、文件、环形缓冲/订阅者三处共用同一份记录
+   *
+   * 由 `HubLogger` 在过了级别判定之后调用。
+   * @param level 级别
+   * @param bound 日志器的固定字段
+   * @param msg 拼好的消息
+   * @param err 随附的错误
    */
-  #dispatch(line: string): void {
-    const rec = parseRecord(line)
-    if (!rec) {
-      // 无法解析时原样输出至控制台，优于直接丢弃
-      if (this.#console) process.stdout.write(line)
-      return
-    }
+  write(level: Exclude<LogLevel, "silent">, bound: Bound, msg: string, err: Error | undefined): void {
+    const value = LEVEL_VALUES[level]
+    const time = Date.now()
+    const serialized = err === undefined ? undefined : serializeError(err)
 
-    const value = levelValue(rec.level)
+    const rec: LogRecord = { level, time, msg: msg === "" && serialized ? serialized.message : msg }
+    if (bound.scope !== undefined) rec.scope = bound.scope
+    if (serialized) rec.stack = serialized.stack
+    if (bound.fields) rec.fields = bound.fields
 
     if (value >= this.#consoleValue) {
       const text = formatRecord(rec, { color: this.#color, scopeWidth: this.#scopeWidth })
@@ -266,7 +305,8 @@ export class LoggerHub {
     }
 
     if (this.#writer && value >= this.#fileValue) {
-      this.#writer.write(line)
+      const errPart = serialized ? `,"err":${safeStringify(serialized)}` : ""
+      this.#writer.write(`{"level":${value},"time":${time}${bound.chunk}${errPart},"msg":${JSON.stringify(msg)}}\n`)
       // fatal 立即落盘：这行之后进程很可能就没了
       if (value >= LEVEL_VALUES.fatal) this.#writer.flushSync()
     }
@@ -302,21 +342,21 @@ export class LoggerHub {
 /**
  * 面向插件的日志器实现
  *
- * 只是 pino 的薄包装：加上级别前置过滤、console.log 风格参数拼接、`mark`。
+ * 只带一份固定字段：级别过滤与输出都在枢纽里。
  */
 class HubLogger implements Logger {
   /** 所属枢纽 */
   readonly #hub: LoggerHub
-  /** 底层 pino 实例（已绑定 scope 等字段） */
-  readonly #pino: pino.Logger
+  /** 固定字段（scope 等） */
+  readonly #bound: Bound
 
   /**
    * @param hub 日志枢纽
-   * @param instance pino 实例
+   * @param bound 固定字段
    */
-  constructor(hub: LoggerHub, instance: pino.Logger) {
+  constructor(hub: LoggerHub, bound: Bound) {
     this.#hub = hub
-    this.#pino = instance
+    this.#bound = bound
   }
 
   /** 当前生效级别 */
@@ -393,7 +433,7 @@ class HubLogger implements Logger {
    * @returns 新日志器
    */
   child(bindings: LogBindings): Logger {
-    return new HubLogger(this.#hub, this.#pino.child(bindings))
+    return new HubLogger(this.#hub, bind(this.#bound, bindings))
   }
 
   /**
@@ -414,8 +454,7 @@ class HubLogger implements Logger {
   #emit(level: Exclude<LogLevel, "silent">, msg: unknown, args: readonly unknown[]): void {
     if (!this.#hub.enabled(level)) return
     const joined = joinArgs(args.length === 0 ? [msg] : [msg, ...args])
-    if (joined.err) this.#pino[level]({ err: joined.err }, joined.msg)
-    else this.#pino[level](joined.msg)
+    this.#hub.write(level, this.#bound, joined.msg, joined.err)
   }
 }
 

@@ -2,12 +2,8 @@
  * 模块职责：静态文件定位 —— 把 URL 剩余段解析成目录内的一个真实文件
  * 依赖方向：依赖 util/fs 的越界校验；不认识 Fastify
  * 生命周期：纯函数
- * 注意事项：**真正读文件与设响应头的活交给 `@fastify/static`**（mime、ETag、304、Range、HEAD 都由
- *          它背后的 `@fastify/send` 实现），本文件只回答「该给哪个文件」。
- *
- *          它以 `{ serve: false }` 注册，那样它一条路由都不注册、只装饰出 `reply.sendFile()`。
- *          必须如此 —— 它默认会占用 `/*`，而那正是本服务器自己的总入口，冲突会让 Fastify 直接抛
- *          duplicate route。
+ * 注意事项：**真正读文件与设响应头的活交给 `@fastify/send`**（mime、ETag、304、Range、HEAD），
+ *          见 index.ts 的 `sendStatic`；本文件只回答「该给哪个文件」。
  *
  *          路径越界仍先由 `safeJoin()` 挡一道，不依赖 `@fastify/send` 的内部检查：任意文件读取是
  *          这类服务器最致命的漏洞，值得两道锁。
@@ -73,7 +69,7 @@ function within(dir: string, rel: string): string | undefined {
  * 把 URL 剩余段解析成挂载目录内的一个真实文件
  * @param mount 挂载信息
  * @param rest 相对挂载点的剩余路径（已解码，不以 `/` 开头，可为空串）
- * @returns 可直接交给 `reply.sendFile()` 的相对路径；找不到时 undefined
+ * @returns 相对挂载目录的路径（未编码）；找不到时 undefined
  */
 export async function resolveStaticFile(mount: StaticMount, rest: string): Promise<string | undefined> {
   const wanted = rest === "" ? INDEX_FILE : rest

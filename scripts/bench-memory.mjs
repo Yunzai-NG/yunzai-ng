@@ -20,7 +20,9 @@
  *      node scripts/bench-memory.mjs --scenario minimal   （子进程模式，只跑一个）
  */
 import { spawn } from "node:child_process"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { existsSync } from "node:fs"
+import { mkdir, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises"
+import { setImmediate } from "node:timers"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -70,6 +72,13 @@ const SCENARIOS = {
     builtin: true
   }
 }
+
+/**
+ * 场景二加载的官方插件：取自与本仓库并列的 `repos/`（须已构建）
+ *
+ * 链进一个临时目录再交给内核，而不是直接扫 `repos/`：那里还有文档与索引仓，扫进来全是警告。
+ */
+const BUNDLED = ["adapter-napcat", "renderer-puppeteer", "yenai-state"]
 
 /** 压测用的内核配置：内存 KV + 关掉面板，把被测面收窄到消息管线本身 */
 const CONFIG_YAML = [
@@ -125,7 +134,8 @@ async function waitUntil(ok, label) {
   const deadline = Date.now() + BATCH_TIMEOUT
   while (!ok()) {
     if (Date.now() > deadline) throw new Error(`等待超时（${label}）：管线在 ${BATCH_TIMEOUT}ms 内没把这一批处理完`)
-    await sleep(0)
+    // 不用 sleep(0)：setTimeout 在 Windows 上至少一毫秒多，200 批下来测的是计时器精度而非管线
+    await new Promise(done => setImmediate(done))
   }
 }
 
@@ -145,12 +155,19 @@ async function runScenario(name) {
   await mkdir(join(home, "config"), { recursive: true })
   await writeFile(join(home, "config", "yunzai.yaml"), CONFIG_YAML, "utf8")
 
-  const app = await createApp({
-    home,
-    console: false,
-    watchConfig: false,
-    builtinDirs: scenario.builtin ? [join(ROOT, "plugins")] : []
-  })
+  const builtinDirs = []
+  if (scenario.builtin) {
+    const dir = join(home, "bundled")
+    await mkdir(dir)
+    for (const name of BUNDLED) {
+      const src = join(ROOT, "..", "repos", name)
+      if (!existsSync(join(src, "dist", "index.js"))) throw new Error(`场景 ${name} 需要先构建 ${src}`)
+      await symlink(src, join(dir, name), "junction")
+    }
+    builtinDirs.push(dir)
+  }
+
+  const app = await createApp({ home, console: false, watchConfig: false, builtinDirs })
 
   const mock = createMockAdapter()
   app.runtime.adapters.register(mock.provider, "bench")
@@ -208,6 +225,8 @@ async function runScenario(name) {
 
   const handled = app.runtime.dispatcher.handled
   await app.stop()
+  // 先逐个拆掉 junction 再删目录：递归删除万一顺着链接走，删掉的就是插件仓库本身
+  if (scenario.builtin) for (const name of BUNDLED) await unlink(join(home, "bundled", name))
   await rm(home, { recursive: true, force: true })
   const stopped = await settled()
 

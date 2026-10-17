@@ -7,10 +7,16 @@
  *          刻意不引入 nanoid：一个 60 行的功能不值得增加一个依赖，在
  *          Termux 上安装依赖时尤为如此。
  */
-import { createHash, randomBytes, randomUUID } from "node:crypto"
+import { createHash, randomFillSync, randomUUID } from "node:crypto"
 
 /** id 字符表：去掉了易混淆的 0/O/1/l/I */
 const ALPHABET = "23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ"
+
+/** 随机字节池：每条消息都要一个事件 id，逐次向系统要随机数是热路径上最贵的一步 */
+const POOL = Buffer.allocUnsafe(1024)
+
+/** 池里下一个可用字节的位置；等于长度即已用尽 */
+let poolAt = POOL.length
 
 /**
  * 生成随机字符串
@@ -18,11 +24,15 @@ const ALPHABET = "23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ"
  * @returns 随机 id
  */
 export function randomId(size = 12): string {
-  const bytes = randomBytes(size)
+  if (size > POOL.length) throw new RangeError(`randomId 的长度不能超过 ${POOL.length}`)
+  if (poolAt + size > POOL.length) {
+    randomFillSync(POOL)
+    poolAt = 0
+  }
   let out = ""
   for (let i = 0; i < size; i++) {
     // 取模引入的偏差在 56/256 上可忽略；这里不用于密码学场景
-    out += ALPHABET[bytes[i]! % ALPHABET.length]
+    out += ALPHABET[POOL[poolAt++]! % ALPHABET.length]
   }
   return out
 }

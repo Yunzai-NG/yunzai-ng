@@ -459,6 +459,10 @@ export class App {
     await this.events.emit("app/ready")
     this.#status = "running"
     this.logger.mark(`Yunzai NG ${this.version} 已启动`)
+    // 启动后再预载 HTTP 实现：不拖慢启动，又免得首个请求（多半是用户的第一条命令）等它
+    setImmediate(() => {
+      this.http.warmup().catch((err: unknown) => this.logger.warn("HTTP 客户端预载失败，首个请求时再试", err))
+    })
     return report
   }
 

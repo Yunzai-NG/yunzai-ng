@@ -26,7 +26,7 @@ import type {
   RuntimePaths,
   TaskInfo
 } from "@yunzai-ng/types"
-import { Schema } from "../config/schema.js"
+import { isSchema, type Schema } from "../config/schema.js"
 import type { ConfigStore } from "../config/store.js"
 import { DisposalRegistry } from "../util/dispose.js"
 import { TimeoutError, withTimeout } from "../util/defer.js"
@@ -630,7 +630,7 @@ export class PluginHost {
     declared: boolean
   }> {
     const schema = definition.configSchema
-    if (!(schema instanceof Schema)) {
+    if (!isSchema(schema)) {
       if (schema !== undefined) {
         this.#logger.warn(
           `插件 ${definition.name} 的 configSchema 不是 s.object(...) 的产物，已忽略。` +

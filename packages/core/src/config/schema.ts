@@ -129,12 +129,29 @@ interface SchemaDef {
   checks?: { message: string; test: (value: never) => boolean }[]
 }
 
+/** schema 的品牌标记；用 `Symbol.for` 而非 `instanceof`，同一份内核被加载两次时也认得 */
+const SCHEMA_BRAND = Symbol.for("yunzai-ng.schema")
+
+/**
+ * 判断一个值是否 `s.*` 造出来的 schema
+ *
+ * 不用 `instanceof Schema`：Windows 上同一个文件经盘符大小写不同的两条路径 import
+ * （`C:/…` 与 `c:/…`）会得到两份模块，插件那份 `s` 造出的 schema 就不是内核这份的实例。
+ * @param value 待判定值
+ * @returns 是否 schema
+ */
+export function isSchema(value: unknown): value is Schema<unknown> {
+  return typeof value === "object" && value !== null && (value as Record<symbol, unknown>)[SCHEMA_BRAND] === true
+}
+
 /**
  * 配置 schema 节点
  *
  * 不可变：全部 fluent 方法均返回新实例，因此可安全地抽取公共片段以供复用。
  */
 export class Schema<T> {
+  /** 品牌标记，见 `isSchema` */
+  readonly [SCHEMA_BRAND] = true
   /** 内部定义 */
   readonly #def: SchemaDef
 

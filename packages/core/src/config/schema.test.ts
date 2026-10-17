@@ -1,5 +1,24 @@
 import { describe, expect, it } from "vitest"
-import { Schema, s, type Infer } from "./schema.js"
+import { Schema, isSchema, s, type Infer } from "./schema.js"
+
+describe("isSchema", () => {
+  it("认得 s.* 的产物，不认手写的对象", () => {
+    expect(isSchema(s.object({ a: s.string() }))).toBe(true)
+    expect(isSchema(s.string().default("x"))).toBe(true)
+    expect(isSchema({ type: "object", properties: {} })).toBe(false)
+    expect(isSchema(undefined)).toBe(false)
+  })
+
+  it("**另一份内核造的 schema 也认**：盘符大小写不同的两条路径会把内核加载两次", async () => {
+    // 带一个查询串即得到同一文件的第二份模块实例，与 `C:/` / `c:/` 两份同理。
+    // 路径放进变量：字面量里的查询串过不了 tsc 的模块解析
+    const copy = "./schema.js?copy"
+    const other = (await import(/* @vite-ignore */ copy)) as typeof import("./schema.js")
+    const foreign = other.s.object({ n: other.s.number().default(1) })
+    expect(foreign instanceof Schema).toBe(false)
+    expect(isSchema(foreign)).toBe(true)
+  })
+})
 
 describe("schema 构造器", () => {
   it("填充嵌套默认值，用户只写关心的键", () => {

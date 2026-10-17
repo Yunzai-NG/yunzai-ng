@@ -14,7 +14,7 @@ import { inspect } from "node:util"
 import type { LogLevel } from "@yunzai-ng/types"
 import { padVisualEnd, visualWidth } from "../util/text.js"
 
-/** pino 的数字级别 → 级别名 */
+/** 数字级别 → 级别名（与 pino 同一套数值，旧日志文件照样读得懂） */
 const LEVEL_NAMES: Record<number, LogLevel> = {
   10: "trace",
   20: "debug",
@@ -24,7 +24,7 @@ const LEVEL_NAMES: Record<number, LogLevel> = {
   60: "fatal"
 }
 
-/** 级别名 → pino 数字级别 */
+/** 级别名 → 数字级别 */
 export const LEVEL_VALUES: Record<Exclude<LogLevel, "silent">, number> = {
   trace: 10,
   debug: 20,
@@ -56,8 +56,79 @@ const LEVEL_COLORS: Record<LogLevel, string> = {
   silent: "0"
 }
 
-/** pino 注入的、不该当作业务字段打印出来的键 */
-const RESERVED_KEYS = new Set(["level", "time", "msg", "pid", "hostname", "v", "err", "scope"])
+/** 日志行里由框架占用、不该当作业务字段打印出来的键 */
+export const RESERVED_KEYS: ReadonlySet<string> = new Set(["level", "time", "msg", "pid", "hostname", "v", "err", "scope"])
+
+/** 序列化后的错误，与 pino 的 `stdSerializers.err` 同形 */
+export interface SerializedError {
+  /** 构造器名 */
+  type: string
+  /** 消息，连带 cause 链 */
+  message: string
+  /** 堆栈，连带 cause 链 */
+  stack: string
+  /** 其余自有字段（如 `code`） */
+  [key: string]: unknown
+}
+
+/**
+ * 取错误的 cause，只认 Error
+ * @param err 错误
+ * @returns cause；不是 Error 时 undefined
+ */
+function causeOf(err: Error): Error | undefined {
+  const cause = (err as { cause?: unknown }).cause
+  return cause instanceof Error ? cause : undefined
+}
+
+/**
+ * 把错误序列化成可写进日志行的对象
+ *
+ * message 与 stack 沿 cause 链接上（`a: b`、`caused by: …`），日志里一眼看到根因；
+ * 链上出现环时停下。
+ * @param err 错误
+ * @returns 序列化结果
+ */
+export function serializeError(err: Error): SerializedError {
+  const seen = new Set<Error>([err])
+  let message = err.message
+  let stack = err.stack ?? ""
+  for (let cur = causeOf(err); cur !== undefined && !seen.has(cur); cur = causeOf(cur)) {
+    seen.add(cur)
+    // 父消息里已经带上了 cause 的消息（常见写法），再接一遍就重复了
+    if (cur.message !== "" && !message.includes(cur.message)) message += `: ${cur.message}`
+    stack += `\ncaused by: ${cur.stack ?? `${cur.name}: ${cur.message}`}`
+  }
+  const out: SerializedError = { type: err.constructor?.name ?? err.name, message, stack }
+  for (const [key, value] of Object.entries(err)) {
+    if (key in out || key === "cause") continue
+    out[key] = value instanceof Error ? serializeError(value) : value
+  }
+  return out
+}
+
+/**
+ * JSON 化，环与 BigInt 不抛错
+ *
+ * 日志器不能因为某个插件往字段里塞了环形对象就把那条日志连同调用方一起炸掉。
+ * @param value 值
+ * @returns JSON 文本
+ */
+export function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value)
+  } catch {
+    const seen = new WeakSet<object>()
+    return JSON.stringify(value, (_key, v: unknown) => {
+      if (typeof v === "bigint") return v.toString()
+      if (typeof v === "object" && v !== null) {
+        if (seen.has(v)) return "[Circular]"
+        seen.add(v)
+      }
+      return v
+    })
+  }
+}
 
 /**
  * 判断当前是否应输出颜色
@@ -97,7 +168,7 @@ export interface LogRecord {
 }
 
 /**
- * 解析 pino 输出的一行 JSON
+ * 解析日志文件里的一行 JSON
  * @param line 日志行（含尾部换行）
  * @returns 解析结果；不是合法 JSON 时 undefined
  */
@@ -219,9 +290,8 @@ function stringifyField(value: unknown): string {
 /**
  * 将任意日志参数拼接为消息文本
  *
- * 不直接交由 pino 处理：pino 仅将第一个参数视为消息，其余参数仅在第一个参数含
- * `%s`/`%d` 占位符时才被消费，否则**静默丢弃**。而 `logger.info("查询", uid, data)`
- * 这类 console.log 写法很常见，故此处统一按 console.log 语义拼接。
+ * `logger.info("查询", uid, data)` 这类 console.log 写法很常见，故统一按 console.log 语义拼接，
+ * 不丢后面的参数。
  * @param args 日志参数
  * @returns 拼接后的消息与提取出的错误
  */
@@ -231,7 +301,7 @@ export function joinArgs(args: readonly unknown[]): { msg: string; err?: Error }
 
   for (const arg of args) {
     if (arg instanceof Error) {
-      // 第一个 Error 单独提出来，让 pino 的 err 序列化器保留堆栈
+      // 第一个 Error 单独提出来，序列化时保留堆栈
       if (!err) err = arg
       parts.push(arg.message)
       continue

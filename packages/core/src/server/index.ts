@@ -13,9 +13,9 @@
  */
 import { isAbsolute } from "node:path"
 import type { IncomingMessage } from "node:http"
-import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify"
-import fastifyStatic from "@fastify/static"
-import fastifyWebsocket from "@fastify/websocket"
+import type { FastifyInstance, FastifyReply, FastifyRequest, FastifyServerOptions } from "fastify"
+// 只为 WebSocket 插件对 Fastify 类型的扩充（`websocket: true`）；运行期见 `loadFastify`
+import type {} from "@fastify/websocket"
 import type {
   Awaitable,
   Disposer,
@@ -54,6 +54,76 @@ const STATIC_REST = "rest"
 
 /** `ws` 的 `readyState` 里代表"已连通"的值 */
 const WS_OPEN = 1
+
+/** 动态加载的 Fastify 与 WebSocket 插件 */
+interface FastifyModules {
+  /** Fastify 工厂 */
+  fastify: typeof import("fastify").default
+  /** `@fastify/websocket` */
+  websocketPlugin: typeof import("@fastify/websocket").default
+}
+
+/**
+ * 加载 Fastify 与 WebSocket 插件
+ *
+ * 动态 import：两者合计数百个模块，`server.enable: false` 的部署与只 import 内核类型的
+ * 进程（CLI 的多数命令）不该为此买单。
+ * @returns 两个模块
+ */
+async function loadFastify(): Promise<FastifyModules> {
+  const [fastify, websocketPlugin] = await Promise.all([import("fastify"), import("@fastify/websocket")])
+  return { fastify: fastify.default, websocketPlugin: websocketPlugin.default }
+}
+
+/** `@fastify/send` 的加载；首个静态请求时才发起 */
+let sendLoad: Promise<typeof import("@fastify/send").default> | undefined
+
+/**
+ * 发一个静态文件
+ *
+ * mime、ETag、Last-Modified、304、Range、HEAD 都由 `@fastify/send` 处理。它在首个静态请求时
+ * 才加载：面板的首屏要等它，但启动不必。路径越界已由 `resolveStaticFile` 挡过。
+ * @param request Fastify 请求
+ * @param reply Fastify 响应
+ * @param rel 相对挂载目录的路径（未编码）
+ * @param root 挂载目录
+ * @returns 同一个 `reply`
+ */
+async function sendStatic(request: FastifyRequest, reply: FastifyReply, rel: string, root: string): Promise<FastifyReply> {
+  sendLoad ??= import("@fastify/send").then(mod => mod.default)
+  const send = await sendLoad
+  // send 会先 URI 解码，故这里编码一次；dotfiles 放行：哪些文件可见是挂载方的事
+  const result = await send(request.raw, encodeURI(rel), { root, dotfiles: "allow" })
+  if (result.type === "file") {
+    reply.code(result.statusCode)
+    reply.headers(result.headers)
+    return reply.send(result.stream)
+  }
+  // 404 与目录都按「没有这个文件」处理，交给 notFound 处理器出统一的错误形状
+  if (result.type === "directory" || result.statusCode === 404) {
+    reply.callNotFound()
+    return reply
+  }
+  return reply.code(result.statusCode).send(result.metadata.error)
+}
+
+/**
+ * 不编译 schema 的编译器
+ *
+ * 本服务器只有 4 条 catch-all 路由、不声明任何 schema（校验在 `PathTable` 与插件里做）。缺省编译器
+ * 是 ajv 与 fast-json-stringify，Fastify 构造时就同步加载它们，约占建服务器耗时的九成。有人往
+ * Fastify 上加带 schema 的路由时当场报错，而不是悄悄不校验。
+ */
+const NO_SCHEMA: NonNullable<FastifyServerOptions["schemaController"]> = {
+  compilersFactory: {
+    buildValidator: () => () => {
+      throw new Error("本服务器不编译路由 schema：在 handler 里自行校验请求")
+    },
+    buildSerializer: () => () => {
+      throw new Error("本服务器不编译响应 schema：在 handler 里自行序列化")
+    }
+  }
+}
 
 /** `RouteResponse` 允许出现的键；出现其他键即表明该对象实为业务数据 */
 const RESPONSE_KEYS = new Set(["status", "headers", "body"])
@@ -549,20 +619,21 @@ export class ManagedServer implements ServerSink {
    * 才能注册（见 `#boot()`），而那是异步的。
    * @param opts 构造参数
    */
-  constructor(opts: ManagedServerOptions) {
+  private constructor(opts: ManagedServerOptions, mods: FastifyModules) {
     this.#config = opts.config
     this.#logger = opts.logger
-    this.#fastify = Fastify({
+    this.#fastify = mods.fastify({
       // 日志走内核自己的 logger；开着 Fastify 的会出现两套格式两份文件
       logger: false,
       // 必须为 false：auth.ts 第 4 条的"是否本机"判断依赖真实 TCP 对端地址
       trustProxy: false,
       // 本服务器已显式注册 HEAD，若再由 Fastify 自动生成一条将冲突为 duplicate route
       exposeHeadRoutes: false,
-      bodyLimit: MAX_BODY_LIMIT
+      bodyLimit: MAX_BODY_LIMIT,
+      schemaController: NO_SCHEMA
     })
     this.#jsonParser = this.#fastify.getDefaultJsonParser("remove", "remove") as JsonParser
-    this.#registerPlugins()
+    this.#registerPlugins(mods)
   }
 
   /**
@@ -571,7 +642,7 @@ export class ManagedServer implements ServerSink {
    * @returns 已 `ready()` 的服务器
    */
   static async create(opts: ManagedServerOptions): Promise<ManagedServer> {
-    const server = new ManagedServer(opts)
+    const server = new ManagedServer(opts, await loadFastify())
     await server.#boot()
     return server
   }
@@ -592,18 +663,13 @@ export class ManagedServer implements ServerSink {
   }
 
   /**
-   * 注册 `@fastify/static` 与 `@fastify/websocket`
+   * 注册 `@fastify/websocket`
    *
-   * 两个 `register()` 都是延迟的，真正启动要等 `after()` / `ready()`。
+   * `register()` 是延迟的，真正启动要等 `after()` / `ready()`。
+   * @param mods 动态加载的 Fastify 插件
    */
-  #registerPlugins(): void {
-    const fastify = this.#fastify
-
-    // `serve: false` 让它一条路由都不注册，只装饰出 `reply.sendFile()`。
-    // 它默认会占用 `/*`，而 `/*` 正是本服务器自己的总入口，见 files.ts 文件头
-    fastify.register(fastifyStatic, { serve: false, decorateReply: true })
-
-    fastify.register(fastifyWebsocket, {
+  #registerPlugins(mods: FastifyModules): void {
+    this.#fastify.register(mods.websocketPlugin, {
       options: {
         // 浏览器将令牌置于子协议中（见 auth.ts 第 2 条）。返回 `WS_PROTOCOL` 即向
         // 浏览器表明"该子协议被接受"，否则 `new WebSocket(url, [...])` 会立即失败
@@ -639,7 +705,7 @@ export class ManagedServer implements ServerSink {
       this.#onRequest(request, reply)
     )
 
-    // `reply.sendFile()` 遇到 ENOENT 会走 `callNotFound()`，加上这个处理器是为了让
+    // 静态文件找不到会走 `callNotFound()`，加上这个处理器是为了让
     // 404 也是 `{ error: string }` —— 面板前端只需要认一种错误形状
     fastify.setNotFoundHandler((request: FastifyRequest, reply: FastifyReply) =>
       this.#reject(reply, 404, `路由 ${pathOf(request.url)} 不存在`)
@@ -1269,9 +1335,7 @@ export class ManagedServer implements ServerSink {
         reply.callNotFound()
         return reply
       }
-      // 此处给出的是**未编码**的相对路径：`@fastify/static` 内部会自行 `encodeURI()`
-      // 再交给 `@fastify/send`，若在此提前编码将造成双重编码
-      return reply.sendFile(rel, ctx.mount.value.dir)
+      return sendStatic(request, reply, rel, ctx.mount.value.dir)
     }
 
     // 携带升级头进入但最终未被 `@fastify/websocket` 接管 —— 最常见的原因是对端实际

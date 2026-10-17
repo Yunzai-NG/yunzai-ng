@@ -9,6 +9,45 @@
 `package.json`，而插件索引里的 `minCore` 说的也是内核版本。两者若脱节，使用者在面板上看到
 一个号、在发布说明与 tag 上看到另一个，无从对账。
 
+## 0.7.0 — 2026-10-18
+
+| 包 | 版本 |
+|---|---|
+| `@yunzai-ng/core` | 0.6.5 → **0.7.0** |
+| `@yunzai-ng/cli` | 0.6.3 → **0.6.4** |
+
+> CLI 无代码改动，抬号用于将其依赖表中锁定的 core 版本更新为 0.7.0。
+
+### 变更
+
+- **启动与内存。** 同一台机器上与 0.6.5 对比（CPU 时间中位数）：
+  - 带面板启动 2328ms → 1125ms，不带面板 1828ms → 485ms；
+  - 空载 heap 24MB → 13MB，加载的 CommonJS 模块 543 → 243 个；
+  - `yzng doctor` 一类只用到内核一两个函数的命令 1938ms → 545ms。
+
+  办法如下：
+  - Fastify 不再编译路由 schema：本服务器只有四条 catch-all 路由、一个 schema 都不声明，而缺省编译器
+    （ajv 与 fast-json-stringify）在构造时同步加载，约占建服务器耗时的九成。有人往 `server.raw` 上加
+    带 schema 的路由时当场报错，而不是悄悄不校验；
+  - Fastify 与 WebSocket 插件在建服务器时才加载，`server.enable: false` 的部署一个都不加载；
+  - undici 在首个请求时才加载，并在启动完成后预载，首个请求不必等它；
+  - yaml 在首次读写配置时才加载；
+  - 日志不再经 pino：直接构造记录，不经「序列化成 JSON 再解析回来」那一圈。文件行格式不变，
+    旧日志与 `parseRecord` 照样通用；
+  - 静态文件改由 `@fastify/send` 直接发送，首个静态请求时才加载。ETag、304、Range、HEAD 照旧。
+- **消息吞吐约提升六成**（压测 1 万条，约 3.7 万 → 6 万条/秒）。事件 id 的随机数改从一块池里取，
+  不再每条消息向系统要一次。
+- 依赖少了 `pino` 与 `@fastify/static`，多了 `@fastify/send`（原先就由 `@fastify/static` 间接装着）。
+- `ManagedHttpClient` 新增 `warmup()`。
+
+### 修复
+
+- **链进 `plugins/` 的插件目录不再被跳过。** 开发时把插件仓库 junction / 软链进来是常见做法，而目录
+  列举用的 `Dirent.isDirectory()` 对链接恒为假，插件静默不加载。断链照旧跳过。
+- **插件的 `configSchema` 不再被误判为「不是 s.object(...) 的产物」而忽略。** Windows 上同一份内核经
+  盘符大小写不同的两条路径 import（`C:/…` 与 `c:/…`）会加载两次，插件那份 `s` 造出的 schema
+  过不了 `instanceof`，配置表单就此消失。判定改用品牌标记，新增导出 `isSchema()`。
+
 ## 0.6.5 — 2026-10-18
 
 | 包 | 版本 |
