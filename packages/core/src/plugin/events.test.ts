@@ -68,6 +68,30 @@ describe("CoreEventBus", () => {
     expect(logger.lines.some(l => l.includes("stuck-plugin") && l.includes("放弃等待"))).toBe(true)
   })
 
+  it("超时只点名卡住的那个，按时结束的不受牵连", async () => {
+    const logger = fakeLogger()
+    const bus = createEventBus({ logger, handlerTimeout: 30 })
+    const quick = vi.fn(async () => undefined)
+    bus.on("app/stopping", quick, "quick-plugin")
+    bus.on("app/stopping", () => new Promise<void>(() => undefined), "stuck-plugin")
+    bus.on("app/stopping", () => undefined, "sync-plugin")
+
+    await bus.emit("app/stopping")
+    expect(quick).toHaveBeenCalledTimes(1)
+    const timeouts = logger.lines.filter(l => l.includes("放弃等待"))
+    expect(timeouts).toHaveLength(1)
+    expect(timeouts[0]).toContain("stuck-plugin")
+  })
+
+  it("全为同步监听器时 emit 立即结束", async () => {
+    const bus = createEventBus({ logger: fakeLogger() })
+    const seen: number[] = []
+    bus.on("app/ready", () => void seen.push(1))
+    bus.on("app/ready", () => void seen.push(2))
+    await bus.emit("app/ready")
+    expect(seen).toEqual([1, 2])
+  })
+
   it("once 只触发一次，且抛错时同样被摘除", async () => {
     const logger = fakeLogger()
     const bus = createEventBus({ logger })

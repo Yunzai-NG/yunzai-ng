@@ -17,7 +17,6 @@
  */
 import type { Awaitable, Disposer, Logger } from "@yunzai-ng/types"
 import type { CoreEventMap } from "@yunzai-ng/types"
-import { TimeoutError, withTimeout } from "../util/defer.js"
 
 /** 单个监听器的默认等待上限 */
 const DEFAULT_HANDLER_TIMEOUT = 10_000
@@ -118,8 +117,7 @@ export class CoreEventBus {
   async emit<K extends keyof CoreEventMap>(event: K, ...args: CoreEventMap[K]): Promise<void> {
     const listeners = this.#take(event as string)
     if (listeners.length === 0) return
-
-    await Promise.all(listeners.map(listener => this.#invoke(event as string, listener, args)))
+    await this.#invokeAll(event as string, listeners, args)
   }
 
   /**
@@ -133,11 +131,8 @@ export class CoreEventBus {
   emitDetached<K extends keyof CoreEventMap>(event: K, ...args: CoreEventMap[K]): void {
     const listeners = this.#take(event as string)
     if (listeners.length === 0) return
-    for (const listener of listeners) {
-      // void 显式表明"刻意不等待"，同时 #invoke 内部已捕获全部错误，
-      // 不会产生 unhandledRejection
-      void this.#invoke(event as string, listener, args)
-    }
+    // void 显式表明"刻意不等待"；#invokeAll 内部已捕获全部错误，不会产生 unhandledRejection
+    void this.#invokeAll(event as string, listeners, args)
   }
 
   /**
@@ -193,9 +188,8 @@ export class CoreEventBus {
    */
   #add(event: string, fn: Listener["fn"], owner: string, once: boolean): Disposer {
     const listener: Listener = { fn, owner, once, calls: 0 }
-    const list = this.#listeners.get(event)
-    if (list) list.push(listener)
-    else this.#listeners.set(event, [listener])
+    // 写时复制：派发时直接拿当前数组当快照，订阅与退订（远比派发少）才付复制的代价
+    this.#listeners.set(event, [...(this.#listeners.get(event) ?? []), listener])
 
     let disposed = false
     return () => {
@@ -203,56 +197,98 @@ export class CoreEventBus {
       disposed = true
       const current = this.#listeners.get(event)
       if (!current) return
-      const index = current.indexOf(listener)
-      if (index >= 0) current.splice(index, 1)
-      if (current.length === 0) this.#listeners.delete(event)
+      const kept = current.filter(item => item !== listener)
+      if (kept.length === 0) this.#listeners.delete(event)
+      else this.#listeners.set(event, kept)
     }
   }
 
   /**
-   * 取出本次要触发的监听器快照
+   * 取出本次要触发的监听器
    *
-   * 必须是快照：监听器在处理过程中订阅/退订是完全合法的（`once` 自己就会退订），
-   * 直接遍历原数组会漏触发或重复触发。
+   * 返回的数组不会再被改动（写时复制），故即为快照：监听器在处理过程中订阅/退订是完全合法的
+   * （`once` 自己就会退订），不至于漏触发或重复触发。
    * @param event 事件名
    * @returns 监听器数组；已关闭或无监听器时为空数组
    */
-  #take(event: string): Listener[] {
+  #take(event: string): readonly Listener[] {
     if (this.#closed) return []
     const list = this.#listeners.get(event)
     if (!list || list.length === 0) return []
 
-    const snapshot = [...list]
     // once 监听器在派发前即摘除，避免其自身抛错导致永久无法摘除
-    if (snapshot.some(listener => listener.once)) {
+    if (list.some(listener => listener.once)) {
       const kept = list.filter(listener => !listener.once)
       if (kept.length === 0) this.#listeners.delete(event)
       else this.#listeners.set(event, kept)
     }
-    return snapshot
+    return list
   }
 
   /**
-   * 调用单个监听器，捕获错误并仅记日志
+   * 同时调起一批监听器，捕获错误并仅记日志
+   *
+   * 整批共用**一个**超时定时器：它们同时启动、上限相同，截止时刻本就是同一个。每条消息都要过
+   * `message` 事件，逐个监听器各套一层 `withTimeout` 时，定时器与包装 Promise 占了派发开销的大半。
    * @param event 事件名
-   * @param listener 监听器
+   * @param listeners 监听器
    * @param args 事件参数
-   * @returns 结束后兑现；永不拒绝
+   * @returns 全部结束（或超时被放弃）后兑现；全为同步监听器时不建 Promise。永不拒绝
    */
-  async #invoke(event: string, listener: Listener, args: readonly unknown[]): Promise<void> {
-    listener.calls++
-    try {
-      const result = listener.fn(...(args as never[]))
-      if (result instanceof Promise) {
-        await withTimeout(result, this.#timeout, `事件 ${event} 的监听器超过 ${this.#timeout}ms 未结束`)
-      }
-    } catch (err) {
-      if (err instanceof TimeoutError) {
-        this.#logger.warn(`插件 ${listener.owner} 处理事件 ${event} 超时，已放弃等待`, err.message)
-      } else {
-        this.#logger.error(`插件 ${listener.owner} 处理事件 ${event} 出错`, err)
-      }
+  #invokeAll(event: string, listeners: readonly Listener[], args: readonly unknown[]): Promise<void> | undefined {
+    let pending = 0
+    let done: (() => void) | undefined
+    let timer: NodeJS.Timeout | undefined
+    /** 各监听器是否已结束；超时时据此点名 */
+    const settled: boolean[] = []
+
+    const finish = (i: number): void => {
+      settled[i] = true
+      if (--pending > 0) return
+      if (timer !== undefined) clearTimeout(timer)
+      done?.()
     }
+
+    for (let i = 0; i < listeners.length; i++) {
+      const listener = listeners[i]!
+      listener.calls++
+      settled.push(true)
+      let result: Awaitable<void>
+      try {
+        result = listener.fn(...(args as never[]))
+      } catch (err) {
+        this.#logger.error(`插件 ${listener.owner} 处理事件 ${event} 出错`, err)
+        continue
+      }
+      if (!(result instanceof Promise)) continue
+      pending++
+      settled[i] = false
+      result.then(
+        () => finish(i),
+        (err: unknown) => {
+          this.#logger.error(`插件 ${listener.owner} 处理事件 ${event} 出错`, err)
+          finish(i)
+        }
+      )
+    }
+
+    if (pending === 0) return undefined
+    return new Promise<void>(resolve => {
+      done = resolve
+      if (this.#timeout <= 0) return
+      timer = setTimeout(() => {
+        done = undefined
+        for (let i = 0; i < listeners.length; i++) {
+          if (settled[i] === true) continue
+          this.#logger.warn(
+            `插件 ${listeners[i]!.owner} 处理事件 ${event} 超时，已放弃等待`,
+            `事件 ${event} 的监听器超过 ${this.#timeout}ms 未结束`
+          )
+        }
+        resolve()
+      }, this.#timeout)
+      timer.unref()
+    })
   }
 }
 
