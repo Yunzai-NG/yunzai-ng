@@ -1,5 +1,5 @@
 /**
- * 模块职责：`yzng doctor` —— 环境自检：运行环境、目录、可选原生依赖、端口占用
+ * 模块职责：`yzng doctor` —— 环境自检：运行环境、目录、内核配置、可选原生依赖、端口占用
  * 依赖方向：依赖 @yunzai-ng/core 的公开入口与 node:net
  * 生命周期：一次性，执行完毕即退出
  * 注意事项：**每一项均须给出后续处置方式，否则本命令不具备存在价值。**
@@ -12,15 +12,20 @@
 import net from "node:net"
 import process from "node:process"
 import { createRequire } from "node:module"
-import { access } from "node:fs/promises"
-import { detectPlatform, legacyInstance, resolvePaths, sampleUsage } from "@yunzai-ng/core"
+import { constants } from "node:fs"
+import { access, readFile } from "node:fs/promises"
+import { join } from "node:path"
+import { CORE_CONFIG_NAME, coreConfigSchema, detectPlatform, legacyInstance, parseYaml, resolvePaths } from "@yunzai-ng/core"
 import { bold, cyan, dim, green, print, printRows, red, yellow } from "../terminal.js"
 
-/** Node 最低版本，与根 package.json 的 engines 保持一致 */
-const MIN_NODE_MAJOR = 20
+/** Node 最低版本，与根 package.json 的 engines（>=20.11.0）保持一致 */
+const MIN_NODE: readonly [number, number] = [20, 11]
+
+/** 校验失败时最多列几条问题 */
+const MAX_ISSUES = 5
 
 /** 一条自检结论 */
-interface Finding {
+export interface Finding {
   /** 严重程度 */
   readonly level: "ok" | "warn" | "error"
   /** 检查项名称 */
@@ -33,17 +38,79 @@ interface Finding {
 
 /**
  * 检查 Node 版本
+ * @param version 版本号（不带 `v`），缺省为当前进程的
  * @returns 结论
  */
-function checkNode(): Finding {
-  const major = Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10)
-  if (major >= MIN_NODE_MAJOR) return { level: "ok", title: "Node 版本", detail: process.version }
+export function checkNode(version: string = process.versions.node): Finding {
+  const [major = 0, minor = 0] = version.split(".").map(part => Number.parseInt(part, 10))
+  const [needMajor, needMinor] = MIN_NODE
+  if (major > needMajor || (major === needMajor && minor >= needMinor)) {
+    return { level: "ok", title: "Node 版本", detail: `v${version}` }
+  }
   return {
     level: "error",
     title: "Node 版本",
-    detail: `${process.version}，低于要求的 ${MIN_NODE_MAJOR}`,
-    next: "将 Node 升级至 20.11 或更高版本：内核使用了 import.meta.dirname 与原生 ESM 解析"
+    detail: `v${version}，低于要求的 ${needMajor}.${needMinor}`,
+    next: `将 Node 升级至 ${needMajor}.${needMinor} 或更高版本：内核使用了 import.meta.dirname 与原生 ESM 解析`
   }
+}
+
+/** 自检要用到的那几项内核配置 */
+export interface ServerProbe {
+  /** 面板是否启用；关着时不探端口 */
+  readonly enable: boolean
+  /** 监听地址 */
+  readonly host: string
+  /** 端口 */
+  readonly port: number
+}
+
+/**
+ * 读内核配置并校验，取出要探测的监听地址
+ *
+ * 启动时配置写错只记一条 error 并沿用缺省值，使用者多半只看到「面板端口不对」；自检要把原因直接报出来。
+ * @param configDir 配置目录
+ * @returns 结论（文件不存在时为 undefined：首次启动会按缺省值生成）与监听参数
+ */
+export async function checkConfig(configDir: string): Promise<{ finding?: Finding; server: ServerProbe }> {
+  const file = join(configDir, `${CORE_CONFIG_NAME}.yaml`)
+  const defaults = coreConfigSchema.defaults().server
+  const fallback = { enable: defaults.enable, host: defaults.host, port: defaults.port }
+  const text = await readFile(file, "utf8").catch(() => undefined)
+  if (text === undefined) return { server: fallback }
+
+  let raw: unknown
+  try {
+    raw = parseYaml(text)
+  } catch (err) {
+    return {
+      finding: {
+        level: "error",
+        title: "内核配置",
+        detail: `${cyan(file)} 语法有误：${err instanceof Error ? err.message.split("\n")[0] : String(err)}`,
+        next: "启动时会整份沿用缺省值，改动全不生效。按提示的行号修正后再启动"
+      },
+      server: fallback
+    }
+  }
+
+  const result = coreConfigSchema.safeParse(raw)
+  if (!result.ok) {
+    const issues = result.issues.filter(issue => issue.severity === "error")
+    const shown = issues.slice(0, MAX_ISSUES).map(issue => `${issue.path || "(根)"}：${issue.message}`)
+    if (issues.length > MAX_ISSUES) shown.push(`…另有 ${issues.length - MAX_ISSUES} 项`)
+    return {
+      finding: {
+        level: "error",
+        title: "内核配置",
+        detail: `${cyan(file)} 校验失败：${shown.join("；")}`,
+        next: "启动时会整份沿用缺省值，改动全不生效。改正这几项，或在面板的设置页里改"
+      },
+      server: fallback
+    }
+  }
+  const { enable, host, port } = result.value.server
+  return { finding: { level: "ok", title: "内核配置", detail: cyan(file) }, server: { enable, host, port } }
 }
 
 /**
@@ -74,7 +141,13 @@ function checkNative(name: string, purpose: string, fallback: string): Finding {
   try {
     require.resolve(name)
   } catch {
-    return { level: "warn", title: name, detail: `未安装（${purpose}）`, next: `${fallback}。需要时执行：pnpm add -w ${name}` }
+    // 它是内核的可选依赖，缺了多半是安装时编译失败（没有预编译包、缺编译工具），不是漏装
+    return {
+      level: "warn",
+      title: name,
+      detail: `未安装（${purpose}）`,
+      next: `${fallback}。需要时在实例目录重新安装依赖（pnpm install 或 npm install），留意其中 ${name} 的编译报错`
+    }
   }
   try {
     require(name)
@@ -90,7 +163,7 @@ function checkNative(name: string, purpose: string, fallback: string): Finding {
 }
 
 /**
- * 检查目录可达
+ * 检查目录存在且可写
  * @param label 检查项名称
  * @param dir 路径
  * @returns 结论
@@ -98,13 +171,23 @@ function checkNative(name: string, purpose: string, fallback: string): Finding {
 async function checkDir(label: string, dir: string): Promise<Finding> {
   try {
     await access(dir)
-    return { level: "ok", title: label, detail: cyan(dir) }
   } catch {
     return {
       level: "warn",
       title: label,
       detail: `${cyan(dir)} ${dim("尚不存在")}`,
       next: "首次启动时将自动创建；亦可先执行 yzng init"
+    }
+  }
+  try {
+    await access(dir, constants.W_OK)
+    return { level: "ok", title: label, detail: cyan(dir) }
+  } catch {
+    return {
+      level: "error",
+      title: label,
+      detail: `${cyan(dir)} 不可写`,
+      next: "内核要在这里写配置、数据与日志。换一个当前用户有写权限的目录（--home / YZNG_HOME），或改这个目录的权限"
     }
   }
 }
@@ -154,9 +237,9 @@ function printFinding(finding: Finding): void {
 export interface DoctorOptions {
   /** 应用主目录 */
   readonly home?: string | undefined
-  /** 待探测的面板端口，缺省 2536（与配置缺省值一致） */
+  /** 待探测的面板端口；缺省取配置的 `server.port` */
   readonly port?: number | undefined
-  /** 待探测的监听地址 */
+  /** 待探测的监听地址；缺省取配置的 `server.host` */
   readonly host?: string | undefined
 }
 
@@ -190,27 +273,31 @@ function checkLegacy(home: string): Finding | undefined {
 export async function runDoctor(opts: DoctorOptions = {}): Promise<number> {
   const platform = detectPlatform()
   const paths = resolvePaths({ home: opts.home })
-  const usage = sampleUsage()
 
   print()
   print(`  ${bold("环境")}`)
   printRows([
     ["系统", `${platform.os}/${platform.arch}${platform.isTermux ? " · Termux" : ""}${platform.isContainer ? " · 容器" : ""}`],
-    ["Node", platform.nodeVersion],
-    ["CPU", `${platform.cpus} 核`],
-    ["常驻内存", `${(usage.rss / 1024 / 1024).toFixed(1)} MB`]
+    ["CPU", `${platform.cpus} 核`]
   ])
 
   const legacy = checkLegacy(paths.home)
+  const config = await checkConfig(paths.config)
+  const server = config.server
+  // 命令行给了就探命令行的；面板关着且没人指定时不探
+  const probePort = opts.port !== undefined || opts.host !== undefined || server.enable
   const findings: Finding[] = [
     checkNode(),
     await checkDir("主目录", paths.home),
     ...(legacy === undefined ? [] : [legacy]),
     await checkDir("配置目录", paths.config),
     await checkDir("数据目录", paths.data),
+    ...(config.finding === undefined ? [] : [config.finding]),
     checkNative("classic-level", "内嵌 KV，用于计数与冷却", "缺失时内核降级为 JSON 文件存储，功能不受影响但写入速度较低"),
     checkNative("better-sqlite3", "关系数据，用于插件建表", "缺失时依赖 SQL 的插件将取得一条错误说明，而非静默失效"),
-    await checkPort(opts.host ?? "127.0.0.1", opts.port ?? 2536)
+    probePort
+      ? await checkPort(opts.host ?? server.host, opts.port ?? server.port)
+      : { level: "ok", title: "面板端口", detail: dim("面板已关闭（server.enable: false），不探测") }
   ]
 
   print()
