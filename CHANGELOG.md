@@ -19,25 +19,33 @@
 ### 变更
 
 - **启动与内存。** 同一台机器上与 0.6.5 对比（CPU 时间中位数）：
-  - 带面板启动 2328ms → 1125ms，不带面板 1828ms → 485ms；
-  - 空载 heap 24MB → 13MB，加载的 CommonJS 模块 543 → 243 个；
-  - `yzng doctor` 一类只用到内核一两个函数的命令 1938ms → 545ms。
+  - 带面板启动 2296ms → 359ms，不带面板 2030ms → 218ms；
+  - 带面板启动后 heap 19.7MB → 12.8MB；
+  - `yzng doctor` 一类只用到内核一两个函数的命令 1938ms → 390ms（墙钟）。
 
   办法如下：
+  - **内核发布产物改为打包。** 内核自身连同 yaml、fastify、`@fastify/websocket`、`@fastify/send` 由 esbuild
+    合成少数几个文件：启动耗时大半花在逐个解析、打开、编译几百个小文件上（Windows 上还要过杀毒扫描），
+    合并后同样的代码只读几次盘。原生模块、undici、croner 不打包。打进来的依赖随内核发版才更新，
+    `npm update` 改不动它们；许可证汇总在 `dist/THIRD-PARTY-LICENSES.txt`。`fastify` 仍列在依赖里，
+    因为 `server.raw` 的类型来自它；另外三个移到了 devDependencies；
   - Fastify 不再编译路由 schema：本服务器只有四条 catch-all 路由、一个 schema 都不声明，而缺省编译器
     （ajv 与 fast-json-stringify）在构造时同步加载，约占建服务器耗时的九成。有人往 `server.raw` 上加
     带 schema 的路由时当场报错，而不是悄悄不校验；
   - Fastify 与 WebSocket 插件在建服务器时才加载，`server.enable: false` 的部署一个都不加载；
   - undici 在首个请求时才加载，并在启动完成后预载，首个请求不必等它；
-  - yaml 在首次读写配置时才加载；
   - 日志不再经 pino：直接构造记录，不经「序列化成 JSON 再解析回来」那一圈。文件行格式不变，
     旧日志与 `parseRecord` 照样通用；
   - 静态文件改由 `@fastify/send` 直接发送，首个静态请求时才加载。ETag、304、Range、HEAD 照旧。
 - **消息吞吐约提升六成**（压测 1 万条，约 3.7 万 → 6 万条/秒）。事件 id 的随机数改从一块池里取，
   不再每条消息向系统要一次。命令路由取消息首字符时不再把整条消息摊成数组；中间件链改为写时复制，
   每条消息少一次数组复制。
-- 依赖少了 `pino` 与 `@fastify/static`，多了 `@fastify/send`（原先就由 `@fastify/static` 间接装着）。
+- 依赖少了 `pino`、`@fastify/static`、`yaml`、`@fastify/websocket`（后两者已打进内核）。
 - `ManagedHttpClient` 新增 `warmup()`。
+- **常驻内存少 8–17MB（空载 / 处理过一阵消息后）。** `yzng start` 的自带守护 fork 内核时带上 `--max-semi-space-size=4`：V8 在 64 位上
+  默认把新生代放到 16MB，消息一阵密集就涨上去且不归还。内核 + 三个官方插件处理 1 万条消息后 RSS
+  98.9MB → 81.5MB，heap 与吞吐不变。使用者自己给过这个参数（命令行或 `NODE_OPTIONS`）时以他的为准；
+  pm2 / systemd 托管时不经自带守护，部署文档里给了对应写法。
 
 ### 修复
 
@@ -56,6 +64,14 @@
   被当作完好留下，而内核在 `C:\…` 下运行，插件经它 import 到的是第二份内核：带面板启动多耗约 200ms CPU、
   6MB heap，`instanceof` 判不出对方的错误类。现在比对与 Node 的模块解析一致，大小写也要相同。
 - 进程里加载了不止一份内核时，启动记一条警告，列出各份所在路径。
+- **`yzng doctor` 探测配置里的面板端口。** 原先固定探 `127.0.0.1:2536`，改过 `server.port` 的实例
+  得到的结论与实际无关；面板关着时也不再探。另外：
+  - 新增内核配置检查：`yunzai.yaml` 语法错或校验失败时报 error 并指出字段（启动时这类错误只记一条日志、
+    整份沿用缺省值）；
+  - Node 版本线按 20.11 判，原先只看主版本，20.0–20.10 被当作合格；
+  - 目录检查补上可写性；
+  - 去掉「常驻内存」一行（那是 doctor 进程自己的内存，与机器人无关）；
+  - 原生模块缺失时的提示不再写死 `pnpm add -w`（npm 安装的实例照着执行会报错）。
 
 ## 0.6.5 — 2026-10-18
 

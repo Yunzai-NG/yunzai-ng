@@ -28,6 +28,32 @@ const CRASH_LIMIT = 5
 const BACKOFF_CAP_MS = 30_000
 
 /**
+ * 内核子进程的新生代半空间上限
+ *
+ * V8 在 64 位上默认放到 16MB，消息一阵密集就涨上去且不归还。机器人的分配节奏用不着那么大：
+ * 实测（内核 + 三个官方插件，1 万条消息）RSS 98.9 → 81.5MB，heap 与吞吐不变；再压到 2MB 吞吐开始掉。
+ * 只能在启动参数里给，运行时改 V8 不认，故由守护 fork 时带上。
+ */
+const SEMI_SPACE_FLAG = "--max-semi-space-size=4"
+
+/**
+ * 内核子进程的 Node 启动参数：继承父进程的，补上新生代上限
+ *
+ * 使用者自己给过（命令行或 `NODE_OPTIONS`）就不动，以他的为准。
+ * @param execArgv 父进程的启动参数
+ * @param env 环境变量
+ * @returns 子进程的启动参数
+ */
+export function childExecArgv(
+  execArgv: readonly string[] = process.execArgv,
+  env: NodeJS.ProcessEnv = process.env
+): string[] {
+  // V8 旗标里 `-` 与 `_` 等价
+  const given = [...execArgv, env["NODE_OPTIONS"] ?? ""].some(arg => arg.replaceAll("_", "-").includes("semi-space-size"))
+  return given ? [...execArgv] : [...execArgv, SEMI_SPACE_FLAG]
+}
+
+/**
  * 该不该由本进程担任守护
  *
  * 四种情形不担任，直接单进程跑内核：已是被守护的子进程、使用者以 `--no-supervise` 关掉、
@@ -84,6 +110,7 @@ export function runSupervisor(): Promise<number> {
   const spawn = (): void => {
     childReady = false
     child = fork(binPath, childArgv, {
+      execArgv: childExecArgv(),
       // 注入 pid 供内核的 detectSupervisor 认出「有自带守护」，也作为子进程「我是被守护的」的标记
       env: { ...process.env, YZNG_SUPERVISOR: String(process.pid) },
       // stdio 继承终端：标准输入适配器要 TTY，这也是自带守护相对 pm2 的好处
