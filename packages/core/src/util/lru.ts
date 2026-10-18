@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 模块职责：LRU + TTL 缓存，带并发去重
  * 依赖方向：仅依赖类型包
  * 生命周期：随创建者（插件 / 账号）一起被回收
@@ -161,10 +161,10 @@ export class LruCache<V> implements ContactCache<V> {
    * 清理队首若干个过期条目
    *
    * 只看队首是因为 LRU 序下队首最可能已经过期；全量扫描在千级条目上
-   * 会让每次写入都变成 O(n)。
+   * 会让每次写入都变成 O(n)。缺省不过期的缓存同样要扫：条目可以在 `set` 时自带存活时长
+   * （命令冷却就是这样用的），不扫的话过期的冷却记录要一直占着，直到挤满上限才被淘汰。
    */
   #sweep(): void {
-    if (this.#ttl === Number.POSITIVE_INFINITY) return
     const now = Date.now()
     let checked = 0
     for (const [key, entry] of this.#map) {
