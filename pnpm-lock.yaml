@@ -20,6 +20,9 @@ importers:
       '@typescript-eslint/parser':
         specifier: ^8.20.0
         version: 8.67.0(eslint@9.39.5)(typescript@5.9.3)
+      esbuild:
+        specifier: 0.21.5
+        version: 0.21.5
       eslint:
         specifier: ^9.18.0
         version: 9.39.5
@@ -47,12 +50,6 @@ importers:
 
   packages/core:
     dependencies:
-      '@fastify/send':
-        specifier: ^4.1.1
-        version: 4.1.1
-      '@fastify/websocket':
-        specifier: ^11.0.2
-        version: 11.3.0
       '@yunzai-ng/types':
         specifier: workspace:*
         version: link:../types
@@ -65,9 +62,6 @@ importers:
       undici:
         specifier: ^7.3.0
         version: 7.29.0
-      yaml:
-        specifier: ^2.7.0
-        version: 2.9.0
     optionalDependencies:
       better-sqlite3:
         specifier: ^11.8.1
@@ -76,9 +70,18 @@ importers:
         specifier: ^2.0.0
         version: 2.0.0
     devDependencies:
+      '@fastify/send':
+        specifier: ^4.1.1
+        version: 4.1.1
+      '@fastify/websocket':
+        specifier: ^11.0.2
+        version: 11.3.0
       '@types/better-sqlite3':
         specifier: ^7.6.12
         version: 7.6.13
+      yaml:
+        specifier: ^2.7.0
+        version: 2.9.0
 
   packages/jsx:
     dependencies:

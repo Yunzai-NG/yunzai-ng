@@ -18,9 +18,8 @@
  *             `server/api.ts` 收的是一组窄依赖加两个取值函数
  *          7) 内核不提供面板前端，只检测有没有插件提供 —— 留兜底会使「替换面板」退化成必须改内核
  */
-import { createRequire } from "node:module"
+import { readFileSync } from "node:fs"
 import { isAbsolute, join, resolve } from "node:path"
-import { fileURLToPath } from "node:url"
 import type {
   AccountsView,
   AdapterRegistryView,
@@ -53,7 +52,7 @@ import { createHttpClient, type ManagedHttpClient } from "../http/client.js"
 import { createLoggerHub, type LoggerHub } from "../logger/index.js"
 import { detectPlatform, sampleUsage } from "../platform/detect.js"
 import { sampleSystem } from "../platform/system.js"
-import { ensurePaths, resolvePaths } from "../platform/paths.js"
+import { corePackageRoot, ensurePaths, resolvePaths } from "../platform/paths.js"
 import { createEventBus, type CoreEventBus } from "../plugin/events.js"
 import { unavailableHooks, type KernelHooks } from "../plugin/hooks.js"
 import { PluginHost, createPluginsView, type LoadReport, type RegistryInspectors } from "../plugin/host.js"
@@ -77,25 +76,19 @@ const LOG_BASENAME = "yunzai"
 /** `app/stopping` 的默认等待上限毫秒 */
 const DEFAULT_STOP_TIMEOUT = 5000
 
-/** 用于读自身 package.json（ESM 里没有 __dirname，也不能 import 到 rootDir 之外） */
-const requireFromHere = createRequire(import.meta.url)
-
 /** 本进程里加载过的每一份内核的包根，跨份共享，见 `#warnDuplicateCore()` */
 const CORE_COPIES: Set<string> = ((globalThis as Record<symbol, Set<string> | undefined>)[
   Symbol.for("yunzai-ng.core-copies")
 ] ??= new Set())
-CORE_COPIES.add(fileURLToPath(new URL("../..", import.meta.url)))
+CORE_COPIES.add(corePackageRoot())
 
 /**
  * 读内核版本
- *
- * `src/kernel/app.ts` 与 `dist/kernel/app.js` 到 package.json 都是两级，
- * 所以同一个相对路径在源码运行（vitest / tsx）与编译产物下都成立。
  * @returns 版本号；读不到时返回占位值而不是抛错 —— 版本号读不到不该让机器人起不来
  */
 function readVersion(): string {
   try {
-    const pkg = requireFromHere("../../package.json") as { version?: unknown }
+    const pkg = JSON.parse(readFileSync(join(corePackageRoot(), "package.json"), "utf8")) as { version?: unknown }
     return typeof pkg.version === "string" ? pkg.version : FALLBACK_VERSION
   } catch {
     return FALLBACK_VERSION

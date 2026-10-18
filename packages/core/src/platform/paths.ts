@@ -54,15 +54,30 @@ export interface ResolvePathsOptions {
   runtime?: string
 }
 
+/** 内核包根，见 {@link corePackageRoot} */
+let coreRoot: string | undefined
+
 /**
- * 推导内核自身所在目录
+ * 内核包根目录
  *
- * 编译后本文件位于 `<pkg>/dist/platform/paths.js`，上溯两级即包根。
+ * 自本文件向上找 `name` 为 `@yunzai-ng/core` 的 package.json，而非按固定层数上溯：
+ * 源码、打包产物（`dist/index.js`、`dist/chunk-*.js`）离包根的层数各不相同。
  * @returns 内核包根目录的绝对路径
  */
-function detectRuntimeDir(): string {
-  const here = dirname(fileURLToPath(import.meta.url))
-  return resolve(here, "..", "..")
+export function corePackageRoot(): string {
+  if (coreRoot !== undefined) return coreRoot
+  const start = dirname(fileURLToPath(import.meta.url))
+  for (let dir = start; ; dir = dirname(dir)) {
+    const pkg = join(dir, "package.json")
+    if (existsSync(pkg)) {
+      try {
+        if ((JSON.parse(readFileSync(pkg, "utf8")) as { name?: unknown }).name === "@yunzai-ng/core") return (coreRoot = dir)
+      } catch {
+        // 读不了的 package.json 不是内核的，接着往上找
+      }
+    }
+    if (dirname(dir) === dir) return (coreRoot = resolve(start, "..", ".."))
+  }
 }
 
 /**
@@ -234,7 +249,7 @@ export function legacyInstance(home: string): string | undefined {
  * @returns 目录布局（全为绝对路径）
  */
 export function resolvePaths(opts: ResolvePathsOptions = {}): RuntimePaths {
-  const runtime = opts.runtime ? resolve(opts.runtime) : detectRuntimeDir()
+  const runtime = opts.runtime ? resolve(opts.runtime) : corePackageRoot()
 
   const explicit = opts.home ?? process.env.YZNG_HOME
   const home = explicit ? resolve(process.cwd(), explicit) : (findPortableRoot(runtime) ?? autoHome())

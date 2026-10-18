@@ -9,25 +9,17 @@
  *          取舍：配置的主编辑面是 WebUI，文件是产物；换来的是注释永远与当前版本
  *          一致。文件里的**值**当然完整保留。
  */
-import { createRequire } from "node:module"
+import * as yamlLib from "yaml"
 import type { Node } from "yaml"
 import type { SchemaDescriptor } from "@yunzai-ng/types"
-
-/** yaml 模块 */
-type YamlLib = typeof import("yaml")
-
-/** 已加载的 yaml；首次读写配置时才加载 */
-let yamlLib: YamlLib | undefined
 
 /**
  * 取 yaml
  *
- * 首次用到时才 require（它是 CommonJS，同步取得的与 import 的是同一份）：约七十个模块、两百多毫秒，
- * 而只用内核里一两个函数的进程（`yzng doctor`、`yzng update`）一个配置文件都不读。
+ * 静态 import 即可：发布产物里 yaml 已打进内核（见 scripts/bundle.mjs），加载只要十来毫秒。
  * @returns yaml 模块
  */
-function yaml(): YamlLib {
-  yamlLib ??= createRequire(import.meta.url)("yaml") as YamlLib
+function yaml(): typeof yamlLib {
   return yamlLib
 }
 

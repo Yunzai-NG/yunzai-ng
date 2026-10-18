@@ -10,9 +10,9 @@
     "node": ">=20.11.0"
   },
   "scripts": {
-    "build": "tsc -b tsconfig.build.json",
+    "build": "tsc -b tsconfig.build.json && node scripts/bundle.mjs",
     "build:clean": "tsc -b tsconfig.build.json --clean",
-    "watch": "tsc -b tsconfig.build.json --watch",
+    "watch": "node scripts/bundle.mjs --watch",
     "typecheck": "tsc -b tsconfig.build.json --dry",
     "typecheck:test": "tsc -p tsconfig.test.json",
     "test": "vitest run",
@@ -31,6 +31,7 @@
     "@types/node": "^22.10.5",
     "@typescript-eslint/eslint-plugin": "^8.20.0",
     "@typescript-eslint/parser": "^8.20.0",
+    "esbuild": "0.21.5",
     "eslint": "^9.18.0",
     "eslint-plugin-jsdoc": "^50.6.1",
     "typescript": "^5.7.3",

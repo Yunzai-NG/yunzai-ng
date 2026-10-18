@@ -32,22 +32,22 @@
     "src"
   ],
   "scripts": {
-    "build": "tsc -b"
+    "build": "tsc -b && node ../../scripts/bundle.mjs"
   },
   "dependencies": {
-    "@fastify/send": "^4.1.1",
-    "@fastify/websocket": "^11.0.2",
     "@yunzai-ng/types": "workspace:*",
     "croner": "^9.0.0",
     "fastify": "^5.2.1",
-    "undici": "^7.3.0",
-    "yaml": "^2.7.0"
+    "undici": "^7.3.0"
   },
   "optionalDependencies": {
     "better-sqlite3": "^11.8.1",
     "classic-level": "^2.0.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.12"
+    "@fastify/send": "^4.1.1",
+    "@fastify/websocket": "^11.0.2",
+    "@types/better-sqlite3": "^7.6.12",
+    "yaml": "^2.7.0"
   }
 }
