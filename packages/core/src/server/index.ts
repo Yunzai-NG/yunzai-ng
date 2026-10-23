@@ -34,7 +34,16 @@ import type { CoreConfigHandle } from "../config/core-config.js"
 import type { ServerSink } from "../plugin/hooks.js"
 import { createSeqFactory } from "../util/id.js"
 import { formatBytes } from "../util/duration.js"
-import { WS_PROTOCOL, checkAuth, checkForgeableBody, generateToken, type AuthRequest } from "./auth.js"
+import {
+  AuthLimiter,
+  WS_PROTOCOL,
+  checkAuth,
+  checkForgeableBody,
+  generateToken,
+  isLocalHost,
+  type AuthFailure,
+  type AuthRequest
+} from "./auth.js"
 import { resolveStaticFile, type StaticMount } from "./files.js"
 import { HTTP_METHODS, PathTable, isHttpMethod, joinPattern, splitSegments, type PathHit } from "./table.js"
 
@@ -73,6 +82,44 @@ interface FastifyModules {
 async function loadFastify(): Promise<FastifyModules> {
   const [fastify, websocketPlugin] = await Promise.all([import("fastify"), import("@fastify/websocket")])
   return { fastify: fastify.default, websocketPlugin: websocketPlugin.default }
+}
+
+/**
+ * 每个响应都带的安全头；处理函数自己给了同名头时以它的为准
+ *
+ * - `nosniff`：插件上传与静态目录里的文件不该被浏览器按内容猜成可执行的类型；
+ * - `no-referrer`：面板与插件页里的外链不把本机地址与路径带给第三方。
+ */
+const BASE_HEADERS: Readonly<Record<string, string>> = {
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer"
+}
+
+/**
+ * HTML 响应另带的防嵌入头
+ *
+ * 不带的话任何网站都能把面板嵌进自己的页面、盖一层透明的诱饵，骗已登录的人点下「删除」——
+ * 令牌在面板自己的 localStorage 里，嵌进去的面板照样是登录态。`'self'` 不妨碍面板嵌自己的
+ * 扩展页面；要被别处嵌入的插件页可以在响应里自己给这两个头。
+ */
+const FRAME_HEADERS: Readonly<Record<string, string>> = {
+  "x-frame-options": "SAMEORIGIN",
+  "content-security-policy": "frame-ancestors 'self'"
+}
+
+/**
+ * 给响应补上安全头
+ * @param reply Fastify 响应
+ */
+function applySecurityHeaders(reply: FastifyReply): void {
+  for (const [name, value] of Object.entries(BASE_HEADERS)) {
+    if (!reply.hasHeader(name)) reply.header(name, value)
+  }
+  const type = String(reply.getHeader("content-type") ?? "")
+  if (!type.includes("text/html")) return
+  // 两个头一起看：处理函数给了其中任意一个，就是它对嵌入有自己的打算
+  if (reply.hasHeader("x-frame-options") || reply.hasHeader("content-security-policy")) return
+  for (const [name, value] of Object.entries(FRAME_HEADERS)) reply.header(name, value)
 }
 
 /** `@fastify/send` 的加载；首个静态请求时才发起 */
@@ -593,6 +640,8 @@ export class ManagedServer implements ServerSink {
   readonly #routes = new Map<HttpMethod, PathTable<RouteEntry>>()
   /** WebSocket 端点表 */
   readonly #ws = new PathTable<WsEntry>()
+  /** 鉴权失败的限流，见 `AuthLimiter` */
+  readonly #limiter = new AuthLimiter()
   /** 静态挂载表 */
   readonly #static = new PathTable<StaticMount>()
   /** 请求 → 查表结果；使用 WeakMap 以免请求对象被本表长期持有 */
@@ -705,6 +754,11 @@ export class ManagedServer implements ServerSink {
       this.#onRequest(request, reply)
     )
 
+    fastify.addHook("onSend", async (_request: FastifyRequest, reply: FastifyReply, payload: unknown) => {
+      applySecurityHeaders(reply)
+      return payload
+    })
+
     // 静态文件找不到会走 `callNotFound()`，加上这个处理器是为了让
     // 404 也是 `{ error: string }` —— 面板前端只需要认一种错误形状
     fastify.setNotFoundHandler((request: FastifyRequest, reply: FastifyReply) =>
@@ -804,6 +858,49 @@ export class ManagedServer implements ServerSink {
     this.#port = typeof addr === "object" && addr !== null ? addr.port : cfg.port
     this.#listening = true
     this.#logger.info(`面板与插件路由已就绪：${this.info.publicUrl}`)
+    this.#warnExposure()
+  }
+
+  /**
+   * 监听地址不只对本机可见时提醒一次
+   *
+   * 本服务器只说 HTTP：令牌在请求头里明文过网，经公网访问时必须由反向代理套上 HTTPS。
+   * 令牌太短的那条提醒在 `serverSecurityWarning`，这里不重复。
+   */
+  #warnExposure(): void {
+    const cfg = this.#config.get().server
+    if (isLocalHost(cfg.host)) return
+    this.#logger.warn(
+      `面板监听在 ${cfg.host}，局域网乃至公网都能访问。本服务器不提供 HTTPS，令牌会明文经过网络：` +
+        `经公网访问时请放在反向代理（Nginx / Caddy）之后并启用 HTTPS，或改用 server.readonly 只读模式`
+    )
+  }
+
+  /**
+   * 带限流的鉴权
+   *
+   * 被封的地址直接 429，不再比对令牌；令牌错（401 / 403）记一次失败，带对了清掉记录。
+   * @param req 请求信息
+   * @returns 校验失败时的描述与额外响应头；通过时 undefined
+   */
+  #authorize(req: AuthRequest): AuthFailure | undefined {
+    const wait = this.#limiter.blockedFor(req.ip)
+    if (wait > 0) {
+      return {
+        status: 429,
+        message: `该地址鉴权失败次数过多，已暂时拒绝，请 ${Math.ceil(wait / 60)} 分钟后再试`,
+        headers: { "retry-after": String(wait) }
+      }
+    }
+    const failure = checkAuth(this.#token(), req)
+    if (failure === undefined) {
+      this.#limiter.succeed(req.ip)
+      return undefined
+    }
+    if (this.#limiter.fail(req.ip)) {
+      this.#logger.warn(`${req.ip} 鉴权连续失败 ${AuthLimiter.MAX_FAILURES} 次，暂时拒绝其访问 ${AuthLimiter.BLOCK_MS / 60_000} 分钟`)
+    }
+    return failure
   }
 
   /**
@@ -1025,7 +1122,7 @@ export class ManagedServer implements ServerSink {
    * @param extra 额外响应头
    * @returns 同一个 `reply`
    */
-  #reject(reply: FastifyReply, status: number, message: string, extra?: Record<string, string>): FastifyReply {
+  #reject(reply: FastifyReply, status: number, message: string, extra?: Readonly<Record<string, string>>): FastifyReply {
     if (extra !== undefined) reply.headers(extra)
     return reply.code(status).send({ error: message })
   }
@@ -1073,8 +1170,8 @@ export class ManagedServer implements ServerSink {
       const entry = route.value
       if (entry.auth) {
         const authReq: AuthRequest = { ip: ipOf(request), method, headers: request.headers }
-        const failure = checkAuth(this.#token(), authReq) ?? checkForgeableBody(authReq)
-        if (failure !== undefined) return this.#reject(reply, failure.status, failure.message)
+        const failure = this.#authorize(authReq) ?? checkForgeableBody(authReq)
+        if (failure !== undefined) return this.#reject(reply, failure.status, failure.message, failure.headers)
       }
 
       // 声明了长度就先按声明拒掉，别等把 64MB 收完再说 413
@@ -1178,7 +1275,7 @@ export class ManagedServer implements ServerSink {
 
     const verify = hit.value.verify
     if (verify === undefined) {
-      const failure = checkAuth(this.#token(), { ip: ipOf(request), method: "GET", headers: request.headers })
+      const failure = this.#authorize({ ip: ipOf(request), method: "GET", headers: request.headers })
       if (failure !== undefined) return this.#rejectUpgrade(reply, failure.status, failure.message)
     } else {
       let ok = false

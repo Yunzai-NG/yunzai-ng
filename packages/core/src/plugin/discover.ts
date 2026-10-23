@@ -298,9 +298,13 @@ const DEFAULT_PRIORITY = 100
  * 同一份插件集合在任何机器上都得到相同顺序，否则"甲机器正常、乙机器异常"
  * 这类问题会耗费大量排障时间。
  * @param units 待排序的插件定义
+ * @param running 已在运行的插件名：依赖它们的视为已满足，不参与排序
  * @returns 顺序与跳过列表
  */
-export function resolveLoadOrder<T extends OrderableUnit>(units: readonly T[]): LoadOrder<T> {
+export function resolveLoadOrder<T extends OrderableUnit>(
+  units: readonly T[],
+  running: ReadonlySet<string> = new Set()
+): LoadOrder<T> {
   const skipped: SkippedPlugin[] = []
   const byName = new Map<string, T>()
 
@@ -317,7 +321,7 @@ export function resolveLoadOrder<T extends OrderableUnit>(units: readonly T[]): 
   while (changed) {
     changed = false
     for (const [name, unit] of byName) {
-      const missing = (unit.dependencies ?? []).filter(dep => !byName.has(dep))
+      const missing = (unit.dependencies ?? []).filter(dep => !byName.has(dep) && !running.has(dep))
       if (missing.length === 0) continue
       byName.delete(name)
       skipped.push({

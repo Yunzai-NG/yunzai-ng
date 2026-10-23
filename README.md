@@ -95,7 +95,7 @@ export default definePlugin({
 | 插件 | 作用 |
 |---|---|
 | [webui-plugin](https://github.com/Yunzai-NG/webui-plugin) | 面板:七个页面、配置表单、面板插件宿主与商店 |
-| [adapter-napcat](https://github.com/Yunzai-NG/adapter-napcat) | 以 OneBot v11 接入 NapCat,提供 QQ 收发 |
+| [adapter-onebot](https://github.com/Yunzai-NG/adapter-onebot) | 以 OneBot v11 接入 NapCat 或 LLOneBot，提供 QQ 收发 |
 | [renderer-puppeteer](https://github.com/Yunzai-NG/renderer-puppeteer) | 把模板渲染成图片 |
 | [hardware-plugin](https://github.com/Yunzai-NG/hardware-plugin) | 整机硬件监控,九枚面板组件 |
 | [webui-example](https://github.com/Yunzai-NG/webui-example) | 面板插件的示例包,用于照抄 |

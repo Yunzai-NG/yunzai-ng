@@ -62,7 +62,7 @@ const RULES = [
 /*
  * 关于 `plugins` scope 的去向
  *
- * 三个官方插件已拆为独立仓库（Yunzai-NG/adapter-napcat 等），本仓库内不再有
+ * 三个官方插件已拆为独立仓库（Yunzai-NG/adapter-onebot 等），本仓库内不再有
  * plugins/ 目录，故此处不再有对应规则。「插件只许走公开入口、不许深引 core 内部
  * 实现」这条约束移交各插件仓库的 eslint no-restricted-imports 等价实现。
  *

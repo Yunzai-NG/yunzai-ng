@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest"
 import type { LogLevel, Logger } from "@yunzai-ng/types"
 import { ConfigStore } from "../config/store.js"
 import { defineCoreConfig, type CoreConfigHandle } from "../config/core-config.js"
+import { AuthLimiter } from "./auth.js"
 import { ManagedServer, createManagedServer } from "./index.js"
 
 /** 本机对端，light-my-request 默认也是这个 */
@@ -595,6 +596,80 @@ describe("ManagedServer", () => {
       await server.listen()
       expect(server.info.enabled).toBe(true)
       expect(server.info.port).toBe(port)
+    })
+  })
+
+  describe("安全响应头与鉴权失败限流", () => {
+    it("每个响应都带 nosniff 与 no-referrer；HTML 另带防嵌入头", async () => {
+      server.route("/plugin/demo", "GET", "ping", () => ({ ok: true }))
+      const json = await server.raw.inject({ method: "GET", url: "/plugin/demo/ping" })
+      expect(json.headers["x-content-type-options"]).toBe("nosniff")
+      expect(json.headers["referrer-policy"]).toBe("no-referrer")
+      expect(json.headers["x-frame-options"]).toBeUndefined()
+
+      const web = join(dir, "web-sec")
+      await mkdir(web, { recursive: true })
+      await writeFile(join(web, "index.html"), "<html>面板</html>", "utf8")
+      server.static("/", "", web)
+      const html = await server.raw.inject({ method: "GET", url: "/" })
+      expect(html.statusCode).toBe(200)
+      expect(html.headers["x-frame-options"]).toBe("SAMEORIGIN")
+      expect(html.headers["content-security-policy"]).toBe("frame-ancestors 'self'")
+    })
+
+    it("处理函数自己给了防嵌入头时不覆盖", async () => {
+      server.route("/plugin/demo", "GET", "embed", () => ({
+        status: 200,
+        headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": "frame-ancestors *" },
+        body: "<html></html>"
+      }))
+      const res = await server.raw.inject({ method: "GET", url: "/plugin/demo/embed" })
+      expect(res.headers["content-security-policy"]).toBe("frame-ancestors *")
+      expect(res.headers["x-frame-options"]).toBeUndefined()
+    })
+
+    it("同一外部地址令牌错满 30 次后 429，别的地址与本机不受影响", async () => {
+      await config.patch({ server: { token: "0123456789abcdef" } }, "api")
+      server.route("/api", "GET", "state", () => ({ ok: true }))
+      const wrong = { method: "GET" as const, url: "/api/state", headers: { authorization: "Bearer nope" } }
+      const right = { method: "GET" as const, url: "/api/state", headers: { authorization: "Bearer 0123456789abcdef" } }
+      for (let i = 0; i < AuthLimiter.MAX_FAILURES; i++) {
+        expect((await server.raw.inject({ ...wrong, remoteAddress: "10.0.0.9" })).statusCode).toBe(403)
+      }
+      // 封了之后带对令牌也不放：不然猜中的那一次照样进得来
+      const blocked = await server.raw.inject({ ...right, remoteAddress: "10.0.0.9" })
+      expect(blocked.statusCode).toBe(429)
+      expect(Number(blocked.headers["retry-after"])).toBeGreaterThan(0)
+      expect(logger.lines.some(line => line.startsWith("warn 10.0.0.9 鉴权连续失败"))).toBe(true)
+
+      expect((await server.raw.inject({ ...right, remoteAddress: "10.0.0.10" })).statusCode).toBe(200)
+      for (let i = 0; i < AuthLimiter.MAX_FAILURES + 5; i++) await server.raw.inject({ ...wrong, remoteAddress: LOCAL_IP })
+      expect((await server.raw.inject({ ...right, remoteAddress: LOCAL_IP })).statusCode).toBe(200)
+    })
+  })
+
+  describe("AuthLimiter", () => {
+    it("窗口过了重新计数，带对令牌清零，封禁到点解除", () => {
+      let now = 0
+      const limiter = new AuthLimiter(() => now)
+      for (let i = 0; i < AuthLimiter.MAX_FAILURES - 1; i++) limiter.fail("10.0.0.9")
+      now += AuthLimiter.WINDOW_MS + 1
+      expect(limiter.fail("10.0.0.9")).toBe(false)
+      expect(limiter.blockedFor("10.0.0.9")).toBe(0)
+
+      limiter.succeed("10.0.0.9")
+      for (let i = 0; i < AuthLimiter.MAX_FAILURES - 1; i++) expect(limiter.fail("10.0.0.9")).toBe(false)
+      expect(limiter.fail("10.0.0.9")).toBe(true)
+      expect(limiter.blockedFor("10.0.0.9")).toBe(AuthLimiter.BLOCK_MS / 1000)
+
+      now += AuthLimiter.BLOCK_MS
+      expect(limiter.blockedFor("10.0.0.9")).toBe(0)
+    })
+
+    it("本机地址一律不计", () => {
+      const limiter = new AuthLimiter()
+      for (let i = 0; i < AuthLimiter.MAX_FAILURES * 2; i++) expect(limiter.fail("::ffff:127.0.0.1")).toBe(false)
+      expect(limiter.blockedFor("::ffff:127.0.0.1")).toBe(0)
     })
   })
 })

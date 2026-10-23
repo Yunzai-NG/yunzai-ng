@@ -207,6 +207,8 @@ export class PluginHost {
   #chain: Promise<unknown> = Promise.resolve()
   /** 模块缓存击穿计数（热重载用） */
   #reloadEpoch = 0
+  /** 导入过的入口文件；再次导入时须击穿模块缓存，否则拿到的是旧代码 */
+  readonly #imported = new Set<string>()
 
   /**
    * @param deps 依赖
@@ -254,7 +256,6 @@ export class PluginHost {
         return false
       }
       await this.#unload(name)
-      this.#reloadEpoch++
       const definition = await this.#import(candidate)
       if (!definition) return false
       this.#logger.info(
@@ -359,12 +360,16 @@ export class PluginHost {
       logger: this.#logger
     })
 
-    this.#logger.info(`发现 ${candidates.length} 个插件，开始导入`)
+    // 已在运行的不再导入：更新、安装一个插件之后也走这里，只该装上新出现的那个
+    const running = new Set([...this.#records.values()].map(record => record.candidate.entry))
+    const pending = candidates.filter(candidate => !running.has(candidate.entry))
+    if (this.#records.size === 0) this.#logger.info(`发现 ${candidates.length} 个插件，开始导入`)
+    else if (pending.length > 0) this.#logger.info(`导入新出现的 ${pending.length} 个插件：${pending.map(c => c.id).join("、")}`)
 
     // 导入阶段可以并发：definePlugin 是纯函数，模块顶层不该有副作用
     // （有副作用的插件本来就是 bug，且并发与否都会发生）
     const pairs = await Promise.all(
-      candidates.map(async candidate => ({ candidate, definition: await this.#import(candidate) }))
+      pending.map(async candidate => ({ candidate, definition: await this.#import(candidate) }))
     )
 
     const units: { name: string; dependencies?: string[]; priority?: number; pair: (typeof pairs)[number] }[] = []
@@ -385,7 +390,7 @@ export class PluginHost {
       units.push(unit)
     }
 
-    const { order, skipped } = resolveLoadOrder(units)
+    const { order, skipped } = resolveLoadOrder(units, new Set(this.#records.keys()))
     for (const item of skipped) {
       this.#logger.warn(`跳过插件 ${item.name}：${item.reason}`)
       this.#markFailed(item.name, item.reason, this.#candidates.get(item.name))
@@ -402,7 +407,9 @@ export class PluginHost {
     }
 
     const cost = Date.now() - startedAt
-    this.#logger.info(`插件加载完成：成功 ${loaded.length} 个，失败/跳过 ${failed.length} 个，耗时 ${cost}ms`)
+    if (pairs.length > 0) {
+      this.#logger.info(`插件加载完成：成功 ${loaded.length} 个，失败/跳过 ${failed.length} 个，耗时 ${cost}ms`)
+    }
     return { loaded, failed, cost }
   }
 
@@ -415,7 +422,9 @@ export class PluginHost {
    */
   async #import(candidate: PluginCandidate): Promise<PluginDefinition | undefined> {
     const url = pathToFileURL(candidate.entry).href
-    // 首次加载不附带 query，以保持堆栈中的路径简洁易辨识
+    // 导入过的入口（卸载后更新、重装）换一个 query 击穿缓存；首次加载不带，堆栈里的路径好认
+    if (this.#imported.has(candidate.entry)) this.#reloadEpoch++
+    this.#imported.add(candidate.entry)
     const spec = this.#reloadEpoch === 0 ? url : `${url}?${RELOAD_QUERY}=${this.#reloadEpoch}`
 
     try {

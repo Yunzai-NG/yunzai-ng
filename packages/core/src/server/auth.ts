@@ -159,12 +159,107 @@ function firstValue(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value
 }
 
+/** 一个对端的失败记录 */
+interface FailureRecord {
+  /** 窗口内的失败次数 */
+  count: number
+  /** 窗口起点 */
+  since: number
+  /** 封禁到何时；未封禁时 0 */
+  blockedUntil: number
+}
+
+/**
+ * 按对端地址数鉴权失败次数，失败太多就暂时拒绝该地址
+ *
+ * 自动生成的令牌有 95 bit，爆破无从谈起；但 `server.token` 可以手填，填成 `123456` 再把端口
+ * 开到公网，没有这一层就是一台可以无限次猜的机器。阈值放得宽：一个开着旧令牌的标签页在
+ * 断线重连，十分钟里也凑不满 30 次。
+ *
+ * **本机不计。** 经反向代理进来的请求对端都是本机 —— 那时这一层无从区分来人，限流该交给代理做；
+ * 本机的使用者也不该被自己一个写错令牌的脚本锁在门外。
+ */
+export class AuthLimiter {
+  /** 窗口长度 */
+  static readonly WINDOW_MS = 10 * 60_000
+  /** 窗口内允许的失败次数 */
+  static readonly MAX_FAILURES = 30
+  /** 封禁时长 */
+  static readonly BLOCK_MS = 15 * 60_000
+  /** 最多记多少个地址；超出时先丢最早的，免得被换着地址打爆内存 */
+  static readonly MAX_ENTRIES = 4096
+
+  readonly #records = new Map<string, FailureRecord>()
+  readonly #now: () => number
+
+  /**
+   * @param now 取当前时刻，测试里换成假时钟
+   */
+  constructor(now: () => number = Date.now) {
+    this.#now = now
+  }
+
+  /**
+   * 该地址此刻是否被封
+   * @param ip 对端地址
+   * @returns 封禁剩余秒数；未封禁时 0
+   */
+  blockedFor(ip: string): number {
+    if (isLoopbackAddress(ip)) return 0
+    const rec = this.#records.get(ip)
+    if (rec === undefined) return 0
+    const left = rec.blockedUntil - this.#now()
+    return left > 0 ? Math.ceil(left / 1000) : 0
+  }
+
+  /**
+   * 记一次失败
+   * @param ip 对端地址
+   * @returns 这一次是否刚好触发了封禁（调用方据此只记一条日志）
+   */
+  fail(ip: string): boolean {
+    if (isLoopbackAddress(ip)) return false
+    const now = this.#now()
+    let rec = this.#records.get(ip)
+    if (rec === undefined || now - rec.since > AuthLimiter.WINDOW_MS) {
+      rec = { count: 0, since: now, blockedUntil: 0 }
+      this.#records.delete(ip)
+      this.#records.set(ip, rec)
+      this.#prune()
+    }
+    rec.count++
+    if (rec.count >= AuthLimiter.MAX_FAILURES && rec.blockedUntil <= now) {
+      rec.blockedUntil = now + AuthLimiter.BLOCK_MS
+      return true
+    }
+    return false
+  }
+
+  /**
+   * 该地址带对了令牌：清掉它的记录
+   * @param ip 对端地址
+   */
+  succeed(ip: string): void {
+    this.#records.delete(ip)
+  }
+
+  /** 超出上限时丢掉最早插入的那些（Map 按插入序迭代） */
+  #prune(): void {
+    for (const key of this.#records.keys()) {
+      if (this.#records.size <= AuthLimiter.MAX_ENTRIES) return
+      this.#records.delete(key)
+    }
+  }
+}
+
 /** 鉴权失败的描述 */
 export interface AuthFailure {
   /** 建议的 HTTP 状态码 */
   readonly status: number
   /** 给人看的原因，会直接写进响应体 */
   readonly message: string
+  /** 额外的响应头，如封禁时的 `retry-after` */
+  readonly headers?: Readonly<Record<string, string>>
 }
 
 /** 一次鉴权要用到的请求信息 */

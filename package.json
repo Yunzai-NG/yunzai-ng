@@ -1,6 +1,6 @@
 {
   "name": "yunzai-ng",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "private": true,
   "type": "module",
   "description": "Yunzai NG - 面向 QQ 机器人的可插拔运行时内核（Windows / Android）",
@@ -22,6 +22,7 @@
     "check:layering": "node scripts/check-layering.mjs",
     "check:firstrun": "node scripts/smoke-firstrun.mjs",
     "bench:memory": "node scripts/bench-memory.mjs",
+    "bench:startup": "node scripts/bench-startup.mjs",
     "verify": "pnpm run build && pnpm run check:layering && pnpm run check:firstrun && pnpm run typecheck:test && pnpm run lint && pnpm run test",
     "dev": "node packages/cli/dist/bin.js dev",
     "start": "node packages/cli/dist/bin.js start"

@@ -16,24 +16,23 @@
  *          3) **Mock 的发送记录要定期清**。`createMockAdapter()` 会把每一条发出去的
  *             消息留在数组里，那是测试替身的账，不该记到内核头上。
  *
- * 用法：node scripts/bench-memory.mjs        （跑全部场景并打印汇总）
+ * 用法：node scripts/bench-memory.mjs                  （跑全部场景并打印汇总，内核取本仓库的构建产物）
+ *      node scripts/bench-memory.mjs --core <目录>     （换一份内核，如 npm 装下来的旧版，见 bench-core.mjs）
  *      node scripts/bench-memory.mjs --scenario minimal   （子进程模式，只跑一个）
  */
 import { spawn } from "node:child_process"
-import { existsSync } from "node:fs"
-import { mkdir, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises"
+import { createServer } from "node:net"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { setImmediate } from "node:timers"
 import { tmpdir } from "node:os"
-import { dirname, join, resolve } from "node:path"
+import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import v8 from "node:v8"
 import vm from "node:vm"
+import { ROOT, coreTargets, linkOfficial, pinCore, unlinkOfficial } from "./bench-core.mjs"
 
 /** 本脚本绝对路径 */
 const SELF = fileURLToPath(import.meta.url)
-
-/** 本仓库根目录 */
-const ROOT = resolve(dirname(SELF), "..")
 
 /** 压测消息条数，来自计划里的"1 万条消息压测" */
 const TOTAL = 10_000
@@ -68,27 +67,46 @@ const SCENARIOS = {
     builtin: false
   },
   bundled: {
-    title: "内核 + 三个官方插件",
+    title: "内核 + 四个官方插件",
     builtin: true
   }
 }
 
 /**
- * 场景二加载的官方插件：取自与本仓库并列的 `repos/`（须已构建）
+ * 压测用的内核配置：内存 KV，把被测面收窄到消息管线本身
  *
- * 链进一个临时目录再交给内核，而不是直接扫 `repos/`：那里还有文档与索引仓，扫进来全是警告。
+ * 纯内核关掉服务器；带官方插件时开在本机一个空闲端口上 —— 面板插件离了服务器挂不上，那不是真实部署。
+ * @param port 服务器端口；省略即关掉服务器
+ * @returns YAML 文本
  */
-const BUNDLED = ["adapter-napcat", "renderer-puppeteer", "yenai-state"]
+function configYaml(port) {
+  const server = port === undefined ? ["  enable: false"] : ["  enable: true", "  host: 127.0.0.1", `  port: ${port}`, "  token: bench-token-0123456789"]
+  return ["store:", "  driver: memory", "  sqlite: false", "server:", ...server, ""].join("\n")
+}
 
-/** 压测用的内核配置：内存 KV + 关掉面板，把被测面收窄到消息管线本身 */
-const CONFIG_YAML = [
-  "store:",
-  "  driver: memory",
-  "  sqlite: false",
-  "server:",
-  "  enable: false",
-  ""
-].join("\n")
+/**
+ * 取一个本机空闲端口
+ * @returns 端口号
+ */
+function freePort() {
+  return new Promise((done, fail) => {
+    const probe = createServer()
+    probe.on("error", fail)
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address()
+      probe.close(() => done(port))
+    })
+  })
+}
+
+/**
+ * 命令行里 `--core` 给的内核目录
+ * @returns 目录；没给时 undefined（即本仓库的构建产物）
+ */
+function coreDirArg() {
+  const at = process.argv.indexOf("--core")
+  return at === -1 ? undefined : process.argv[at + 1]
+}
 
 /**
  * 睡一小会儿
@@ -148,23 +166,20 @@ async function runScenario(name) {
   const scenario = SCENARIOS[name]
   if (!scenario) throw new Error(`未知场景 ${name}，可选：${Object.keys(SCENARIOS).join(" / ")}`)
 
-  const { createApp } = await import("../packages/core/dist/index.js")
-  const { createMockAdapter } = await import("../packages/core/dist/testing/index.js")
+  const targets = coreTargets(coreDirArg())
+  pinCore(targets)
+  const { createApp } = await import(targets.core)
+  const { createMockAdapter } = await import(targets.testing)
 
   const home = await mkdtemp(join(tmpdir(), "yzng-bench-"))
   await mkdir(join(home, "config"), { recursive: true })
-  await writeFile(join(home, "config", "yunzai.yaml"), CONFIG_YAML, "utf8")
+  await writeFile(join(home, "config", "yunzai.yaml"), configYaml(scenario.builtin ? await freePort() : undefined), "utf8")
 
   const builtinDirs = []
+  let linked = []
   if (scenario.builtin) {
-    const dir = join(home, "bundled")
-    await mkdir(dir)
-    for (const name of BUNDLED) {
-      const src = join(ROOT, "..", "repos", name)
-      if (!existsSync(join(src, "dist", "index.js"))) throw new Error(`场景 ${name} 需要先构建 ${src}`)
-      await symlink(src, join(dir, name), "junction")
-    }
-    builtinDirs.push(dir)
+    linked = await linkOfficial(join(home, "bundled"))
+    builtinDirs.push(join(home, "bundled"))
   }
 
   const app = await createApp({ home, console: false, watchConfig: false, builtinDirs })
@@ -225,14 +240,14 @@ async function runScenario(name) {
 
   const handled = app.runtime.dispatcher.handled
   await app.stop()
-  // 先逐个拆掉 junction 再删目录：递归删除万一顺着链接走，删掉的就是插件仓库本身
-  if (scenario.builtin) for (const name of BUNDLED) await unlink(join(home, "bundled", name))
+  if (scenario.builtin) await unlinkOfficial(join(home, "bundled"), linked)
   await rm(home, { recursive: true, force: true })
   const stopped = await settled()
 
   return {
     scenario: name,
     title: scenario.title,
+    core: targets.version,
     plugins,
     total: TOTAL,
     handled,
@@ -253,7 +268,9 @@ async function runScenario(name) {
  */
 function forkScenario(name) {
   return new Promise((done, fail) => {
-    const child = spawn(process.execPath, [SELF, "--scenario", name], { stdio: ["ignore", "pipe", "inherit"] })
+    const core = coreDirArg()
+    const args = [SELF, "--scenario", name, ...(core === undefined ? [] : ["--core", core])]
+    const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "inherit"] })
     let out = ""
     child.stdout.setEncoding("utf8")
     child.stdout.on("data", chunk => {
@@ -294,7 +311,8 @@ async function main() {
     return
   }
 
-  console.log(`Node ${process.version} / ${process.platform}-${process.arch}，每场景 ${TOTAL} 条消息`)
+  const core = coreTargets(coreDirArg()).version
+  console.log(`Node ${process.version} / ${process.platform}-${process.arch}，内核 ${core}，每场景 ${TOTAL} 条消息`)
   const results = []
   for (const name of Object.keys(SCENARIOS)) {
     console.log(`\n▶ 场景 ${name}…`)
@@ -303,11 +321,11 @@ async function main() {
     printResult(result)
   }
 
-  const out = join(ROOT, "..", "temp", "bench-memory.json")
+  const out = join(ROOT, "..", "temp", `bench-memory-${core}.json`)
   await mkdir(dirname(out), { recursive: true })
   await writeFile(
     out,
-    JSON.stringify({ node: process.version, platform: `${process.platform}-${process.arch}`, at: new Date().toISOString(), results }, undefined, 2),
+    JSON.stringify({ node: process.version, platform: `${process.platform}-${process.arch}`, core, at: new Date().toISOString(), results }, undefined, 2),
     "utf8"
   )
   console.log(`\n明细已写入 ${out}`)

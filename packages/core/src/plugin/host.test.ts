@@ -406,20 +406,44 @@ describe("PluginHost 加载", () => {
     expect(h.host.size).toBe(0)
   })
 
-  it("重复 loadAll 不会把同一个插件装两遍", async () => {
+  it("重复 loadAll 只装新出现的插件，已在运行的不再导入", async () => {
     const h = await makeHarness()
-    await writePlugin(
-      h,
-      "ok",
-      `export default { name: "ok", setup(ctx) { ctx.command("#a") } }`
-    )
+    await writePlugin(h, "ok", `export default { name: "ok", setup(ctx) { ctx.command("#a"); globalThis.__yzngMarks.push("ok") } }`)
 
     await h.host.loadAll()
-    await h.host.loadAll()
+    await writePlugin(h, "fresh", `export default { name: "fresh", setup() { globalThis.__yzngMarks.push("fresh") } }`)
+    const report = await h.host.loadAll()
 
-    expect(h.host.size).toBe(1)
+    expect(report.loaded).toEqual(["fresh"])
+    expect(marks()).toEqual(["ok", "fresh"])
+    expect(h.host.size).toBe(2)
     expect(h.recorded.commands).toHaveLength(1)
-    expect(h.logger.lines.some(l => l.includes("忽略重复加载"))).toBe(true)
+    expect(h.logger.lines.some(l => l.includes("忽略重复加载"))).toBe(false)
+  })
+
+  it("卸载后改了磁盘上的代码，再 loadAll 跑的是新代码 —— 市场更新就是这条路", async () => {
+    const h = await makeHarness()
+    await writePlugin(h, "upd", `export default { name: "upd", setup() { globalThis.__yzngMarks.push("v1") } }`)
+    await h.host.loadAll()
+
+    await h.host.unload("upd")
+    await writePlugin(h, "upd", `export default { name: "upd", setup() { globalThis.__yzngMarks.push("v2") } }`)
+    const report = await h.host.loadAll()
+
+    expect(report.loaded).toEqual(["upd"])
+    expect(marks()).toEqual(["v1", "v2"])
+  })
+
+  it("新装的插件依赖一个已在运行的插件时照常加载", async () => {
+    const h = await makeHarness()
+    await writePlugin(h, "base", `export default { name: "base", setup() {} }`)
+    await h.host.loadAll()
+
+    await writePlugin(h, "child", `export default { name: "child", dependencies: ["base"], setup() {} }`)
+    const report = await h.host.loadAll()
+
+    expect(report.loaded).toEqual(["child"])
+    expect(report.failed).toEqual([])
   })
 })
 
