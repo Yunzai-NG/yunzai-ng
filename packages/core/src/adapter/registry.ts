@@ -19,7 +19,10 @@ import type { AdapterSink } from "../plugin/hooks.js"
 export type AdapterSummary = Pick<
   AdapterProvider,
   "id" | "name" | "description" | "platform" | "accountSchema" | "loginModes"
->
+> & {
+  /** 名下机器人是否接受群配置（提供方插件声明了 `groupRules`）；面板的 `GET adapters` 才补上 */
+  groupRules?: boolean
+}
 
 /** 注册表内部条目 */
 export interface AdapterEntry {

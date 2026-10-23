@@ -165,6 +165,12 @@ export interface ApiDeps {
   readonly registries: ApiRegistries
   /** 适配器注册表（此处只读视图即可满足需要：注册由插件负责） */
   readonly adapters: AdapterRegistryView
+  /**
+   * 适配器由哪个插件提供；用来判它名下的机器人接不接受群配置。省略时一律当不接受
+   * @param id 适配器 id
+   * @returns 插件名
+   */
+  readonly adapterOwner?: (id: string) => string | undefined
   /** 账号管理器 */
   readonly accounts: AccountManager
   /** 登录会话管理器 */
@@ -531,6 +537,8 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
       counts: {
         plugins: plugins.length,
         pluginsFailed: plugins.filter(p => p.status === "error").length,
+        // 其中单文件插件几个：`plugins` 仍是总数，旧面板照旧读得对
+        scripts: plugins.filter(p => p.file !== undefined).length,
         commands: deps.registries.commands().length,
         tasks: deps.registries.tasks().length,
         adapters: deps.adapters.list().length,
@@ -587,6 +595,23 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     const state = deps.plugins.get(name)
     if (state === undefined) throw fail(404, `没有名为 ${name} 的插件`)
     return state
+  })
+
+  /*
+   * 重新扫一遍插件目录：加载新出现的与先前卸掉的，单文件插件另按磁盘增删改同步
+   *
+   * 面板「全部更新」的收尾：逐个更新时都带 `load: false`，最后在这里一次装回，
+   * 而不是每更新完一个就整份扫一遍。段数与 `plugins/:name` 相同，故注册在它之前。
+   */
+  add("POST", "plugins/rescan", async () => {
+    requireWritable()
+    const scripts = await deps.plugins.syncSingles()
+    const report = await deps.plugins.loadAll()
+    return {
+      loaded: [...scripts.loaded, ...report.loaded],
+      failed: [...scripts.failed, ...report.failed],
+      removed: scripts.removed
+    }
   })
 
   add("POST", "plugins/:name/reload", async req => {
@@ -905,7 +930,13 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
 
   /* ────────────────────── 适配器与账号 ────────────────────── */
 
-  add("GET", "adapters", () => deps.adapters.list())
+  // 补上「名下机器人接不接受群配置」：判据在插件宿主那边，注册表不认识插件
+  add("GET", "adapters", () =>
+    deps.adapters.list().map(a => {
+      const owner = deps.adapterOwner?.(a.id)
+      return owner !== undefined && deps.plugins.acceptsGroupRules(owner) ? { ...a, groupRules: true } : a
+    })
+  )
 
   // 账号配置里含连接密钥，同 GET config/:name 一样刻意不脱敏
   add("GET", "accounts", () => deps.accounts.list())
@@ -981,6 +1012,22 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     const state = accountOf(req.params.id)
     await deps.accounts.reconnect(state.record.id)
     return deps.accounts.get(state.record.id)
+  })
+
+  // 面板「群规则」挑群用：只读，问的是平台，故账号须在线
+  add("GET", "accounts/:id/groups", async req => {
+    const state = accountOf(req.params.id)
+    const bot = deps.bots.get(state.record.id)
+    if (bot === undefined) throw fail(409, "账号不在线，取不到群列表")
+    try {
+      return (await bot.getGroupList()).map(group => ({
+        gid: group.gid,
+        ...(group.name === undefined ? {} : { name: group.name }),
+        ...(group.memberCount === undefined ? {} : { memberCount: group.memberCount })
+      }))
+    } catch (err) {
+      throw fail(502, `取群列表失败：${messageOf(err)}`)
+    }
   })
 
   /* ────────────────────────── 交互式登录 ────────────────────────── */

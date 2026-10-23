@@ -53,6 +53,8 @@ interface PackageManifest {
     disabled?: boolean
     /** 入口文件 */
     entry?: string
+    /** 其适配器名下机器人是否接受群配置，见类型包 `PluginMeta.groupRules` */
+    groupRules?: boolean
   }
 }
 

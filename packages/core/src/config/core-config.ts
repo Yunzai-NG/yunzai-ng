@@ -165,6 +165,14 @@ export const coreConfigSchema = s.object({
         .default([])
         .title("禁用的插件")
         .desc("按插件名精确匹配。禁用后完全不加载，不占内存。"),
+      watchScripts: s
+        .boolean()
+        .default(true)
+        .title("单文件插件热加载")
+        .desc(
+          "盯住插件目录里的单文件 js（如 plugins/example/ 下的）：放进来即加载，拿走即卸载，改了即重载，不用重启。" +
+            "目录插件不在此列，它们要编译、装依赖，改完在插件页重载。改本项后需重启生效。"
+        ),
       hotReload: s
         .boolean()
         .default(false)
@@ -248,6 +256,75 @@ export const coreConfigSchema = s.object({
     .group("消息")
     .order(60),
 
+  scope: s
+    .object({
+      prefix: s
+        .tags()
+        .default([])
+        .title("全局群前缀")
+        .desc(
+          "填了之后，群里的命令要先带上其中一个才响应：前缀填「小云」时发「小云#帮助」才算，直接发「#帮助」不理。" +
+            "可以填几个，带上任意一个都算。留空表示不要前缀。私聊不受影响。"
+        ),
+      disabled: s
+        .tags()
+        .default([])
+        .title("全局禁用")
+        .desc("在所有群里都不响应的插件或命令：写插件名禁掉整个插件，写「插件名:命令名」只禁那一条。私聊不受影响。"),
+      presets: s
+        .array(
+          s.object({
+            name: s.string().default("").title("名字"),
+            prefixMode: s
+              .select([
+                { value: "inherit", label: "沿用全局" },
+                { value: "custom", label: "单独设" },
+                { value: "none", label: "不要前缀" }
+              ])
+              .default("inherit")
+              .title("前缀"),
+            prefix: s.tags().default([]).title("前缀").showWhen({ prefixMode: ["custom"] }),
+            ownDisabled: s.boolean().default(false).title("单独设禁用"),
+            disabled: s.tags().default([]).title("禁用").showWhen({ ownDisabled: [true] })
+          })
+        )
+        .default([])
+        .title("规则组")
+        .desc("起好名字的一套前缀与禁用，群配置里选它即整套套用；改规则组，用了它的群一并跟着变。"),
+      rules: s
+        .array(
+          s.object({
+            account: s
+              .string()
+              .default("*")
+              .title("机器人账号")
+              .desc("机器人的 QQ 号（或其他平台的账号 id）；* 表示所有机器人。"),
+            groups: s.tags().default([]).title("群号").desc("留空表示这个账号的全部群。"),
+            preset: s.string().default("").title("套用").desc("填规则组的名字即整套套用，下面几项不再看；留空用下面几项。"),
+            prefixMode: s
+              .select([
+                { value: "inherit", label: "沿用全局" },
+                { value: "custom", label: "单独设" },
+                { value: "none", label: "不要前缀" }
+              ])
+              .default("inherit")
+              .title("前缀"),
+            prefix: s.tags().default([]).title("前缀").showWhen({ prefixMode: ["custom"] }),
+            ownDisabled: s.boolean().default(false).title("单独设禁用").desc("打开后只认下面这份，全局禁用不再生效。"),
+            disabled: s.tags().default([]).title("禁用").showWhen({ ownDisabled: [true] })
+          })
+        )
+        .default([])
+        .title("群配置")
+        .desc(
+          "优先于全局。一个群同时落进几条规则时：写了群号的优先于「全部群」，指名账号的优先于 *，同一档里靠后的那条优先。"
+        )
+    })
+    // 0.7.1 开发期的旧写法，一条规则只管一个群
+    .deprecated("groups")
+    .title("群配置")
+    .group("消息")
+    .order(65),
   render: s
     .object({
       default: s

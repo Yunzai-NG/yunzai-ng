@@ -98,6 +98,12 @@ export interface RuntimeDeps {
    */
   readonly plugins: (name: string) => PluginRuntimeView | undefined
   /**
+   * 某个插件是否声明了 `groupRules`，由插件宿主提供；分发器据此判一个机器人的适配器接不接受群配置
+   * @param name 插件名
+   * @returns 是否声明
+   */
+  readonly groupRules?: (name: string) => boolean
+  /**
    * 登记一个需要在停机时回收的动作
    *
    * 回收按登记的**逆序**执行，见 `kernel/app.ts` 的 `own()`。
@@ -244,7 +250,17 @@ export function installRuntime(deps: RuntimeDeps): RuntimeParts {
     prompts,
     plugins: deps.plugins,
     // 只读一次：信号量的容量在构造时定下，见文件头第 4 条
-    concurrency: config.get().message.concurrency
+    concurrency: config.get().message.concurrency,
+    scope: () => config.get().scope,
+    // 适配器注册表在下面才建，这里现查；没有宿主的判据（单测）时一律接受
+    ...(deps.groupRules === undefined
+      ? {}
+      : {
+          groupRules: (adapterId: string) => {
+            const owner = adapters.entry(adapterId)?.owner
+            return owner !== undefined && deps.groupRules!(owner)
+          }
+        })
   })
 
   // ── 2. 调度器与渲染 ───────────────────────────────────────────────────

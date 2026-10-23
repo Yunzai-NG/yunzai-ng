@@ -7,7 +7,7 @@
  *          2. 中间件 —— 可改写 `message`、可注入字段、可 `stop()`
  *          3. `e.prompt()` 等待者 —— 在中间件之后（让改写生效）、路由之前（正在回答问题时
  *             不该同时触发命令，否则会收到两条回复）
- *          4. 命令路由 —— 只做纯查询与零成本静态过滤
+ *          4. 命令路由 —— 只做纯查询与零成本静态过滤；群消息先过群规则（前缀与禁用，见 scope.ts）
  *          5. 冷却 —— 命中之后才计费，且主人豁免
  *          6. 处理函数 —— 返回 `false` 继续找下一条，`block !== false` 则命中即止
  *
@@ -37,6 +37,7 @@ import type { EventFactory, PluginRuntimeView, RuntimeMessageEvent } from "./eve
 import type { MiddlewarePipeline } from "./middleware.js"
 import type { PromptRegistry } from "./prompt.js"
 import type { CommandRouter, RouterCandidate } from "./router.js"
+import { isScopeDisabled, isScopeEmpty, resolveScope, stripScopePrefix, type ScopeRules } from "./scope.js"
 
 /**
  * 分发器需要的策略视图
@@ -88,6 +89,21 @@ export interface EventDispatcherOptions {
    * 闸门的位置有讲究，见 `#route` 的注释。
    */
   readonly concurrency?: number
+  /**
+   * 取当前的群规则（前缀与禁用），见 scope.ts
+   *
+   * 每条群消息现取：配置改了下一条就按新的判。省略即不启用。
+   * @returns 规则
+   */
+  readonly scope?: () => ScopeRules
+  /**
+   * 某个适配器名下的机器人是否接受群配置（提供它的插件声明了 `groupRules`）；省略即都接受
+   *
+   * 不接受的机器人在群里照常收发，前缀与禁用一概不管。
+   * @param adapterId 适配器 id
+   * @returns 是否接受
+   */
+  readonly groupRules?: (adapterId: string) => boolean
 }
 
 /**
@@ -123,6 +139,10 @@ export class EventDispatcher {
   readonly #gate: Semaphore | undefined
   /** 闸门积压到多少条开始告警 */
   readonly #backlogWarnAt: number
+  /** 取群规则；未启用时 undefined */
+  readonly #scope: (() => ScopeRules) | undefined
+  /** 适配器名下的机器人是否接受群配置 */
+  readonly #groupRules: (adapterId: string) => boolean
 
   /** 累计处理的事件数，用于 WebUI 的运行状态 */
   #handled = 0
@@ -142,6 +162,8 @@ export class EventDispatcher {
     this.#cooldown = opts.cooldown
     this.#prompts = opts.prompts
     this.#plugins = opts.plugins
+    this.#scope = opts.scope
+    this.#groupRules = opts.groupRules ?? (() => true)
 
     const limit = opts.concurrency ?? 0
     this.#gate = limit > 0 ? new Semaphore(limit) : undefined
@@ -274,10 +296,10 @@ export class EventDispatcher {
    * @param e 运行时消息事件
    */
   async #route(e: RuntimeMessageEvent): Promise<void> {
-    // 命中等待者即消费掉这条消息，不再进路由
+    // 命中等待者即消费掉这条消息，不再进路由；回话不要求群前缀
     if (this.#prompts.offer(e)) return
 
-    const candidates = this.#router.match(e)
+    const candidates = this.#scoped(e)
     if (candidates.length === 0) return
 
     const gate = this.#gate
@@ -295,6 +317,37 @@ export class EventDispatcher {
       }
     }
     return gate.use(() => this.#invokeAll(e, candidates))
+  }
+
+  /**
+   * 按群规则路由：要前缀的群先剥前缀，再滤掉本群禁用的命令
+   *
+   * 剥掉的前缀直接写回 `e.text`：插件按 `e.text` / `e.command.rest` 取参数，留着前缀的话
+   * 每个插件都得自己认一遍。没带前缀的消息不进路由，但 `message` 事件照发 —— 统计要数它。
+   * @param e 运行时消息事件
+   * @returns 候选命令
+   */
+  #scoped(e: RuntimeMessageEvent): RouterCandidate[] {
+    const rules = this.#scope?.()
+    const gid = e.group?.gid
+    if (rules === undefined || !e.isGroup || gid === undefined || isScopeEmpty(rules) || !this.#groupRules(e.bot.adapterId)) {
+      return this.#router.match(e)
+    }
+
+    const scope = resolveScope(rules, e.selfId, gid)
+    const text = stripScopePrefix(e.text, scope.prefix)
+    if (text === undefined) return []
+    e.text = text
+
+    const candidates = this.#router.match(e)
+    if (scope.disabled.size === 0) return candidates
+    return candidates.filter(c => {
+      const off = isScopeDisabled(scope, c.reg.plugin, c.match.name)
+      if (off && this.#logger.isLevelEnabled("debug")) {
+        this.#logger.debug(`命令 ${c.reg.plugin}:${c.match.name} 在群 ${gid} 已禁用，跳过`)
+      }
+      return !off
+    })
   }
 
   /**

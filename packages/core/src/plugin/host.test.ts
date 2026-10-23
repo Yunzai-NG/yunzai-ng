@@ -13,7 +13,7 @@
  *          2) 需要 `s`（配置 schema）时从 `globalThis` 取测试注入的那一份 ——
  *             `instanceof Schema` 要求同一个类实例，只能以此方式传递。
  */
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
@@ -792,6 +792,72 @@ describe("PluginHost 热重载", () => {
     expect(h.host.size).toBe(0)
     expect(h.host.get("hot")).toMatchObject({ status: "error" })
     expect(h.recorded.commands).toEqual([])
+  })
+})
+
+describe("PluginHost 单文件插件同步", () => {
+  /**
+   * 往 plugins/example 写一个单文件插件，并把修改时间往后拨，免得与上一次落在同一刻
+   * @param h 宿主套件
+   * @param file 文件名
+   * @param pattern 它注册的命令
+   * @param bump 修改时间往后拨几秒
+   */
+  const writeScript = async (h: Harness, file: string, pattern: string, bump = 0): Promise<void> => {
+    const dir = join(h.pluginsDir, "example")
+    await mkdir(dir, { recursive: true })
+    const full = join(dir, file)
+    await writeFile(full, `${BRAND}export default { setup(ctx) { ctx.command("${pattern}") }, [brand]: true }`, "utf8")
+    const at = new Date(Date.now() + bump * 1000)
+    await utimes(full, at, at)
+  }
+
+  it("放进来的加载、改过的重载、拿走的卸载，目录插件不受牵连", async () => {
+    const h = await makeHarness()
+    await writePlugin(h, "dirplug", `export default { name: "dirplug", setup(ctx) { ctx.command("#目录") } }`)
+    await writeScript(h, "dice.js", "#骰子")
+    await h.host.loadAll()
+
+    await writeScript(h, "coin.js", "#硬币")
+    expect((await h.host.syncSingles()).loaded).toEqual(["coin"])
+
+    await writeScript(h, "dice.js", "#骰子2", 5)
+    const changed = await h.host.syncSingles()
+    expect(changed.loaded).toEqual(["dice"])
+    expect(h.recorded.commands.map(c => c.patterns[0]).sort()).toEqual(["#目录", "#硬币", "#骰子2"].sort())
+
+    await rm(join(h.pluginsDir, "example", "coin.js"))
+    expect((await h.host.syncSingles()).removed).toEqual(["coin"])
+    expect(h.host.get("coin")).toBeUndefined()
+    expect(h.host.get("dirplug")).toMatchObject({ status: "loaded" })
+  })
+
+  it("没变化时什么都不动；坏掉的那份不反复重试，改好后再载", async () => {
+    const h = await makeHarness()
+    await writeScript(h, "dice.js", "#骰子")
+    await h.host.loadAll()
+    expect(await h.host.syncSingles()).toEqual({ loaded: [], failed: [], cost: expect.any(Number), removed: [] })
+
+    const broken = join(h.pluginsDir, "example", "bad.js")
+    await writeFile(broken, "export default {", "utf8")
+    expect((await h.host.syncSingles()).failed.map(f => f.name)).toEqual(["bad"])
+    expect((await h.host.syncSingles()).failed).toEqual([])
+
+    await writeScript(h, "bad.js", "#好了", 5)
+    expect((await h.host.syncSingles()).loaded).toEqual(["bad"])
+  })
+
+  it("加载失败的单文件插件被拿走后，状态一并消失", async () => {
+    const h = await makeHarness()
+    const dir = join(h.pluginsDir, "example")
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "bad.js"), "export default {", "utf8")
+    await h.host.loadAll()
+    expect(h.host.get("bad")?.status).toBe("error")
+
+    await rm(join(dir, "bad.js"))
+    expect((await h.host.syncSingles()).removed).toEqual(["bad"])
+    expect(h.host.list()).toEqual([])
   })
 })
 

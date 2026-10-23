@@ -10,6 +10,7 @@
  *          3) 依赖失败要连带处理：`resolveLoadOrder` 只剔除未安装的依赖，故 setup 前再查一次实际状态
  *          4) 热重载只是开发期功能：Node 的 ESM 缓存清不掉，每次重载永久留下一份旧模块连同其闭包
  */
+import { stat } from "node:fs/promises"
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 import type {
@@ -159,6 +160,29 @@ export interface LoadReport {
 }
 
 /**
+ * 插件是否声明了 `groupRules`：定义里写的优先，其次 package.json 的 `yunzai.groupRules`
+ * @param definition 插件定义
+ * @param candidate 候选，含 package.json
+ * @returns 是否接受
+ */
+function groupRulesOf(definition: PluginDefinition, candidate: PluginCandidate): boolean {
+  return (definition.groupRules ?? candidate.manifest?.yunzai?.groupRules) === true
+}
+
+/**
+ * 取文件的修改时间
+ * @param file 文件路径
+ * @returns 毫秒时间戳；读不到时 -1
+ */
+async function stampOf(file: string): Promise<number> {
+  try {
+    return (await stat(file)).mtimeMs
+  } catch {
+    return -1
+  }
+}
+
+/**
  * 将未知错误转换为一段可读描述
  * @param err 错误
  * @returns 错误描述
@@ -209,6 +233,10 @@ export class PluginHost {
   #reloadEpoch = 0
   /** 导入过的入口文件；再次导入时须击穿模块缓存，否则拿到的是旧代码 */
   readonly #imported = new Set<string>()
+  /** 单文件插件入口 → 导入时的修改时间，`syncSingles` 据此判断改没改 */
+  readonly #stamps = new Map<string, number>()
+  /** 加载失败的单文件插件入口 → 失败那一份的修改时间 */
+  readonly #failed = new Map<string, number>()
 
   /**
    * @param deps 依赖
@@ -303,6 +331,16 @@ export class PluginHost {
   }
 
   /**
+   * 某个插件是否声明了 `groupRules`（它注册的适配器名下机器人接受群配置）
+   * @param name 插件名
+   * @returns 是否声明；未加载时 false
+   */
+  acceptsGroupRules(name: string): boolean {
+    const record = this.#records.get(name)
+    return record !== undefined && groupRulesOf(record.definition, record.candidate)
+  }
+
+  /**
    * 按名取插件的运行时上下文
    *
    * 供事件分发器使用：执行某插件的命令时，`e.render()` 要用该插件的模板根、
@@ -347,25 +385,102 @@ export class PluginHost {
   }
 
   /**
-   * 扫描 → 导入 → 排序 → 依次 setup
-   * @returns 加载汇总
+   * 扫描全部插件目录
+   * @returns 候选
    */
-  async #loadAll(): Promise<LoadReport> {
-    const startedAt = Date.now()
+  #discover(): Promise<PluginCandidate[]> {
     const dirs = [...(this.#deps.extraDirs ?? []), this.#deps.paths.plugins, ...(this.#deps.builtinDirs ?? [])]
-    const candidates = await discoverPlugins({
+    return discoverPlugins({
       dirs,
       builtinDirs: this.#deps.builtinDirs,
       disabled: this.#deps.disabled,
       logger: this.#logger
     })
+  }
+
+  /**
+   * 扫描 → 导入 → 排序 → 依次 setup
+   * @returns 加载汇总
+   */
+  async #loadAll(): Promise<LoadReport> {
+    const startedAt = Date.now()
+    const candidates = await this.#discover()
 
     // 已在运行的不再导入：更新、安装一个插件之后也走这里，只该装上新出现的那个
     const running = new Set([...this.#records.values()].map(record => record.candidate.entry))
     const pending = candidates.filter(candidate => !running.has(candidate.entry))
     if (this.#records.size === 0) this.#logger.info(`发现 ${candidates.length} 个插件，开始导入`)
     else if (pending.length > 0) this.#logger.info(`导入新出现的 ${pending.length} 个插件：${pending.map(c => c.id).join("、")}`)
+    return this.#loadCandidates(pending, startedAt)
+  }
 
+  /**
+   * 让单文件插件与磁盘一致：新放进来的加载、拿走的卸载、改过的重载
+   *
+   * 只碰单文件插件：目录插件要编译、要装依赖，半途改动时加载只会报一串错，它们走插件页的重载与市场。
+   * 导入失败的那份记下修改时间，文件没再动过就不重试 —— 否则目录里随便一个文件变动，
+   * 那条导入错误就再刷一遍。
+   * @returns 加载汇总，`removed` 为卸掉的插件名
+   */
+  async syncSingles(): Promise<LoadReport & { removed: string[] }> {
+    return this.#serial(async () => {
+      const startedAt = Date.now()
+      const found = (await this.#discover()).filter(candidate => candidate.single === true)
+      const present = new Set(found.map(candidate => candidate.entry))
+      const removed: string[] = []
+      const changed: string[] = []
+
+      for (const [name, record] of [...this.#records]) {
+        const entry = record.candidate.entry
+        if (record.candidate.single !== true) continue
+        if (!present.has(entry)) {
+          await this.#unload(name)
+          this.#candidates.delete(name)
+          this.#stamps.delete(entry)
+          removed.push(name)
+        } else if ((await stampOf(entry)) !== this.#stamps.get(entry)) {
+          await this.#unload(name)
+          changed.push(name)
+        }
+      }
+      // 加载失败的单文件插件只有一条状态，文件拿走了它也该一起消失
+      for (const [name, state] of [...this.#states]) {
+        if (state.status !== "error" || state.file === undefined || present.has(state.file)) continue
+        this.#states.delete(name)
+        this.#candidates.delete(name)
+        this.#failed.delete(state.file)
+        removed.push(name)
+      }
+
+      const running = new Set([...this.#records.values()].map(record => record.candidate.entry))
+      const pending: PluginCandidate[] = []
+      for (const candidate of found) {
+        if (running.has(candidate.entry)) continue
+        const failedAt = this.#failed.get(candidate.entry)
+        if (failedAt !== undefined && failedAt === (await stampOf(candidate.entry))) continue
+        pending.push(candidate)
+      }
+
+      if (removed.length > 0) this.#logger.info(`单文件插件已移除：${removed.join("、")}`)
+      if (changed.length > 0) this.#logger.info(`单文件插件有改动，重新加载：${changed.join("、")}`)
+      if (pending.length === 0) return { loaded: [], failed: [], cost: Date.now() - startedAt, removed }
+      const report = await this.#loadCandidates(pending, startedAt)
+      const loaded = new Set([...this.#records.values()].map(record => record.candidate.entry))
+      for (const candidate of pending) {
+        if (loaded.has(candidate.entry)) this.#failed.delete(candidate.entry)
+        else this.#failed.set(candidate.entry, this.#stamps.get(candidate.entry) ?? 0)
+      }
+      return { ...report, removed }
+    })
+  }
+
+  /**
+   * 导入 → 排序 → 依次 setup
+   * @param pending 要加载的候选
+   * @param startedAt 起算时刻
+   * @returns 加载汇总
+   */
+  async #loadCandidates(pending: readonly PluginCandidate[], startedAt: number): Promise<LoadReport> {
     // 导入阶段可以并发：definePlugin 是纯函数，模块顶层不该有副作用
     // （有副作用的插件本来就是 bug，且并发与否都会发生）
     const pairs = await Promise.all(
@@ -421,6 +536,8 @@ export class PluginHost {
    * @returns 插件定义；失败时 undefined
    */
   async #import(candidate: PluginCandidate): Promise<PluginDefinition | undefined> {
+    // 导入之前记：导入途中文件又被改了的话，下一次同步看到的时间对不上，会再载一次
+    if (candidate.single === true) this.#stamps.set(candidate.entry, await stampOf(candidate.entry))
     const url = pathToFileURL(candidate.entry).href
     // 导入过的入口（卸载后更新、重装）换一个 query 击穿缓存；首次加载不带，堆栈里的路径好认
     if (this.#imported.has(candidate.entry)) this.#reloadEpoch++
@@ -712,6 +829,7 @@ export class PluginHost {
       configured
     }
     if (candidate.single === true) state.file = candidate.entry
+    if (groupRulesOf(definition, candidate)) state.groupRules = true
     const description = definition.description ?? manifest?.description
     if (description !== undefined) state.description = description
     if (author !== undefined) state.author = author

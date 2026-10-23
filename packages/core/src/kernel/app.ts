@@ -58,6 +58,7 @@ import { unavailableHooks, type KernelHooks } from "../plugin/hooks.js"
 import { PluginHost, createPluginsView, type LoadReport, type RegistryInspectors } from "../plugin/host.js"
 import { PluginMarket } from "../plugin/market.js"
 import { createServiceRegistry, type ServiceRegistry } from "../plugin/services.js"
+import { watchScripts } from "../plugin/watch.js"
 import { openKv, type KvStore } from "../store/index.js"
 import { withTimeout } from "../util/defer.js"
 import { parseDuration } from "../util/duration.js"
@@ -442,6 +443,9 @@ export class App {
     }
     this.logger.info(`插件就绪：成功 ${report.loaded.length} 个，失败 ${report.failed.length} 个，耗时 ${report.cost}ms`)
     this.#warnDuplicateCore()
+    if (this.settings.plugins.watchScripts) {
+      this.own(watchScripts({ root: this.paths.plugins, logger: this.logger, onChange: () => this.plugins.syncSingles() }))
+    }
 
     // 监听要卡在这两步中间：
     // - 在 loadAll() 之后，插件的路由才齐，不会出现"面板半截可用"的窗口期；
@@ -822,6 +826,7 @@ export async function createApp(opts: CreateAppOptions = {}): Promise<App> {
     hooks,
     subsystems,
     plugins: name => host.runtime(name),
+    groupRules: name => host.acceptsGroupRules(name),
     own: dispose => void disposers.push(dispose)
   })
 
@@ -872,6 +877,7 @@ export async function createApp(opts: CreateAppOptions = {}): Promise<App> {
           middlewares: () => subsystems.registries.middlewares()
         },
         adapters: runtime.adapters,
+        adapterOwner: id => runtime.adapters.entry(id)?.owner,
         accounts: runtime.accounts,
         logins: runtime.logins,
         bots: runtime.bots,

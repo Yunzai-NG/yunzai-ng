@@ -47,6 +47,7 @@ export default {
   name: "${PLUGIN}",
   version: "0.0.1",
   description: "测试用：注册内存 Mock 适配器并挂几条命令",
+  groupRules: globalThis.__yzngGroupRules !== false,
   setup(ctx) {
     ctx.registerAdapter(globalThis.__yzngMock)
 
@@ -136,6 +137,9 @@ async function login(app: App, selfId = "10000"): Promise<string> {
   expect(app.runtime.accounts.get(record.id)?.status).toBe("online")
   return record.id
 }
+
+// 每条都起一个真实例；首条还要等整个内核第一次 import，机器忙时会越过缺省的 5 秒
+vi.setConfig({ testTimeout: 20_000 })
 
 afterEach(async () => {
   await current?.stop()
@@ -591,6 +595,83 @@ describe("适配器生命周期", () => {
     expect(app.view.bots.size).toBe(0)
     expect(mock.driver.disconnects).toBe(1)
     expect(mock.driver.online).toBe(false)
+  })
+})
+
+describe("群规则", () => {
+  /**
+   * 发一串消息，再补一条私聊 `#ping`，等够预期条数后返回全部回复（已排序）
+   *
+   * 末尾那条恒能回复；等够之后再让一拍，被拦下的那几条若漏了出来，会让条数多于预期。
+   * @param mock Mock 适配器
+   * @param send 发消息
+   * @param expected 预期回复条数，含末尾的 pong
+   * @returns 回复文本，排过序
+   */
+  const repliesOf = async (mock: MockAdapter, send: () => void, expected: number): Promise<string[]> => {
+    send()
+    mock.driver.receivePrivate("#ping")
+    await mock.waitForSend(expected)
+    await new Promise(resolve => setTimeout(resolve, 50))
+    return [...mock.texts].sort()
+  }
+
+  it("全局前缀：群里不带前缀不理，带了照常；私聊不受影响", async () => {
+    const { app, mock } = await boot("scope:\n  prefix: [小云, 阿云]\n")
+    await login(app)
+    const texts = await repliesOf(mock, () => {
+      mock.driver.receiveGroup("#谁", { gid: "800001", uid: "20001" })
+      mock.driver.receiveGroup("小云 #谁", { gid: "800001", uid: "20002" })
+      mock.driver.receiveGroup("阿云#谁", { gid: "800001", uid: "20009" })
+    }, 3)
+    expect(texts).toEqual(["pong", "你是 20002", "你是 20009"].sort())
+  })
+
+  it("群规则优先：本群不要前缀时直接发 #命令", async () => {
+    const yaml =
+      "scope:\n  prefix: 小云\n  rules:\n    - account: '*'\n      groups: ['800002']\n      prefixMode: none\n"
+    const { app, mock } = await boot(yaml)
+    await login(app)
+    const texts = await repliesOf(mock, () => {
+      mock.driver.receiveGroup("#谁", { gid: "800002", uid: "20003" })
+      mock.driver.receiveGroup("#谁", { gid: "800001", uid: "20004" })
+    }, 2)
+    expect(texts).toEqual(["pong", "你是 20003"].sort())
+  })
+
+  it("全局禁用单条命令；某个群套用「放开」套餐后照常响应", async () => {
+    const yaml =
+      "scope:\n  disabled:\n    - 'mock-adapter:#谁'\n  presets:\n    - name: 放开\n      ownDisabled: true\n      disabled: []\n  rules:\n" +
+      "    - account: '10000'\n      groups: ['800003']\n      preset: 放开\n"
+    const { app, mock } = await boot(yaml)
+    await login(app)
+    const texts = await repliesOf(mock, () => {
+      mock.driver.receiveGroup("#谁", { gid: "800001", uid: "20005" })
+      mock.driver.receiveGroup("#谁", { gid: "800003", uid: "20006" })
+      mock.driver.receivePrivate("#谁", { uid: "20007" })
+    }, 3)
+    expect(texts).toEqual(["pong", "你是 20006", "你是 20007"].sort())
+  })
+
+  it("适配器插件没声明 groupRules 时，它的机器人在群里不受群配置约束", async () => {
+    ;(globalThis as Record<string, unknown>).__yzngGroupRules = false
+    try {
+      const { app, mock } = await boot("scope:\n  prefix: 小云\n  disabled: ['mock-adapter:#谁']\n")
+      await login(app)
+      const texts = await repliesOf(mock, () => mock.driver.receiveGroup("#谁", { gid: "800001", uid: "20011" }), 2)
+      expect(texts).toEqual(["pong", "你是 20011"].sort())
+    } finally {
+      delete (globalThis as Record<string, unknown>).__yzngGroupRules
+    }
+  })
+
+  it("指名账号的「全部群」规则只管那个号", async () => {
+    const yaml =
+      "scope:\n  rules:\n    - account: '99999'\n      ownDisabled: true\n      disabled: [mock-adapter]\n"
+    const { app, mock } = await boot(yaml)
+    await login(app)
+    const texts = await repliesOf(mock, () => mock.driver.receiveGroup("#谁", { gid: "800004", uid: "20008" }), 2)
+    expect(texts).toEqual(["pong", "你是 20008"].sort())
   })
 })
 

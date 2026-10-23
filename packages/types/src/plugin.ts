@@ -390,6 +390,8 @@ export interface PluginState {
   builtin: boolean
   /** 是否声明了配置 schema；加载失败的插件恒为假，其 `setup` 未执行 */
   configured: boolean
+  /** 是否声明了 `groupRules`（其适配器名下机器人接受群配置），见 `PluginMeta.groupRules`；旧内核不给 */
+  groupRules?: boolean
 }
 
 /** 插件管理视图 */
@@ -899,6 +901,13 @@ export interface PluginMeta {
   provides?: string[]
   /** 加载优先级，小者先加载，缺省 100 */
   priority?: number
+  /**
+   * 本插件注册的适配器，其名下机器人接受群配置（内核配置 `scope`：群前缀与禁用），缺省不接受
+   *
+   * 给适配器插件用：声明了，它接入的机器人才出现在面板「群配置」的账号里、能取群列表来配，群里的消息也才按
+   * 群配置判前缀与禁用；没声明的适配器名下的机器人在群里照常收发。package.json 里写 `yunzai.groupRules: true` 等效。
+   */
+  groupRules?: boolean
 }
 
 /**
