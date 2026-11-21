@@ -154,7 +154,7 @@ export class LoggerHub {
   /** 是否输出控制台 */
   readonly #console: boolean
   /** 是否着色 */
-  readonly #color: boolean
+  #color: boolean
   /** 作用域列宽 */
   readonly #scopeWidth: number
 
@@ -265,6 +265,12 @@ export class LoggerHub {
   subscribe(fn: (rec: LogRecord) => void): Disposer {
     this.#subscribers.add(fn)
     return () => void this.#subscribers.delete(fn)
+  }
+
+  /** 配置加载或重载后更新输出策略，不替换已被插件持有的日志器。 */
+  configureOutput(opts: { color: boolean; maxSize: number; keepDays: number; maxFiles: number }): void {
+    this.#color = opts.color && supportsColor()
+    this.#writer?.configure(opts)
   }
 
   /** 同步刷盘 */
@@ -419,12 +425,12 @@ class HubLogger implements Logger {
   }
 
   /**
-   * 重要信息，等价于 `info`
+   * 日常标记
    * @param msg 消息
    * @param args 附加参数
    */
   mark(msg: unknown, ...args: unknown[]): void {
-    this.#emit("info", msg, args)
+    this.#emit("mark", msg, args)
   }
 
   /**

@@ -181,7 +181,8 @@ export function runSupervisor(): Promise<number> {
    *
    * Ctrl+C 时父子同处一个控制台组、子进程也收到了 SIGINT 并自行优雅停机，父进程只需置位
    * 收工、等它停完；在 Windows 上转发（`child.kill`）反而是硬杀。非 Windows 上信号可能只发给
-   * 父进程（`kill <父pid>`），故转发一手，那里的转发对子进程是优雅的。
+   * 父进程（`kill <父pid>`），故转发一手，那里的转发对子进程是优雅的。终端那一份与转发的这一份
+   * 前后脚到，内核的 `handleSignals` 把一秒内的第二个当作副本，不会误判成「连按两次」。
    * @param signal 信号名
    */
   const onSignal = (signal: NodeJS.Signals): void => {
@@ -207,6 +208,7 @@ export function runSupervisor(): Promise<number> {
 
   process.on("SIGINT", onSignal)
   process.on("SIGTERM", onSignal)
+  process.on("SIGHUP", onSignal)
 
   print(dim(`  守护已就绪（pid ${process.pid}），启动实例…`))
   spawn()

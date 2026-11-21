@@ -14,9 +14,9 @@ import { gzipSync } from "node:zlib"
 import { readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import { AbortError, sleep } from "../util/defer.js"
-import { HttpError, createHttpClient, sanitizeHeaders, sanitizeUrl, type ManagedHttpClient } from "./client.js"
+import { HttpError, createHttpClient, proxyFromEnv, sanitizeHeaders, sanitizeUrl, type ManagedHttpClient } from "./client.js"
 
 /** 服务器实例 */
 let server: Server
@@ -134,6 +134,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       res.end("<html>网关错误页</html>")
       return
 
+    case "/unfinished-error":
+      res.writeHead(503)
+      res.write("未结束")
+      return
+
     case "/404":
       res.writeHead(404, { "content-type": "text/plain" })
       res.end("资源不存在")
@@ -193,6 +198,23 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     case "/file":
       res.writeHead(200, { "content-type": "application/octet-stream" })
       res.end(Buffer.from("下载内容", "utf8"))
+      return
+
+    case "/trickle": {
+      // 每 40ms 一块，共 8 块：总时长远超 150ms，但没有一次空闲超过它
+      res.writeHead(200, { "content-type": "application/octet-stream" })
+      for (let i = 0; i < 8; i++) {
+        res.write(Buffer.from(String(i)))
+        await new Promise(r => setTimeout(r, 40))
+      }
+      res.end()
+      return
+    }
+
+    case "/stall":
+      // 响应头之后再无下文
+      res.writeHead(200, { "content-type": "application/octet-stream" })
+      res.write(Buffer.from("0"))
       return
 
     case "/broken-stream":
@@ -439,6 +461,22 @@ describe("重试", () => {
     expect(hits.get("flaky:none")).toBe(1)
   })
 
+  it("客户端缺省的重试只给幂等方法，POST 不重发（避免重复下单、重复计费）", async () => {
+    const http = makeClient({ retry: { times: 2, delay: "1ms" } })
+    await expect(http.request(`${base}/count`, { method: "POST", query: { k: "post" }, json: {} })).rejects.toThrow(/500/)
+    expect(hits.get("count:post")).toBe(1)
+    await expect(http.get(`${base}/count`, { query: { k: "get" } })).rejects.toThrow(/500/)
+    expect(hits.get("count:get")).toBe(3)
+  })
+
+  it("POST 在这一次请求上显式给了 retry 时照办", async () => {
+    const http = makeClient()
+    await expect(
+      http.request(`${base}/count`, { method: "POST", query: { k: "post-explicit" }, json: {}, retry: { times: 1, delay: "1ms" } })
+    ).rejects.toThrow(/500/)
+    expect(hits.get("count:post-explicit")).toBe(2)
+  })
+
   it("重试次数用尽后抛最后一次的错误", async () => {
     const http = makeClient()
     await expect(
@@ -517,6 +555,22 @@ describe("download", () => {
     await expect(readFile(dest)).rejects.toThrow(/ENOENT/)
     await expect(readFile(`${dest}.part`)).rejects.toThrow(/ENOENT/)
   })
+
+  it("超时只限到响应头，持续有数据的慢下载不被掐断", async () => {
+    const http = makeClient()
+    const dest = join(dir, "trickle.bin")
+
+    await expect(http.download(`${base}/trickle`, dest, { timeout: 150 })).resolves.toBe(dest)
+    await expect(readFile(dest, "utf8")).resolves.toBe("01234567")
+  })
+
+  it("响应体停滞超过超时仍会中断，不留半个文件", async () => {
+    const http = makeClient()
+    const dest = join(dir, "stall.bin")
+
+    await expect(http.download(`${base}/stall`, dest, { timeout: 150 })).rejects.toThrow()
+    await expect(readFile(`${dest}.part`)).rejects.toThrow(/ENOENT/)
+  })
 })
 
 describe("extend", () => {
@@ -543,7 +597,59 @@ describe("extend", () => {
   })
 })
 
+describe("环境代理", () => {
+  const env = { HTTP_PROXY: "http://http-proxy", HTTPS_PROXY: "http://https-proxy", NO_PROXY: ".internal.test:8080,host.test" }
+  it("命中回环的请求不交给环境代理，显式代理仍优先", async () => {
+    const proxy = createServer()
+    const connects: string[] = []
+    proxy.on("connect", (req, socket) => {
+      connects.push(req.url ?? "")
+      socket.end("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+    })
+    await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve))
+    const address = proxy.address()
+    if (!address || typeof address === "string") throw new Error("测试代理未绑定端口")
+    const uri = `http://127.0.0.1:${address.port}`
+    vi.stubEnv("http_proxy", uri)
+    vi.stubEnv("no_proxy", "")
+    try {
+      const http = makeClient({ useEnvProxy: true })
+      await expect(http.get(`${base}/json`)).resolves.toMatchObject({ ok: true })
+      expect(connects).toEqual([])
+      await expect(http.get("http://proxy-check.invalid/")).rejects.toThrow()
+      await expect(http.get(`${base}/json`, { proxy: uri })).rejects.toThrow()
+      expect(connects).toEqual(["proxy-check.invalid:80", new URL(base).host])
+    } finally {
+      vi.unstubAllEnvs()
+      await new Promise<void>(resolve => proxy.close(() => resolve()))
+    }
+  })
+
+  it("依目标协议选代理，端口和域名按边界匹配", () => {
+    expect(proxyFromEnv(new URL("https://external.test"), env)).toBe(env.HTTPS_PROXY)
+    expect(proxyFromEnv(new URL("http://external.test"), env)).toBe(env.HTTP_PROXY)
+    for (const url of ["http://127.3.2.1", "http://[::1]", "https://localhost", "http://sub.internal.test:8080", "https://host.test"]) {
+      expect(proxyFromEnv(new URL(url), env)).toBeUndefined()
+    }
+    expect(proxyFromEnv(new URL("http://notinternal.test:8080"), env)).toBe(env.HTTP_PROXY)
+    expect(proxyFromEnv(new URL("http://sub.internal.test"), env)).toBe(env.HTTP_PROXY)
+    expect(proxyFromEnv(new URL("https://external.test"), { ...env, no_proxy: "*" })).toBeUndefined()
+    expect(proxyFromEnv(new URL("http://external.test"), { HTTPS_PROXY: env.HTTPS_PROXY })).toBeUndefined()
+  })
+})
+
+it("拒绝未结束的错误流后，唯一连接可立即服务下一次请求", async () => {
+  const http = makeClient({ connections: 1, timeout: 0 })
+  await expect(http.request(`${base}/unfinished-error`, { responseType: "stream" })).rejects.toMatchObject({ status: 503 })
+  await expect(http.get(`${base}/json`, { timeout: 2000 })).resolves.toMatchObject({ ok: true })
+})
+
 describe("脱敏", () => {
+  it("代理 userinfo 和无效地址里的凭据均不进入日志", () => {
+    expect(sanitizeUrl("http://sample-user:sample-pass@proxy.test:123/")).toBe("http://proxy.test:123/")
+    expect(sanitizeUrl("http://sample-user:sample-pass@[").includes("sample-pass")).toBe(false)
+  })
+
   it("URL 里的 authkey 等密钥被打码", () => {
     const masked = sanitizeUrl("https://hk4e-api.mihoyo.com/gacha?authkey=ABCDEFGHIJKLMNOP&size=20&uid=114")
 

@@ -9,13 +9,13 @@
  *
  *          夹具中固定 `store.driver: memory` 与 `store.sqlite: false`：
  *          用例待验证的是**装配**，而非存储驱动本身（后者见 store/kv.test.ts），
- *          同时规避 classic-level / better-sqlite3 两个原生模块，
+ *          同时规避 SQLite 绑定，
  *          使该组用例在 Termux 一类无法编译原生模块的环境中同样可执行。
  */
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import type { CommandInfo } from "@yunzai-ng/types"
 import { SubsystemUnavailableError } from "../plugin/hooks.js"
 import { createApp, type App, type CreateAppOptions } from "./app.js"
@@ -82,6 +82,15 @@ describe("createApp", () => {
     }
     expect(app.settings.server.port).toBe(2536)
     expect(app.kv.driver).toBe("memory")
+  })
+
+  // 沿用缺省值起来，存储目录、端口都不是使用者的那份；随后的生成令牌还会用缺省值覆盖整个文件
+  it("内核配置坏了就不启动，坏文件原样留着", async () => {
+    const home = await makeHome("server:\n  port: 99999\n")
+    const file = join(home, "config", "yunzai.yaml")
+    const before = await readFile(file, "utf8")
+    await expect(createApp({ home, version: "t", console: false, watchConfig: false })).rejects.toThrow(/内核不启动[\s\S]*server\.port/)
+    expect(await readFile(file, "utf8")).toBe(before)
   })
 
   it("配置文件里的值覆盖 schema 默认值", async () => {
@@ -279,5 +288,29 @@ describe("面板的挂载归属", () => {
     // 归属指向插件，且这是**唯一**的形态：面板由插件提供，内核只做检测，
     // 因此"替换面板前端"不需要改内核
     expect(app.hooks.server.claimant("/")).toBe("plugin:webui")
+  })
+})
+
+describe("handleSignals", () => {
+  // Unix 上 Ctrl+C 发给整个进程组，自带守护又转发一次：两个 SIGINT 前后脚到
+  it("紧跟着的第二个信号当作同一次按键，不硬退出；隔一阵再按才强退", async () => {
+    const app = await makeApp()
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never)
+    vi.spyOn(app, "stop").mockReturnValue(new Promise(() => undefined))
+    const listeners = process.listeners("SIGINT")
+    const release = app.handleSignals()
+    try {
+      const handler = process.listeners("SIGINT").find(l => !listeners.includes(l)) as (s: NodeJS.Signals) => void
+      handler("SIGINT")
+      handler("SIGINT")
+      expect(exit).not.toHaveBeenCalled()
+
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + 5000)
+      handler("SIGINT")
+      expect(exit).toHaveBeenCalledWith(1)
+    } finally {
+      release()
+      vi.restoreAllMocks()
+    }
   })
 })

@@ -59,6 +59,8 @@ export interface MessageRecord {
 
 /** 发送选项 */
 export interface SendOptions {
+  /** 被动回复的入站消息 id，不控制引用样式 */
+  replyTo?: string
   /** 引用回复的目标消息 id */
   quote?: string
   /** 若目标平台支持，多少毫秒后自动撤回 */
@@ -170,7 +172,7 @@ export interface BotApi {
    * @param nodes 转发节点
    * @returns 发送结果
    */
-  sendForward?(target: SendTarget, nodes: ForwardNode[]): Promise<SendResult>
+  sendForward?(target: SendTarget, nodes: ForwardNode[], opts?: Pick<SendOptions, "replyTo" | "quote">): Promise<SendResult>
 
   /**
    * 修改群名片（需 `caps` 含 `groupCard`）

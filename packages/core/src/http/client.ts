@@ -26,13 +26,25 @@ import type {
   HttpRetryOptions,
   Logger
 } from "@yunzai-ng/types"
-import { AbortError, backoffDelay, sleep } from "../util/defer.js"
+import { AbortError, backoffDelay, linkSignals, sleep } from "../util/defer.js"
 import { parseDuration } from "../util/duration.js"
 import { ensureDir } from "../util/fs.js"
 import { maskSecret } from "../util/text.js"
 
 /** 默认超时（毫秒） */
 const DEFAULT_TIMEOUT = 10_000
+
+/**
+ * 可提前撤销的超时信号；`AbortSignal.timeout()` 撤不掉
+ * @param ms 时长
+ * @returns 信号与撤销函数
+ */
+function deadlineSignal(ms: number): { signal: AbortSignal; clear: () => void } {
+  const controller = new AbortController()
+  const t = setTimeout(() => controller.abort(new DOMException("请求超时", "TimeoutError")), ms)
+  t.unref()
+  return { signal: controller.signal, clear: () => clearTimeout(t) }
+}
 
 /** 默认缓冲上限：64 MiB */
 const DEFAULT_MAX_BODY = 64 * 1024 * 1024
@@ -42,6 +54,9 @@ const MAX_REDIRECTIONS = 5
 
 /** 默认会重试的状态码 */
 const RETRY_STATUSES: readonly number[] = [408, 429, 500, 502, 503, 504]
+
+/** 重发不改变结果的方法，客户端缺省的重试只作用于它们 */
+const IDEMPOTENT = new Set(["GET", "HEAD", "OPTIONS", "PUT", "DELETE"])
 
 /** 重试等待的上限（毫秒）：`Retry-After` 说等一小时也不真等 */
 const MAX_RETRY_DELAY = 30_000
@@ -87,9 +102,6 @@ const SECRET_QUERY_KEYS: readonly string[] = [
 
 /** 请求头里需要打码的键（小写比对） */
 const SECRET_HEADER_KEYS: readonly string[] = ["cookie", "authorization", "x-rpc-device_fp", "ds"]
-
-/** 从环境变量里读代理的顺序 */
-const PROXY_ENV_KEYS: readonly string[] = ["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "ALL_PROXY"]
 
 /** HTTP 请求失败 */
 export class HttpError extends Error {
@@ -186,13 +198,13 @@ interface ResolvedRequest {
   /** 响应解析方式 */
   responseType: HttpResponseType
   /** 代理地址；false 表示直连 */
-  proxy: string | false
+  proxy: string | false | undefined
   /** 跟随重定向次数 */
   redirections: number
   /** 非 2xx 是否抛错 */
   throwOnError: boolean
-  /** 外部中止信号 */
-  signal: AbortSignal | undefined
+  /** 外部中止信号：客户端默认的与单次请求的，不预先合并（见 linkSignals） */
+  signals: readonly (AbortSignal | undefined)[]
 }
 
 /**
@@ -205,10 +217,10 @@ export function sanitizeUrl(raw: string): string {
   try {
     parsed = new URL(raw)
   } catch {
-    // 拼错的 URL 也可能带密钥，整体截断了事
-    return raw.length > 120 ? `${raw.slice(0, 120)}…` : raw
+    return "[无效 URL]"
   }
-
+  parsed.username = ""
+  parsed.password = ""
   for (const key of [...parsed.searchParams.keys()]) {
     if (!SECRET_QUERY_KEYS.includes(key.toLowerCase())) continue
     const value = parsed.searchParams.get(key) ?? ""
@@ -228,22 +240,6 @@ export function sanitizeHeaders(headers: Record<string, string>): Record<string,
     safe[key] = SECRET_HEADER_KEYS.includes(key.toLowerCase()) ? maskSecret(value) : value
   }
   return safe
-}
-
-/**
- * 合并两个中止信号
- *
- * 用于把「客户端默认信号」（如插件的卸载信号）与「单次请求的信号」并成一个：
- * 任一触发即中止。两者都缺省时返回 undefined，此时不给 undici 传 signal。
- * @param a 一个信号
- * @param b 另一个信号
- * @returns 合并后的信号；都没有时 undefined
- */
-function mergeSignals(a: AbortSignal | undefined, b: AbortSignal | undefined): AbortSignal | undefined {
-  const list = [a, b].filter((s): s is AbortSignal => s !== undefined)
-  if (list.length === 0) return undefined
-  if (list.length === 1) return list[0]
-  return AbortSignal.any(list)
 }
 
 /**
@@ -406,16 +402,22 @@ function isRetryableNetworkError(err: unknown): boolean {
   ].includes(code)
 }
 
-/**
- * 从环境变量里挑一个代理
- * @returns 代理地址；没配时 undefined
- */
-function proxyFromEnv(): string | undefined {
-  for (const key of PROXY_ENV_KEYS) {
-    const value = process.env[key]
-    if (value && value.trim()) return value.trim()
+/** 根据目标协议、端口和旁路名单选择环境代理。 */
+export function proxyFromEnv(url: URL, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const host = url.hostname.toLowerCase().replace(/\.$/, "")
+  if (host === "localhost" || host.endsWith(".localhost") || host === "[::1]" ||
+    /^127(?:\.\d+){3}$/.test(host) || /^\[::ffff:7f[\da-f]{2}:[\da-f]+\]$/.test(host)) return undefined
+  const port = url.port || (url.protocol === "https:" ? "443" : "80")
+  for (const rule of (env.no_proxy ?? env.NO_PROXY ?? "").toLowerCase().split(/[,\s]+/)) {
+    if (rule === "*") return undefined
+    const match = /^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/.exec(rule)
+    if (!match || (match[2] && match[2] !== port)) continue
+    const domain = match[1]!.replace(/^\*?\./, "").replace(/\.$/, "")
+    if (domain && (host === domain || host.endsWith(`.${domain}`))) return undefined
   }
-  return undefined
+  const all = env.all_proxy || env.ALL_PROXY
+  const selected = url.protocol === "https:" ? env.https_proxy || env.HTTPS_PROXY : env.http_proxy || env.HTTP_PROXY
+  return (selected || all)?.trim() || undefined
 }
 
 /**
@@ -469,11 +471,6 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
   /** 组合后的派发器：键为 `代理|重定向次数` */
   const dispatchers = new Map<string, Dispatcher>()
 
-  const envProxy = (opts.useEnvProxy ?? true) ? proxyFromEnv() : undefined
-  if (envProxy && opts.proxy === undefined) {
-    logger?.info(`已从环境变量读到代理：${sanitizeUrl(envProxy)}`)
-  }
-
   /**
    * 取（或建）一个基础连接池
    * @param lib undici 模块
@@ -499,13 +496,19 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
    * @param redirections 跟随重定向次数
    * @returns 派发器
    */
-  function dispatcherFor(lib: Undici, proxy: string, redirections: number): Dispatcher {
-    const key = `${proxy}|${redirections}`
+  function dispatcherFor(lib: Undici, proxy: ResolvedRequest["proxy"], redirections: number): Dispatcher {
+    const key = JSON.stringify([proxy, redirections])
     let dispatcher = dispatchers.get(key)
     if (dispatcher) return dispatcher
     // 只装重定向拦截器。解压刻意不走 interceptors.decompress()，改在 once() 里
     // 手工套 zlib —— 理由见 decodeStream 的注释
-    dispatcher = baseAgent(lib, proxy).compose(lib.interceptors.redirect({ maxRedirections: redirections }))
+    const agent = baseAgent(lib, proxy || "")
+    const route: Dispatcher.DispatcherComposeInterceptor = direct => (options, handler) => {
+      const selected = options.origin && proxyFromEnv(new URL(options.origin))
+      return selected ? baseAgent(lib, selected).dispatch(options, handler) : direct(options, handler)
+    }
+    const redirect = lib.interceptors.redirect({ maxRedirections: redirections })
+    dispatcher = proxy === undefined ? agent.compose(route, redirect) : agent.compose(redirect)
     dispatchers.set(key, dispatcher)
     return dispatcher
   }
@@ -542,7 +545,8 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
       }
 
       const method = (options.method ?? (body === undefined ? "GET" : "POST")).toUpperCase()
-      const proxyChoice = options.proxy ?? defaults.proxy ?? envProxy ?? false
+      const explicitProxy = options.proxy ?? defaults.proxy
+      const proxyChoice = explicitProxy === false ? false : explicitProxy?.trim() || (opts.useEnvProxy === false ? false : undefined)
       const follow = options.followRedirect ?? true
 
       // 提前校验：非法头字符交给 undici 只会换来一句 `invalid x-foo header`
@@ -554,30 +558,65 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
         headers,
         body,
         timeout: parseDuration(options.timeout ?? defaults.timeout, DEFAULT_TIMEOUT),
-        retry: normalizeRetry(options.retry ?? defaults.retry),
+        // 客户端缺省的重试只给幂等方法：POST/PATCH 重发会让服务端执行两三遍（重复下单、重复计费）。
+        // 调用方在这一次请求上显式给了 retry 才照办
+        retry: normalizeRetry(options.retry ?? (IDEMPOTENT.has(method) ? defaults.retry : 0)),
         responseType: options.responseType ?? "json",
         proxy: proxyChoice,
         redirections: follow ? MAX_REDIRECTIONS : 0,
         throwOnError: options.throwOnError ?? true,
-        signal: mergeSignals(defaults.signal, options.signal)
+        signals: [defaults.signal, options.signal]
       }
     }
 
     /**
      * 发一次请求（不含重试）
+     *
+     * 每次尝试一个独立的超时信号；与调用方信号合并，谁先触发都能中断底层连接。
+     * 注意不能用 withTimeout 包一层了事 —— 那样只是调用方不等了，
+     * socket 还在那儿挂着，重试几轮就把连接池占满。
      * @param req 最终参数
      * @returns 完整响应
      */
     async function once<T>(req: ResolvedRequest): Promise<HttpResponse<T>> {
+      const deadline = req.timeout > 0 ? deadlineSignal(req.timeout) : undefined
+      const timer = deadline?.signal
+      const linked = linkSignals([timer, ...req.signals])
+      let streamed = false
+      try {
+        const res = await sendOnce<T>(req, linked.signal, timer)
+        if (req.responseType === "stream") {
+          // 流式：总时长只管到响应头；往后由 bodyTimeout 按空闲计，否则大文件下到一半会被掐断。
+          // 读的人还要靠调用方信号中止，等流关了再摘监听
+          deadline?.clear()
+          streamed = true
+          const body = res.data as unknown as Readable
+          body.once("close", linked.dispose)
+          body.once("error", linked.dispose)
+        }
+        return res
+      } finally {
+        if (!streamed) {
+          deadline?.clear()
+          linked.dispose()
+        }
+      }
+    }
+
+    /**
+     * 发一次请求的本体
+     * @param req 最终参数
+     * @param signal 合并后的中止信号
+     * @param timer 本次的超时信号
+     * @returns 完整响应
+     */
+    async function sendOnce<T>(
+      req: ResolvedRequest,
+      signal: AbortSignal | undefined,
+      timer: AbortSignal | undefined
+    ): Promise<HttpResponse<T>> {
       const startedAt = Date.now()
       const safeUrl = sanitizeUrl(req.url)
-
-      // 每次尝试一个独立的超时信号；与调用方信号合并，谁先触发都能中断底层连接。
-      // 注意不能用 withTimeout 包一层了事 —— 那样只是调用方不等了，
-      // socket 还在那儿挂着，重试几轮就把连接池占满
-      const timer = req.timeout > 0 ? AbortSignal.timeout(req.timeout) : undefined
-      const signals = [timer, req.signal].filter((s): s is AbortSignal => s !== undefined)
-      const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0]
 
       let res: Dispatcher.ResponseData
       try {
@@ -585,15 +624,17 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
         // 等加载的这一跳里 close() 可能已经发生：此时再建连接池就是关不掉的孤儿
         if (closed) throw new Error("HTTP 客户端已关闭")
         res = await lib.request(req.url, {
-          dispatcher: dispatcherFor(lib, req.proxy === false ? "" : req.proxy, req.redirections),
+          dispatcher: dispatcherFor(lib, req.proxy, req.redirections),
           method: req.method as Dispatcher.HttpMethod,
           headers: req.headers,
+          // 两次收到数据之间的最长间隔；0 即不限
+          bodyTimeout: req.timeout,
           ...(req.body === undefined ? {} : { body: req.body }),
           ...(signal ? { signal } : {})
         })
       } catch (err) {
         // 调用方主动取消：原样抛出 AbortError，别包成 HttpError 让人误判成服务端问题
-        if (req.signal?.aborted) throw new AbortError(`请求已被取消：${req.method} ${safeUrl}`)
+        if (req.signals.some(s => s?.aborted === true)) throw new AbortError(`请求已被取消：${req.method} ${safeUrl}`)
         if (timer?.aborted) {
           throw new HttpError(`请求超时（${req.timeout}ms）：${req.method} ${safeUrl}`, {
             status: 0,
@@ -710,7 +751,12 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
          */
         const waitThen = async (wait: number, why: string): Promise<void> => {
           logger?.debug(`${req.method} ${sanitizeUrl(req.url)} ${why}，${wait}ms 后重试（第 ${attempt + 1} 次）`)
-          await sleep(Math.min(wait, MAX_RETRY_DELAY), req.signal)
+          const linked = linkSignals(req.signals)
+          try {
+            await sleep(Math.min(wait, MAX_RETRY_DELAY), linked.signal)
+          } finally {
+            linked.dispose()
+          }
         }
 
         let res: HttpResponse<T>
@@ -728,13 +774,14 @@ export function createHttpClient(opts: HttpClientOptions = {}): ManagedHttpClien
         const custom = req.retry.when?.(undefined, res)
         if ((custom ?? byStatus) && canRetry) {
           // 重试前必须把 body 处理掉，否则连接不还池
-          if (req.responseType === "stream") discard(res.data as unknown as Readable)
+          if (req.responseType === "stream") (res.data as unknown as Readable).destroy()
           const hinted = parseRetryAfter(res.headers["retry-after"])
           await waitThen(hinted ?? backoffDelay(attempt + 1, { baseDelay }), `返回 ${res.status}`)
           continue
         }
 
         if (!res.ok && req.throwOnError) {
+          if (req.responseType === "stream") (res.data as unknown as Readable).destroy()
           const snippet = typeof res.data === "string" ? res.data.slice(0, 200) : ""
           throw new HttpError(`${req.method} ${res.url} 返回 ${res.status}${snippet ? `：${snippet}` : ""}`, {
             status: res.status,

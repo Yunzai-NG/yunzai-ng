@@ -4,10 +4,9 @@
  *          **不依赖任何插件**，这是本次重写的核心不变量，由 scripts/check-layering.mjs 守着
  * 生命周期：一个进程一个实例；`stop()` 是终态，重启请新建实例
  * 注意事项：装配顺序不是任意排列，以下七项是强制约束 ——
- *          1) 日志最先就绪，早于配置，否则「读配置时出错」无处记录。代价是轮转参数只能取 schema
- *             默认值，配置里的改动次轮启动才生效
- *          2) 存储早于插件：插件加载失败要写状态、要记日志，两者都以 KV 为前提。反过来插件注册的
- *             KV 驱动本轮接管不了存储，见 kernel/kv-sink.ts
+ *          1) 日志最先就绪，早于配置，否则「读配置时出错」无处记录。读到配置后就地更新输出策略
+ *          2) 存储早于插件：插件加载失败要写状态、要记日志，两者都以 KV 为前提。存储只归内核，
+ *             插件不能注册或替换驱动，见 store/index.ts
  *          3) 子系统接缝可后填 —— `hooks` 与 `subsystems` 是可变对象，装配完替换字段即可。
  *             `server.enable` 为 false 时刻意不建实例，让 `ctx.route()` 得到一条说明原因的错误，
  *             而不是一次静默不生效的注册
@@ -62,7 +61,6 @@ import { watchScripts } from "../plugin/watch.js"
 import { openKv, type KvStore } from "../store/index.js"
 import { withTimeout } from "../util/defer.js"
 import { parseDuration } from "../util/duration.js"
-import { createKvDriverSink } from "./kv-sink.js"
 import { createMaintenanceView } from "./maintenance.js"
 import { createPolicy, type KernelPolicy } from "./policy.js"
 import { installRuntime, type RuntimeParts } from "./runtime.js"
@@ -76,6 +74,9 @@ const LOG_BASENAME = "yunzai"
 
 /** `app/stopping` 的默认等待上限毫秒 */
 const DEFAULT_STOP_TIMEOUT = 5000
+
+/** 这么短的间隔里再来的停机信号当作同一次按键的副本，不算「连按两次」 */
+const DUPLICATE_SIGNAL_MS = 1000
 
 /** 本进程里加载过的每一份内核的包根，跨份共享，见 `#warnDuplicateCore()` */
 const CORE_COPIES: Set<string> = ((globalThis as Record<symbol, Set<string> | undefined>)[
@@ -422,6 +423,7 @@ export class App {
     this.own(
       this.config.onChange(change => {
         applyLogLevel(this.loggerHub, change.next)
+        this.loggerHub.configureOutput(loggerSettingsOf(change.next))
         // emitDetached：配置回调可能来自 fs 事件，没人在等它的返回值；
         // 用 emit 会把插件监听器的耗时算进文件监听的回调里
         this.events.emitDetached("config/changed", CORE_CONFIG_NAME, change.paths)
@@ -463,7 +465,7 @@ export class App {
 
     await this.events.emit("app/ready")
     this.#status = "running"
-    this.logger.mark(`Yunzai NG ${this.version} 已启动`)
+    this.logger.info(`Yunzai NG ${this.version} 已启动`)
     // 启动后再预载 HTTP 实现：不拖慢启动，又免得首个请求（多半是用户的第一条命令）等它
     setImmediate(() => {
       this.http.warmup().catch((err: unknown) => this.logger.warn("HTTP 客户端预载失败，首个请求时再试", err))
@@ -568,6 +570,8 @@ export class App {
   handleSignals(): Disposer {
     /** 是否已经在停机 */
     let leaving = false
+    /** 第一次信号的时刻 */
+    let firstAt = 0
 
     /**
      * 信号处理
@@ -575,12 +579,16 @@ export class App {
      */
     const onSignal = (signal: NodeJS.Signals): void => {
       if (leaving) {
+        // 紧跟着的那一个是同一次按键的副本：Unix 上 Ctrl+C 发给整个进程组，自带守护又转发一次。
+        // 当成「连按两次」就是硬退出，KV / SQL 来不及关
+        if (Date.now() - firstAt < DUPLICATE_SIGNAL_MS) return
         // 用户连按两次 Ctrl+C 的意思很明确：别等了。这时强退比"优雅"重要
         this.logger.warn(`再次收到 ${signal}，放弃优雅停机直接退出`)
         this.loggerHub.flush()
         process.exit(1)
       }
       leaving = true
+      firstAt = Date.now()
       this.logger.info(`收到 ${signal}，开始停机（再按一次可强制退出）`)
       void this.stop().then(
         () => process.exit(0),
@@ -588,11 +596,24 @@ export class App {
       )
     }
 
+    /**
+     * 崩溃前把原因写进日志：fatal 会同步落盘，否则缓冲里最后那段连同崩溃原因一起丢掉。
+     * 用 Monitor 而不是 uncaughtException：只记录，不吞掉崩溃
+     * @param err 未捕获的异常
+     */
+    const onCrash = (err: Error): void => {
+      this.logger.fatal("未捕获的异常，进程即将退出", err)
+    }
+
     process.on("SIGINT", onSignal)
     process.on("SIGTERM", onSignal)
+    process.on("SIGHUP", onSignal)
+    process.on("uncaughtExceptionMonitor", onCrash)
     return () => {
       process.off("SIGINT", onSignal)
       process.off("SIGTERM", onSignal)
+      process.off("SIGHUP", onSignal)
+      process.off("uncaughtExceptionMonitor", onCrash)
     }
   }
 
@@ -678,7 +699,6 @@ export async function createApp(opts: CreateAppOptions = {}): Promise<App> {
     dir: paths.logs,
     basename: LOG_BASENAME,
     console: opts.console !== false,
-    color: logDefaults.color,
     maxSize: logDefaults.maxSize * 1024 * 1024,
     keepDays: logDefaults.keepDays,
     maxFiles: logDefaults.maxFiles
@@ -691,18 +711,18 @@ export async function createApp(opts: CreateAppOptions = {}): Promise<App> {
   // ── 2. 配置 ───────────────────────────────────────────────────────────
   const configStore = createConfigStore({ dir: paths.config, logger: root, watch: opts.watchConfig !== false })
   const config = await defineCoreConfig(configStore)
+  // 内核配置坏了就不起：沿用缺省值起来，存储目录、插件目录、端口都可能不是使用者的那份，
+  // 看上去像数据全丢了；而这时任何一次保存（面板、生成令牌、addMaster）都会用缺省值覆盖整个文件
+  if (config.broken !== undefined) {
+    const lines = config.broken
+      .filter(issue => issue.severity === "error")
+      .map(issue => `  · ${issue.path === "" ? "(根)" : issue.path}：${issue.message}`)
+    throw new Error(`${config.file} 有错，内核不启动（改好再启动；yzng doctor 会指出是哪一项）：\n${lines.join("\n")}`)
+  }
   const settings = config.get()
   applyLogLevel(loggerHub, settings)
 
-  // 日志写入器已按默认值建立，轮转参数无法再变更；此处明确说明而非静默忽略
-  const wanted = loggerSettingsOf(settings)
-  if (
-    wanted.maxSize !== logDefaults.maxSize * 1024 * 1024 ||
-    wanted.keepDays !== logDefaults.keepDays ||
-    wanted.maxFiles !== logDefaults.maxFiles
-  ) {
-    logger.info("日志的单文件上限 / 保留天数 / 文件数上限将在下次启动生效：日志必须早于配置就绪，见 kernel/app.ts 文件头")
-  }
+  loggerHub.configureOutput(loggerSettingsOf(settings))
 
   // ── 3. 存储 ───────────────────────────────────────────────────────────
   const kv = await openKv({
@@ -732,11 +752,6 @@ export async function createApp(opts: CreateAppOptions = {}): Promise<App> {
   const subsystems = emptySubsystems()
   const hooks = unavailableHooks()
   hooks.sql = sql
-  hooks.kvDrivers = createKvDriverSink({
-    logger: root,
-    requested: () => config.get().store.driver,
-    active: kv.driver
-  })
   hooks.bots = { pick: (id?: string) => pickBot(subsystems.bots, id) }
 
   // 共享服务器：关掉时刻意**不建实例**，`hooks.server` 保持 unavailable 占位。

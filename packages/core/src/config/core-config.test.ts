@@ -17,7 +17,27 @@ describe("内核配置", () => {
     expect(coreConfigSchema.safeParse(defaults).ok).toBe(true)
     expect(defaults.server.port).toBe(2536)
     expect(defaults.bot.prefix).toEqual(["#", "*", "%"])
-    expect(defaults.store.driver).toBe("auto")
+    expect(defaults.store.driver).toBe("sqlite")
+  })
+
+  it("发送与重连时长不能让定时器立即触发，冷却仍允许关闭", () => {
+    for (const value of [0, "0s", -1, "30d"]) {
+      expect(coreConfigSchema.safeParse({ message: { sendTimeout: value } }).ok).toBe(false)
+      expect(coreConfigSchema.safeParse({ adapter: { reconnectInterval: value } }).ok).toBe(false)
+      expect(coreConfigSchema.safeParse({ adapter: { reconnectMaxInterval: value } }).ok).toBe(false)
+    }
+    expect(coreConfigSchema.safeParse({ message: { cooldown: 0, sendTimeout: "1s" } }).ok).toBe(true)
+  })
+
+  // 旧配置里写着 auto / level / json：拒收会让整份配置失效、沿用缺省值
+  it("旧的 KV 驱动名照收，换成 sqlite", () => {
+    for (const old of ["auto", "level", "json"]) {
+      const result = coreConfigSchema.safeParse({ store: { driver: old } })
+      expect(result.ok).toBe(true)
+      if (result.ok) expect(result.value.store.driver).toBe("sqlite")
+    }
+    expect(coreConfigSchema.safeParse({ store: { driver: "redis" } }).ok).toBe(false)
+    expect(coreConfigSchema.safeParse({ store: { driver: "toString" } }).ok).toBe(false)
   })
 
   it("序列化成带注释的 YAML 后能原样解析回来", () => {

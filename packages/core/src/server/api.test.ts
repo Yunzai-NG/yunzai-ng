@@ -1144,6 +1144,35 @@ describe("面板 API", () => {
       expect(spies.plugins.reload).toHaveBeenCalledWith("demo")
     })
 
+    // 连点两次「更新」：两次 git 撞 index.lock，或一边删一边装
+    it("同一插件的第二次操作在第一次做完之前 409", async () => {
+      let release!: () => void
+      spies.market.update.mockImplementationOnce(
+        () => new Promise(resolve => (release = () => resolve({ name: "demo", dir, via: "pull", version: "1.0.0" })))
+      )
+      const first = call("POST", "market/demo/update", {})
+      await vi.waitFor(() => expect(spies.market.update).toHaveBeenCalled())
+      const second = await call("DELETE", "market/demo")
+      expect(second.statusCode).toBe(409)
+      release()
+      expect((await first).statusCode).toBe(200)
+    })
+
+    // 新版 setup 抛错时，早先只回一个空的 loaded，使用者看不出插件没起来
+    it("装完加载失败时带回这个插件的失败原因", async () => {
+      spies.plugins.loadAll.mockResolvedValueOnce({
+        loaded: [],
+        failed: [
+          { name: "demo", reason: "setup 抛错：缺少配置" },
+          { name: "other", reason: "与本次无关" }
+        ],
+        cost: 1
+      })
+      const res = await call("POST", "market/demo/update", {})
+      expect(res.statusCode).toBe(200)
+      expect(res.json().failed).toEqual([{ name: "demo", reason: "setup 抛错：缺少配置" }])
+    })
+
     // 安装（replace 为假）压根不卸载，失败时自然也没什么可装回来的
     it("没卸载过就不必装回来", async () => {
       spies.market.install.mockRejectedValueOnce(new Error("取源失败"))

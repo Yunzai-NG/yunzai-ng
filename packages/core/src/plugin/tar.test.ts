@@ -9,6 +9,7 @@
 import { readFile, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { gzipSync } from "node:zlib"
 import { afterEach, describe, expect, it } from "vitest"
 import { isFile } from "../util/fs.js"
 import { buildTarGz, extractTarGz, joinWithin, singleRoot } from "./tar.js"
@@ -132,6 +133,15 @@ describe("extractTarGz", () => {
     const archive = buildTarGz([{ path: "big.js", content: "x".repeat(4096) }])
 
     await expect(extractTarGz(archive, dir, { maxBytes: 1024 })).rejects.toThrow("体积超过上限")
+  })
+
+  it("gzip 炸弹在解压阶段就被拦下，不先全量解压", async () => {
+    const dir = await temp()
+    // 64 MB 的零压成几十 KB；全量解压后会被当成结束块而静默通过
+    const bomb = gzipSync(Buffer.alloc(64 * 1024 * 1024))
+    await expect(extractTarGz(bomb, dir, { maxBytes: 1024 * 1024, maxEntries: 10 })).rejects.toThrow(
+      "体积超过上限 1048576 字节"
+    )
   })
 })
 

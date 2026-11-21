@@ -23,7 +23,7 @@ import type { HttpClient } from "./http.js"
 import type { Logger } from "./logger.js"
 import type { PlatformInfo, ResourceUsage, RuntimePaths } from "./platform.js"
 import type { RenderOptions, RenderablePage, RenderedImage, RendererProvider } from "./renderer.js"
-import type { KvDriver, KvNamespace, SqlHandle } from "./store.js"
+import type { KvNamespace, SqlHandle } from "./store.js"
 import type {
   HttpMethod,
   RouteHandler,
@@ -810,13 +810,6 @@ export interface PluginContext<C = unknown> {
    * @returns 注销句柄
    */
   registerRenderer(provider: RendererProvider): Disposer
-
-  /**
-   * 注册 KV 驱动（如 Redis）
-   * @param driver 驱动实现
-   * @returns 注销句柄
-   */
-  registerKvDriver(driver: KvDriver): Disposer
 
   /**
    * 渲染 TSX 页面为图片段

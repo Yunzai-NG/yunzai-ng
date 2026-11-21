@@ -116,12 +116,15 @@ function keyOfRegExp(re: RegExp): string | undefined {
 
   const src = re.source
   if (!src.startsWith("^")) return undefined
+  // `/^#抽卡|^\*抽卡/` 的第二支不以 `#` 开头：顶层有 `|` 就无法证明首字符唯一
+  if (hasTopLevelAlternation(src)) return undefined
 
   let literal: string
   let after: number
 
-  const first = src[1]
-  if (first === undefined) return undefined
+  const cp = src.codePointAt(1)
+  if (cp === undefined) return undefined
+  const first = String.fromCodePoint(cp)
 
   if (first === "\\") {
     const escaped = src[2]
@@ -133,8 +136,9 @@ function keyOfRegExp(re: RegExp): string | undefined {
   } else if (REGEX_META.has(first)) {
     return undefined
   } else {
+    // 按码点取：emoji 与扩展区汉字是两个码元，消息侧也按码点取首字符（见 #candidates）
     literal = first
-    after = 2
+    after = 1 + first.length
   }
 
   const next = src[after]
@@ -142,9 +146,38 @@ function keyOfRegExp(re: RegExp): string | undefined {
   // `{0,3}` 也让首字符可选；`{2}` 不会，但区分成本高于收益，一律放弃
   if (next === "{") return undefined
 
-  if (re.flags.includes("i") && /[a-zA-Z]/.test(literal)) return undefined
+  // 有大小写之分的字符都不分桶：`é` 之于 `É`，乃至 `k` 在 `iu` 下匹配开尔文符号
+  if (re.flags.includes("i") && literal.toLowerCase() !== literal.toUpperCase()) return undefined
 
   return literal
+}
+
+/**
+ * 正则源码里有没有顶层的 `|`
+ *
+ * 跳过转义、字符类与括号内部；只关心「整个模式是否几支并列」。
+ * @param src 正则源码
+ * @returns 是否有顶层分支
+ */
+function hasTopLevelAlternation(src: string): boolean {
+  let depth = 0
+  let inClass = false
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i]
+    if (ch === "\\") {
+      i++
+      continue
+    }
+    if (inClass) {
+      if (ch === "]") inClass = false
+      continue
+    }
+    if (ch === "[") inClass = true
+    else if (ch === "(") depth++
+    else if (ch === ")") depth = Math.max(0, depth - 1)
+    else if (ch === "|" && depth === 0) return true
+  }
+  return false
 }
 
 /**

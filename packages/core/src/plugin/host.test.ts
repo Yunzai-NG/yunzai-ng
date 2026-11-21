@@ -775,6 +775,54 @@ describe("PluginHost 热重载", () => {
     expect(h.host.get("cfg")).toMatchObject({ status: "loaded" })
   })
 
+  // 早先 setup 失败不撤配置声明：修好代码之后再加载也报「配置已被声明」，只能重启
+  it("声明了配置的插件 setup 失败后，修好再加载照常成功", async () => {
+    const h = await makeHarness()
+    await writePlugin(
+      h,
+      "cfgboom",
+      `${BRAND}const s = globalThis.__yzngS
+      export default {
+        name: "cfgboom",
+        configSchema: s.object({ a: s.number().default(1) }),
+        setup() { throw new Error("第一次坏了") },
+        [brand]: true
+      }`
+    )
+    expect((await h.host.loadAll()).failed.map(f => f.name)).toEqual(["cfgboom"])
+
+    await writePlugin(
+      h,
+      "cfgboom",
+      `${BRAND}const s = globalThis.__yzngS
+      export default {
+        name: "cfgboom",
+        configSchema: s.object({ a: s.number().default(1) }),
+        setup() {},
+        [brand]: true
+      }`
+    )
+    expect(await h.host.reload("cfgboom")).toBe(true)
+    expect(h.host.get("cfgboom")).toMatchObject({ status: "loaded" })
+  })
+
+  it("setup 超时后才交回的清理函数照样被执行", async () => {
+    const h = await makeHarness({ setupTimeout: 80 })
+    await writePlugin(
+      h,
+      "lateclean",
+      `export default {
+        name: "lateclean",
+        setup() {
+          return new Promise(resolve => setTimeout(() => resolve(() => { globalThis.__yzngLateCleaned = true }), 200))
+        }
+      }`
+    )
+    await h.host.loadAll()
+    await new Promise(r => setTimeout(r, 400))
+    expect((globalThis as { __yzngLateCleaned?: boolean }).__yzngLateCleaned).toBe(true)
+  })
+
   it("重载未知插件返回 false 并告警", async () => {
     const h = await makeHarness()
     expect(await h.host.reload("ghost")).toBe(false)

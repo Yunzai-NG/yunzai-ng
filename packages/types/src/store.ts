@@ -2,8 +2,8 @@
  * 模块职责：存储抽象（KV + 关系型）
  * 依赖方向：仅依赖 common.ts
  * 生命周期：纯类型
- * 注意事项：「用什么存」与「存什么」彻底分开：内核默认内嵌 LevelDB，不要求外部 Redis；
- *          存储插件实现同一套 `KvDriver` 即可替换。
+ * 注意事项：「用什么存」与「存什么」彻底分开：内核的 KV 落在一个 SQLite 文件里，不要求外部 Redis。
+ *          `KvDriver` 是内核内部的接缝，插件不能注册或替换驱动。
  */
 import type { DurationLike } from "./common.js"
 
@@ -16,7 +16,7 @@ export interface StoredEnvelope {
 }
 
 /**
- * KV 驱动：一个存储插件只需实现这几个方法
+ * KV 驱动（内核内部）：SQLite 与内存两种实现
  *
  * `incr` 可选：没有原生原子自增时内核退化为「命名空间内串行队列 + 读改写」，语义仍正确。
  */

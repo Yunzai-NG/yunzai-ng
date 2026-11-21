@@ -13,7 +13,6 @@ import type {
   AdapterProvider,
   AppView,
   HttpClient,
-  KvDriver,
   LogLevel,
   Logger,
   RenderRequest,
@@ -59,7 +58,7 @@ export function fakeLogger(): FakeLogger {
     warn: push("warn"),
     error: push("error"),
     fatal: push("fatal"),
-    mark: push("info"),
+    mark: push("mark"),
     child: () => logger,
     isLevelEnabled: () => true
   }
@@ -108,8 +107,6 @@ export interface Recorded {
   renderers: RendererProvider[]
   /** 收到的渲染请求（断言 templateRoot/resourceRoot 是否算对） */
   renders: RenderRequest[]
-  /** KV 驱动 */
-  kvDrivers: KvDriver[]
   /** 已打开的 SQL 库，形如 `"插件名/库名"` */
   sqlOpened: string[]
   /** 被要求关闭全部库的插件名 */
@@ -155,7 +152,6 @@ export function recordingHooks(): RecordingHooks {
     adapters: [],
     renderers: [],
     renders: [],
-    kvDrivers: [],
     sqlOpened: [],
     sqlClosed: []
   }
@@ -233,12 +229,6 @@ export function recordingHooks(): RecordingHooks {
       register: provider => {
         recorded.adapters.push(provider)
         return remover(recorded.adapters, provider)
-      }
-    },
-    kvDrivers: {
-      register: driver => {
-        recorded.kvDrivers.push(driver)
-        return remover(recorded.kvDrivers, driver)
       }
     },
     sql: {

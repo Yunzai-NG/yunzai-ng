@@ -28,7 +28,7 @@ import type {
 } from "@yunzai-ng/types"
 import type { CommandRegistration } from "../plugin/hooks.js"
 import type { CoreEventBus } from "../plugin/events.js"
-import { describeMessage } from "../message/segment.js"
+import { textOf } from "../message/segment.js"
 import { parseDuration } from "../util/duration.js"
 import { Semaphore } from "../util/queue.js"
 import { cooldownKey, renderCooldownTip } from "./cooldown.js"
@@ -253,13 +253,21 @@ export class EventDispatcher {
    * @param e 运行时消息事件
    */
   async #processMessage(e: RuntimeMessageEvent): Promise<void> {
-    this.#logIncoming(e)
+    let routed = false
+    let reachedCore = false
     // core 里先路由再广播：`message` 总线事件的契约是"命令路由之后触发"，
     // 统计类插件因此能看到 e.command 是否有值
-    await this.#middlewares.run(e, async () => {
-      await this.#route(e)
-      await this.#events.emit("message", e)
-    })
+    let failed = true
+    try {
+      await this.#middlewares.run(e, async () => {
+        reachedCore = true
+        routed = await this.#route(e)
+        await this.#events.emit("message", e)
+      })
+      failed = false
+    } finally {
+      this.#logIncoming(e, failed || routed || !reachedCore || e.stopped || e.replyAttempted ? "info" : "mark")
+    }
   }
 
   /**
@@ -295,12 +303,12 @@ export class EventDispatcher {
    * 代价是中间件与 `message` 总线事件不受限，它们本该是轻量的。
    * @param e 运行时消息事件
    */
-  async #route(e: RuntimeMessageEvent): Promise<void> {
+  async #route(e: RuntimeMessageEvent): Promise<boolean> {
     // 命中等待者即消费掉这条消息，不再进路由；回话不要求群前缀
-    if (this.#prompts.offer(e)) return
+    if (this.#prompts.offer(e)) return true
 
     const candidates = this.#scoped(e)
-    if (candidates.length === 0) return
+    if (candidates.length === 0) return false
 
     const gate = this.#gate
     if (gate === undefined) return this.#invokeAll(e, candidates)
@@ -335,7 +343,9 @@ export class EventDispatcher {
     }
 
     const scope = resolveScope(rules, e.selfId, gid)
-    const text = stripScopePrefix(e.text, scope.prefix)
+    // 群前缀与机器人昵称常是同一个词（都叫「小云」）：e.text 已剥过昵称，再要求它以前缀开头
+    // 就一条都对不上，故 e.text 不带前缀时再拿原文认一次
+    const text = stripScopePrefix(e.text, scope.prefix) ?? stripScopePrefix(textOf(e.message), scope.prefix)
     if (text === undefined) return []
     e.text = text
 
@@ -355,15 +365,18 @@ export class EventDispatcher {
    * @param e 运行时消息事件
    * @param candidates 候选命令
    */
-  async #invokeAll(e: RuntimeMessageEvent, candidates: readonly RouterCandidate[]): Promise<void> {
+  async #invokeAll(e: RuntimeMessageEvent, candidates: readonly RouterCandidate[]): Promise<boolean> {
+    let accepted = false
     for (const candidate of candidates) {
       if (e.stopped) break
       const handled = await this.#invoke(e, candidate.reg, candidate.match)
       if (!handled) continue
+      accepted = true
       // 缺省阻断：一条消息通常只该有一个功能响应。声明 block: false 的
       // 命令（如日志、统计类）才会让后面的命令继续匹配。
       if (candidate.reg.options.block !== false) break
     }
+    return accepted
   }
 
   /**
@@ -445,20 +458,20 @@ export class EventDispatcher {
    * selfId 说明是哪个号，二者都取自 `e.bot` 的 getter，不缓存。
    * @param e 运行时消息事件
    */
-  #logIncoming(e: RuntimeMessageEvent): void {
-    if (!this.#logger.isLevelEnabled("info")) return
+  #logIncoming(e: RuntimeMessageEvent, level: "mark" | "info"): void {
+    if (!this.#logger.isLevelEnabled(level)) return
     const who = `${e.sender.name ?? ""}(${e.sender.uid})`
-    const body = describeMessage(e.message)
+    const body = `收到消息（${e.message.length} 段）`
     const via = `${e.bot.platform}:${e.bot.selfId}`
     switch (e.scene) {
       case "group":
-        this.#logger.info(`[${via}][群 ${e.group?.name ?? e.group?.gid ?? "?"}] ${who}: ${body}`)
+        this.#logger[level](`[${via}][群 ${e.group?.name ?? e.group?.gid ?? "?"}] ${who}: ${body}`)
         return
       case "guild":
-        this.#logger.info(`[${via}][频道 ${e.channel?.name ?? e.channel?.channelId ?? "?"}] ${who}: ${body}`)
+        this.#logger[level](`[${via}][频道 ${e.channel?.name ?? e.channel?.channelId ?? "?"}] ${who}: ${body}`)
         return
       case "private":
-        this.#logger.info(`[${via}][私聊] ${who}: ${body}`)
+        this.#logger[level](`[${via}][私聊] ${who}: ${body}`)
         return
     }
   }

@@ -1,52 +1,39 @@
 /**
- * 模块职责：KV 存储的装配（驱动选择、自动降级、根命名空间）
- * 依赖方向：依赖 store/{kv,memory,json,level}、util/fs、类型包
+ * 模块职责：KV 存储的装配（选绑定、迁移旧数据、根命名空间）
+ * 依赖方向：依赖 store/{kv,memory,sqlite-kv,sqlite-binding,migrate,legacy,inspect}、类型包
  * 生命周期：应用级单例，`close()` 时落盘
- * 注意事项：**存储不可用不等于机器人不可用。** `auto` 模式按 level → json → memory 逐级降级，
- *          每次降级记一条 warn 说明原因；最坏退到纯内存（重启丢缓存），但机器人始终能收发消息。
+ * 注意事项：**存储只归内核，插件不能注册或替换驱动。** 账号凭据与各插件的数据同在一个库里，
+ *          交给插件提供的驱动就等于把全部数据交给那个插件。
  *
- *          外部注册的驱动（如 store-redis 插件）通过 `registerKvDriver()` 挂进来，
- *          与内置驱动一视同仁 —— 这正是"一切皆可为插件"在存储层的落点。
+ *          **落盘格式只有一种：`<store>/kv.db`（SQLite）。** 文件跨平台通用，换机器、换系统直接拷；
+ *          读写它的绑定可以不同（better-sqlite3 或 node:sqlite），格式不变。旧版的 LevelDB 与 JSON
+ *          只读，首次启动时迁进 kv.db，原件改名保留。
+ *
+ *          **没有可用绑定时直接报错，不退到内存。** 退到内存意味着每次重启账号与插件数据全丢，
+ *          而且没人会立刻发现。`memory` 只在配置里显式指定时用（测试、评测脚本）。
  */
 import { join } from "node:path"
 import type { KvDriver, KvNamespace, Logger } from "@yunzai-ng/types"
 import { Kv } from "./kv.js"
 import { MemoryKvDriver } from "./memory.js"
-import { JsonKvDriver } from "./json.js"
-import { LevelKvDriver, loadLevel } from "./level.js"
+import { KV_DB_FILE, SqliteKvDriver } from "./sqlite-kv.js"
+import { isSqliteBusy, loadSqliteBinding } from "./sqlite-binding.js"
+import { migrateLegacy } from "./migrate.js"
+import { findLegacy } from "./legacy.js"
 import { createKvInspector, type KvInspector } from "./inspect.js"
+import { isFile } from "../util/fs.js"
 
-/** 内置驱动 id */
-export type BuiltinDriverId = "auto" | "level" | "json" | "memory"
+/** 驱动 id */
+export type BuiltinDriverId = "sqlite" | "memory"
 
-/** 驱动工厂：拿到数据目录，产出一个尚未 open 的驱动 */
-export type KvDriverFactory = (dir: string) => Promise<KvDriver> | KvDriver
-
-/** 外部注册的驱动表（插件注册的驱动进这里） */
-const externalDrivers = new Map<string, KvDriverFactory>()
-
-/**
- * 注册一个 KV 驱动
- *
- * 供 `store-redis` 这类插件调用；配置里把 `store.driver` 写成同一个 id 即可启用。
- * @param id 驱动 id
- * @param factory 驱动工厂
- * @returns 取消注册
- * @throws id 与内置驱动冲突时
- */
-export function registerKvDriver(id: string, factory: KvDriverFactory): () => void {
-  if (id === "auto" || id === "level" || id === "json" || id === "memory") {
-    throw new Error(`驱动 id ${id} 与内置驱动冲突`)
-  }
-  externalDrivers.set(id, factory)
-  return () => void externalDrivers.delete(id)
-}
+/** 旧配置里还会出现的驱动名，一律当 sqlite */
+const LEGACY_DRIVER_IDS: ReadonlySet<string> = new Set(["auto", "level", "json"])
 
 /** 打开 KV 存储的参数 */
 export interface OpenKvOptions {
-  /** 数据目录（KV 数据会放在其子目录里） */
+  /** 存储目录 */
   dir: string
-  /** 驱动 id，缺省 `auto` */
+  /** 驱动 id，缺省 `sqlite` */
   driver?: string
   /** 日志器 */
   logger: Logger
@@ -54,8 +41,12 @@ export interface OpenKvOptions {
 
 /** 已打开的 KV 存储 */
 export interface KvStore {
-  /** 实际生效的驱动 id（`auto` 会被解析为具体驱动） */
-  readonly driver: string
+  /** 实际生效的驱动 id */
+  readonly driver: BuiltinDriverId
+  /** SQLite 绑定名；memory 时 undefined */
+  readonly engine: string | undefined
+  /** 库文件；memory 时 undefined */
+  readonly file: string | undefined
   /** 根命名空间 */
   readonly root: KvNamespace
   /**
@@ -72,89 +63,116 @@ export interface KvStore {
 
 /**
  * 打开 KV 存储
- *
- * `auto` 的降级顺序：level（性能最优）→ json（纯 JS，Termux 兜底）→ memory。
- * 显式指定驱动时同样会降级，但会将"所指定的驱动为何不可用"记为 warn，
- * 而非静默替换 —— 使用者配置了 redis 却运行于内存驱动之上而不知情是最糟的情形。
  * @param opts 参数
  * @returns 已打开的 KV 存储
+ * @throws 没有可用的 SQLite 绑定、旧数据迁移不了、库被别的进程占用，或驱动 id 不认识时
  */
 export async function openKv(opts: OpenKvOptions): Promise<KvStore> {
   const logger = opts.logger.child({ scope: "store" })
-  const requested = opts.driver ?? "auto"
-  const chain = resolveChain(requested)
+  const id = normalizeDriver(opts.driver)
 
-  let driver: KvDriver | undefined
-  for (const id of chain) {
-    try {
-      const candidate = await createDriver(id, opts.dir)
-      if (!candidate) {
-        logger.warn(`KV 驱动 ${id} 不可用（未安装或未注册），尝试下一个`)
-        continue
-      }
-      await candidate.open()
-      driver = candidate
-      if (id !== requested && requested !== "auto") {
-        logger.warn(`配置指定的 KV 驱动 ${requested} 不可用，已降级为 ${id}`)
-      }
-      break
-    } catch (err) {
-      logger.warn(`KV 驱动 ${id} 打开失败，尝试下一个`, err)
+  if (id === "memory") {
+    logger.warn("KV 存储使用内存驱动：重启即丢，只应出现在测试里")
+    return assemble(new MemoryKvDriver(), id, undefined, undefined, logger)
+  }
+
+  const loaded = await loadSqliteBinding()
+  const binding = loaded.binding
+  if (binding === undefined) {
+    throw new Error(
+      `KV 存储需要 SQLite，而 better-sqlite3 与 node:sqlite 都不可用（${loaded.reason ?? "未知原因"}）。` +
+        `在实例目录重新安装依赖让 better-sqlite3 装上，或换用 Node 22.13 及以上（自带 node:sqlite）`
+    )
+  }
+
+  const file = join(opts.dir, KV_DB_FILE)
+  if (!(await isFile(file))) {
+    const report = await withLockRetry(() => migrateLegacy(opts.dir, binding, logger), opts.dir)
+    if (report !== undefined) {
+      logger.info(
+        `已把旧版 KV（${report.from.kind}）的 ${report.entries} 条数据迁入 ${file}` +
+          (report.archived === undefined ? "" : `，原数据改名保留为 ${report.archived}`)
+      )
+    }
+  } else {
+    for (const left of await findLegacy(opts.dir)) {
+      logger.warn(`${left.path} 是旧版 KV 数据，而 ${KV_DB_FILE} 已在使用，它不会被读取。确认无用后可自行移走`)
     }
   }
 
-  if (!driver) {
-    // chain 末尾恒为 memory，理论上到不了这里；留着是为了让失败可诊断而不是空指针
-    throw new Error("所有 KV 驱动均不可用")
-  }
+  const driver = new SqliteKvDriver(file, binding)
+  await withLockRetry(() => driver.open(), opts.dir)
+  return assemble(driver, id, binding.engine, file, logger)
+}
 
-  logger.info(`KV 存储就绪：驱动 ${driver.id}`)
+/**
+ * 规整驱动 id
+ * @param raw 配置里的值
+ * @returns 驱动 id
+ * @throws 不认识时
+ */
+function normalizeDriver(raw: string | undefined): BuiltinDriverId {
+  if (raw === undefined || raw === "sqlite" || LEGACY_DRIVER_IDS.has(raw)) return "sqlite"
+  if (raw === "memory") return "memory"
+  throw new Error(`不认识的 KV 驱动 ${raw}：只有 sqlite / memory`)
+}
+
+/**
+ * 包成对外的 KvStore
+ * @param driver 已打开的驱动
+ * @param id 驱动 id
+ * @param engine 绑定名
+ * @param file 库文件
+ * @param logger 日志器
+ * @returns KV 存储
+ */
+function assemble(driver: KvDriver, id: BuiltinDriverId, engine: string | undefined, file: string | undefined, logger: Logger): KvStore {
+  logger.info(`KV 存储就绪：${engine === undefined ? id : `${file ?? ""}（${engine}）`}`)
   const root = new Kv(driver)
-
   return {
-    driver: driver.id,
+    driver: id,
+    engine,
+    file,
     root,
     namespace: (name: string) => root.sub(name),
-    inspector: createKvInspector(driver),
-    close: async () => {
-      await driver.close()
-    }
+    inspector: createKvInspector(driver, engine),
+    close: () => driver.close()
   }
 }
 
+/** 库被锁时重试几次：守护拉起新进程时，旧进程可能还在退出途中 */
+const LOCK_RETRIES = 5
+
 /**
- * 把请求的驱动 id 展开成降级链
- * @param requested 请求的驱动 id
- * @returns 依次尝试的驱动 id 列表，末尾恒为 memory
+ * 是不是「库被另一个进程锁着」
+ * @param err 错误
+ * @returns 是否锁冲突
  */
-function resolveChain(requested: string): string[] {
-  if (requested === "auto") return ["level", "json", "memory"]
-  if (requested === "memory") return ["memory"]
-  if (requested === "json") return ["json", "memory"]
-  if (requested === "level") return ["level", "json", "memory"]
-  // 外部驱动（redis 等）失败后退回内置默认链
-  return [requested, "level", "json", "memory"]
+function isLocked(err: unknown): boolean {
+  const chain = [err, (err as { cause?: unknown } | null)?.cause]
+  return chain.some(e => (e as { code?: unknown } | null)?.code === "LEVEL_LOCKED" || isSqliteBusy(e))
 }
 
 /**
- * 按 id 造驱动
- * @param id 驱动 id
- * @param dir 数据目录
- * @returns 驱动实例；不可用时 undefined
+ * 执行一个要独占存储的步骤，锁冲突时退避重试
+ * @param task 步骤
+ * @param dir 存储目录，用于报错
+ * @returns 步骤的结果
+ * @throws 重试用尽仍被占用时
  */
-async function createDriver(id: string, dir: string): Promise<KvDriver | undefined> {
-  switch (id) {
-    case "memory":
-      return new MemoryKvDriver()
-    case "json":
-      return new JsonKvDriver(join(dir, "kv.json"))
-    case "level": {
-      const ctor = await loadLevel()
-      return ctor ? new LevelKvDriver(join(dir, "kv"), ctor) : undefined
-    }
-    default: {
-      const factory = externalDrivers.get(id)
-      return factory ? await factory(dir) : undefined
+async function withLockRetry<T>(task: () => Promise<T>, dir: string): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await task()
+    } catch (err) {
+      if (!isLocked(err)) throw err
+      if (attempt >= LOCK_RETRIES) {
+        throw new Error(
+          `KV 数据目录 ${dir} 被另一个进程占用（多半是上一个实例还没退干净，或两个实例指向同一主目录）。结束那个进程后再启动`,
+          { cause: err }
+        )
+      }
+      await new Promise(resolve => setTimeout(resolve, 300 * attempt))
     }
   }
 }

@@ -9,6 +9,7 @@
  *          告诉你「最后目录对了」，而次序错掉（先 reset 后 stash）同样能得到一个
  *          对的目录，直到某天吃掉使用者的改动。故此处逐条比对参数数组。
  */
+import * as fs from "node:fs/promises"
 import { mkdir, readFile, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -32,6 +33,8 @@ import {
   type GitRunner,
   type MarketSettings
 } from "./market.js"
+
+vi.mock("node:fs/promises", async importOriginal => ({ ...await importOriginal<typeof fs>() }))
 
 /** 一个可编程的响应 */
 interface StubReply {
@@ -101,8 +104,8 @@ interface StubGitOptions {
   status?: string
   /** `log` 的输出 */
   log?: string
-  /** 令某个子命令失败 */
-  fail?: { cmd: string; message: string }
+  /** 令某个子命令失败；`code` 模拟 execFile 的错误码（ENOENT 即找不到 git） */
+  fail?: { cmd: string; message: string; code?: string }
   /** 某条命令执行后的副作用，用于模拟 reset 改写了工作区 */
   effect?: (args: readonly string[]) => Promise<void> | void
 }
@@ -131,7 +134,7 @@ function stubGit(options: StubGitOptions = {}): StubGit {
   const run: GitRunner = async (args, cwd, timeout) => {
     calls.push({ args: [...args], cwd, timeout })
     const cmd = args[0]
-    if (options.fail !== undefined && options.fail.cmd === cmd) throw new Error(options.fail.message)
+    if (options.fail !== undefined && options.fail.cmd === cmd) throw Object.assign(new Error(options.fail.message), { code: options.fail.code })
     await options.effect?.(args)
     if (cmd === "rev-parse") return `${heads.length > 1 ? heads.shift() : heads[0]}\n`
     if (cmd === "status") return options.status ?? ""
@@ -586,6 +589,53 @@ describe("PluginMarket 安装", () => {
     expect(await isFile(join(h.pluginsDir, "demo", "旧文件.txt"))).toBe(false)
   })
 
+  it("只剩上次替换的备份时先还原旧目录，不在本次请求中覆盖它", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: INDEX }, [TARBALL]: { bytes: pluginArchive(undefined) } })
+    const backup = join(h.pluginsDir, ".demo.replacing")
+    const target = join(h.pluginsDir, "demo")
+    await mkdir(backup)
+    await writeFile(join(backup, "old.txt"), "旧内容")
+
+    await expect(h.market.install("demo", { replace: true })).rejects.toThrow("已还原")
+    expect(await readFile(join(target, "old.txt"), "utf8")).toBe("旧内容")
+    expect(await isDirectory(backup)).toBe(false)
+    expect(h.calls).not.toContain(TARBALL)
+  })
+
+  it("移入与回滚都失败时报告路径，解除占用后重试能找回原件", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: INDEX }, [TARBALL]: { bytes: pluginArchive(undefined) } })
+    const target = join(h.pluginsDir, "demo")
+    const backup = join(h.pluginsDir, ".demo.replacing")
+    await mkdir(target)
+    await writeFile(join(target, "old.txt"), "旧内容")
+    const rename = fs.rename
+    const fault = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (to === target) throw new Error(from === backup ? "还原被占用" : "新目录移入失败")
+      return rename(from, to)
+    })
+    const attempt = h.market.install("demo", { replace: true })
+    for (const detail of [target, backup, "还原被占用", "新目录移入失败"]) await expect(attempt).rejects.toThrow(detail)
+    expect(await readFile(join(backup, "old.txt"), "utf8")).toBe("旧内容")
+
+    fault.mockRestore()
+    await expect(h.market.install("demo", { replace: true })).rejects.toThrow("已还原")
+    expect(await readFile(join(target, "old.txt"), "utf8")).toBe("旧内容")
+    await h.market.install("demo", { replace: true })
+    expect(await isFile(join(target, "index.js"))).toBe(true)
+  })
+
+  it("正式目录和残留备份并存时不猜哪份完整", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: INDEX }, [TARBALL]: { bytes: pluginArchive(undefined) } })
+    const target = join(h.pluginsDir, "demo")
+    const backup = join(h.pluginsDir, ".demo.replacing")
+    for (const dir of [target, backup]) {
+      await mkdir(dir)
+      await writeFile(join(dir, "marker"), dir)
+    }
+    await expect(h.market.install("demo", { replace: true })).rejects.toThrow(backup)
+    for (const dir of [target, backup]) expect(await readFile(join(dir, "marker"), "utf8")).toBe(dir)
+  })
+
   it("非 GitHub 的纯 git 来源在本机没有 git 时明确报错，而不是静默失败", async () => {
     /*
      * GitHub 的 git 地址可换算出 codeload 归档，故缺 git 仍装得上；而其余托管站
@@ -951,6 +1001,13 @@ describe("PluginMarket 就地拉取", () => {
     expect(await h.market.inspectUpdate("demo")).toEqual({ willPull: false, dirty: false })
   })
 
+  it("探测：是 git 仓库却拉不了时报出 blocked，与 update() 的拒绝一致", async () => {
+    const git = stubGit({ fail: { cmd: "--version", message: "找不到 git", code: "ENOENT" } })
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, git.run)
+    await makeGitRepo(h.pluginsDir)
+    expect(await h.market.inspectUpdate("demo")).toEqual({ willPull: false, dirty: false, blocked: "本机没有 git" })
+  })
+
   it("工作区干净时不 stash", async () => {
     const git = stubGit({ status: "" })
     const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, git.run)
@@ -1015,8 +1072,9 @@ describe("PluginMarket 就地拉取", () => {
     expect(await readFile(join(dir, "index.js"), "utf8")).toBe('export default "v2"')
   })
 
-  it("本机没有 git 时退回重装，走归档", async () => {
-    const git = stubGit({ fail: { cmd: "--version", message: "找不到 git" } })
+  // 早先这两种情况退回整目录重装：.git 与本地改动一起删掉，且不经「有没有改动」那道检查
+  it("目录是 git 仓库而本机没有 git：拒绝更新，目录原样不动", async () => {
+    const git = stubGit({ fail: { cmd: "--version", message: "找不到 git", code: "ENOENT" } })
     const h = await makeHarness(
       {
         "https://example.com/index.json": { json: GIT_INDEX },
@@ -1026,15 +1084,26 @@ describe("PluginMarket 就地拉取", () => {
       undefined,
       git.run
     )
-    await makeGitRepo(h.pluginsDir)
+    const dir = await makeGitRepo(h.pluginsDir)
 
-    const result = await h.market.update("demo")
-
-    expect(result).toMatchObject({ via: "tarball", version: "2.0.0" })
-    expect(h.calls).toContain(CODELOAD)
+    await expect(h.market.update("demo")).rejects.toThrow(/本机没有 git[\s\S]*整份重装/)
+    expect(await isDirectory(join(dir, ".git"))).toBe(true)
+    expect(await isFile(join(dir, "index.js"))).toBe(true)
+    expect(h.calls).not.toContain(CODELOAD)
   })
 
-  it("索引声明的来源不是 git 时退回重装", async () => {
+  it("worktree 的 .git 文件同样保护未跟踪改动", async () => {
+    const git = stubGit({ fail: { cmd: "--version", message: "找不到 git", code: "ENOENT" } })
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, git.run)
+    const dir = join(h.pluginsDir, "demo")
+    await mkdir(dir)
+    await writeFile(join(dir, ".git"), "gitdir: ../git/worktrees/demo")
+    await writeFile(join(dir, "local.txt"), "保留")
+    await expect(h.market.update("demo")).rejects.toThrow(/本机没有 git/)
+    expect(await readFile(join(dir, "local.txt"), "utf8")).toBe("保留")
+  })
+
+  it("目录是使用者自己 clone 的、而索引说它由归档分发：拒绝更新，目录原样不动", async () => {
     const git = stubGit()
     const h = await makeHarness(
       {
@@ -1045,13 +1114,39 @@ describe("PluginMarket 就地拉取", () => {
       undefined,
       git.run
     )
-    // 目录里有 .git（使用者自己 clone 的），但索引说这插件由归档分发
+    const dir = await makeGitRepo(h.pluginsDir)
+
+    await expect(h.market.update("demo")).rejects.toThrow(/不是 git 来源/)
+    expect(await isDirectory(join(dir, ".git"))).toBe(true)
+    expect(h.calls).not.toContain(TARBALL)
+  })
+
+  it("git 探测偶发失败（不是 ENOENT）不缓存，下次照样能拉取", async () => {
+    let first = true
+    const inner = stubGit()
+    const run: GitRunner = async (args, cwd, timeout) => {
+      if (args[0] === "--version" && first) {
+        first = false
+        throw new Error("超时")
+      }
+      return inner.run(args, cwd, timeout)
+    }
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, run)
     await makeGitRepo(h.pluginsDir)
 
+    await expect(h.market.update("demo")).rejects.toThrow(/本机没有 git/)
     const result = await h.market.update("demo")
+    expect(result).toMatchObject({ via: "pull" })
+  })
 
-    expect(result).toMatchObject({ via: "tarball", version: "2.0.0" })
-    expect(git.cmds()).not.toContain("fetch")
+  it("选了暂存而拉取失败：把暂存的改动放回去", async () => {
+    const git = stubGit({ status: " M index.js\n", fail: { cmd: "fetch", message: "无法连接到远端" } })
+    const h = await makeHarness({ "https://example.com/index.json": { json: GIT_INDEX } }, {}, undefined, git.run)
+    await makeGitRepo(h.pluginsDir)
+
+    await expect(h.market.update("demo", { onDirty: "stash" })).rejects.toThrow("无法连接到远端")
+    expect(git.calls.map(c => c.args.slice(0, 2).join(" "))).toContain("stash pop")
+    expect(h.logger.lines.some(line => line.includes("已放回目录"))).toBe(true)
   })
 })
 
@@ -1612,7 +1707,7 @@ describe("PluginMarket 自定义登记", () => {
   /*
    * 索引里已有同名条目时不许登记
    *
-   * 两份来源指向同一个目录名，谁生效取决于 `#apply` 的优先级 —— 而使用者看到的是
+   * 两份来源指向同一个目录名，谁生效取决于索引条目的优先级 —— 而使用者看到的是
    * 「我填的地址没生效」，一句无从查证的话。故当场拒绝，并说明两条出路。
    */
   it("**索引里已有同名的一条时拒绝登记**，并说明该怎么办", async () => {
@@ -1637,13 +1732,6 @@ describe("PluginMarket 自定义登记", () => {
     expect(indexed?.custom).toBeUndefined()
   })
 
-  /*
-   * 断网时自登记的那几条仍要在
-   *
-   * `#fetchAll` 有三个出口（缓存新鲜、全部源不可达而沿用缓存、正常取到），三处都经
-   * `#apply`。少一处的表现是「自定义插件平时在、断网时不见了」，而那种缺失极难与
-   * 网络问题区分开。
-   */
   it("**全部索引源不可达时自登记的仍在** —— 它与网络无关", async () => {
     const first = await makeHarness({ "https://example.com/index.json": { json: EMPTY_INDEX } })
     await first.market.registerCustom({ url: "https://github.com/demo/demo.git" })
@@ -1656,6 +1744,43 @@ describe("PluginMarket 自定义登记", () => {
     const snapshot = await second.market.list(true)
 
     expect(snapshot.plugins.map(item => item.name)).toContain("demo")
+  })
+
+  it("并发登记和撤销串行修改同一文件，重启后也不丢条目", async () => {
+    const routes = { "https://example.com/index.json": { json: EMPTY_INDEX } }
+    const h = await makeHarness(routes)
+    const register = (name: string) => h.market.registerCustom({ url: `https://example.com/demo/${name}.git` })
+    await register("old")
+    await Promise.all([register("one"), register("two"), h.market.removeCustom("old")])
+    const second = await makeHarness(routes, {}, h)
+    expect((await second.market.customs()).map(item => item.name).sort()).toEqual(["one", "two"])
+  })
+
+  it.each(["{", "{}", '{"plugins":[null]}'])("坏登记文件 %s 不得被登记或撤销覆盖", async bad => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: INDEX } })
+    await h.market.registerCustom({ url: "https://example.com/demo/old.git" })
+    await writeFile(h.customFile, bad)
+    await expect(h.market.registerCustom({ url: "https://example.com/demo/new.git" })).rejects.toThrow(h.customFile)
+    await expect(h.market.removeCustom("old")).rejects.toThrow(h.customFile)
+    expect(await readFile(h.customFile, "utf8")).toBe(bad)
+    expect((await h.market.list()).plugins.map(item => item.name)).toContain("demo")
+  })
+
+  it("撤销后新缓存和旧版混合缓存都不会让登记复现", async () => {
+    const h = await makeHarness({ "https://example.com/index.json": { json: INDEX } })
+    const custom = await h.market.registerCustom({ url: "https://example.com/demo/local.git" })
+    await h.market.list(true)
+    await h.market.removeCustom("local")
+    const cache = JSON.parse(await readFile(h.cacheFile, "utf8"))
+    expect(cache.entries.map((item: { name: string }) => item.name)).toEqual(["demo"])
+    cache.entries.push(custom)
+    await writeFile(h.cacheFile, JSON.stringify(cache))
+    for (const force of [false, true]) {
+      const restarted = await makeHarness({ "https://example.com/index.json": { error: "离线" } }, {}, h)
+      const snapshot = await restarted.market.list(force)
+      expect(snapshot.plugins.map(item => item.name)).toEqual(["demo"])
+      expect(restarted.calls.length).toBe(force ? 1 : 0)
+    }
   })
 
   it("撤掉登记之后 entry() 再也找不到它", async () => {

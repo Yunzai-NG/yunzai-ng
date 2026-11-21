@@ -60,11 +60,11 @@ export class RotatingFileWriter {
   /** 文件名前缀 */
   readonly #basename: string
   /** 单文件上限 */
-  readonly #maxSize: number
+  #maxSize: number
   /** 保留天数 */
-  readonly #keepDays: number
+  #keepDays: number
   /** 文件数上限 */
-  readonly #maxFiles: number
+  #maxFiles: number
   /** 刷盘间隔 */
   readonly #flushInterval: number
   /** 缓冲上限 */
@@ -95,9 +95,16 @@ export class RotatingFileWriter {
     this.#basename = opts.basename ?? "app"
     this.#maxSize = Math.max(64 * 1024, opts.maxSize ?? DEFAULT_MAX_SIZE)
     this.#keepDays = Math.max(1, opts.keepDays ?? 14)
-    this.#maxFiles = Math.max(2, opts.maxFiles ?? 100)
+    this.#maxFiles = Math.max(1, opts.maxFiles ?? 100)
     this.#flushInterval = Math.max(50, opts.flushInterval ?? 200)
     this.#bufferLimit = Math.max(4096, opts.bufferLimit ?? 32 * 1024)
+  }
+
+  /** 从下一次写入起采用新的轮转策略。 */
+  configure(opts: { maxSize: number; keepDays: number; maxFiles: number }): void {
+    this.#maxSize = Math.max(64 * 1024, opts.maxSize)
+    this.#keepDays = Math.max(1, opts.keepDays)
+    this.#maxFiles = Math.max(1, opts.maxFiles)
   }
 
   /** 当前正在写入的文件路径 */
@@ -200,7 +207,7 @@ export class RotatingFileWriter {
     let index = 0
     let file = join(this.#dir, `${this.#basename}-${day}.log`)
     let size = this.#sizeOf(file)
-    while (size + incoming > this.#maxSize && index < 1000) {
+    while (size > 0 && size + incoming > this.#maxSize && index < 1000) {
       index++
       file = join(this.#dir, `${this.#basename}-${day}.${index}.log`)
       size = this.#sizeOf(file)
@@ -240,7 +247,11 @@ export class RotatingFileWriter {
       }
 
       // 按日期倒序、同日按序号倒序 → 数组头部是最新的
-      files.sort((a, b) => (a.day === b.day ? b.index - a.index : a.day < b.day ? 1 : -1))
+      files.sort((a, b) => {
+        if (join(this.#dir, a.name) === this.#file) return -1
+        if (join(this.#dir, b.name) === this.#file) return 1
+        return a.day === b.day ? b.index - a.index : a.day < b.day ? 1 : -1
+      })
 
       const cutoff = new Date()
       cutoff.setDate(cutoff.getDate() - this.#keepDays)

@@ -73,7 +73,7 @@ const LOG_TAIL_MAX = 2000
 const WRITE_SOURCE = "webui"
 
 /** 合法的日志级别，用于校验查询参数 */
-const LOG_LEVELS: readonly string[] = ["trace", "debug", "info", "warn", "error", "fatal", "silent"]
+const LOG_LEVELS: readonly string[] = ["trace", "debug", "mark", "info", "warn", "error", "fatal", "silent"]
 
 /**
  * 两次「把令牌打进日志」之间的最小间隔
@@ -407,7 +407,8 @@ function retryOverrideOf(body: Record<string, unknown>): AccountRetryOverride | 
     if (!isDurationLike(value)) {
       throw fail(400, `字段 retry.${key} 必须是毫秒数字或形如 "2s" 的时长字符串`)
     }
-    if (parseDuration(value, -1) < 0) throw fail(400, `字段 retry.${key} 不能是负数`)
+    const ms = parseDuration(value, 0)
+    if (ms < 1 || ms > 2147483647) throw fail(400, `字段 retry.${key} 须在 1 到 2147483647 毫秒之间`)
     override[key] = value
   }
   return override
@@ -687,6 +688,29 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
    * @param name 先前卸掉的插件声明名
    * @param unloaded 当时是否确实卸掉了
    */
+  /** 正在被安装、更新、重跑装依赖或删除的插件目录 */
+  const busy = new Set<string>()
+
+  /**
+   * 同一个插件目录同时只做一件事
+   *
+   * 连点两次「更新」时两次 git 在同一个仓库里撞 index.lock，或一边在删目录一边在往里装。
+   * 第二次直接 409，不排队：排队等于让使用者以为第二下也生效了。
+   * @param name 插件目录名
+   * @param task 要做的事
+   * @returns task 的结果
+   * @throws 该目录已有一件事在做时，409
+   */
+  const exclusive = async <T>(name: string, task: () => Promise<T>): Promise<T> => {
+    if (busy.has(name)) throw fail(409, `插件 ${name} 正在安装、更新或删除，等这一次做完再操作`)
+    busy.add(name)
+    try {
+      return await task()
+    } finally {
+      busy.delete(name)
+    }
+  }
+
   const restore = async (name: string | undefined, unloaded: boolean): Promise<void> => {
     if (!unloaded || name === undefined) return
     const back = await deps.plugins.reload(name).catch(() => false)
@@ -707,13 +731,24 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
    * @returns 安装结果，附本次加载成功的插件名
    * @throws 安装失败时以 400 结束请求
    */
-  const installFromMarket = async (
+  const installFromMarket = (
     name: string,
     load: boolean,
     replace: boolean,
     dependencies: boolean,
     fresh = false,
     onDirty: DirtyAction = "abort"
+  ): Promise<Record<string, unknown>> =>
+    exclusive(name, () => installFromMarketNow(name, load, replace, dependencies, fresh, onDirty))
+
+  /** 实际执行；参数见 `installFromMarket` */
+  const installFromMarketNow = async (
+    name: string,
+    load: boolean,
+    replace: boolean,
+    dependencies: boolean,
+    fresh: boolean,
+    onDirty: DirtyAction
   ): Promise<Record<string, unknown>> => {
     const instance = market()
     refuseSingles(name)
@@ -739,8 +774,10 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
       else result = await instance.update(name, { dependencies, onDirty })
       // 缺依赖或装后步骤失败时不加载：加载注定失败，且报出的错离原因很远
       const skip = result.setupError !== undefined || result.dependencyError !== undefined || result.needsDependencies
-      const loaded = load && !skip ? [...(await deps.plugins.loadAll()).loaded] : []
-      return { ...result, unloaded, loaded }
+      const report = load && !skip ? await deps.plugins.loadAll() : undefined
+      // 只报这一个插件的加载失败：新版 setup 抛错时，早先只回一个空的 loaded，使用者看不出它没起来
+      const failed = (report?.failed ?? []).filter(f => f.name === name || f.name === occupant)
+      return { ...result, unloaded, loaded: [...(report?.loaded ?? [])], ...(failed.length === 0 ? {} : { failed }) }
     } catch (err) {
       await restore(occupant, unloaded)
       throw fail(400, err instanceof Error ? err.message : String(err))
@@ -878,46 +915,51 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     const body = req.body === undefined ? {} : objectOf(req.body)
     const load = optionalBoolean(body, "load") ?? true
     refuseSingles(name)
-    // 先卸载再跑：`build` 会覆盖 `dist/`，而旧模块还在内存里响应命令。
-    // 卸的是这个目录里装着的那个插件，不是与目录同名的那个，见 `pluginInDir`
-    const occupant = pluginInDir(name)
-    const unloaded =
-      occupant !== undefined && deps.plugins.get(occupant) !== undefined ? await deps.plugins.unload(occupant) : false
-    try {
-      const result = await market().setup(name)
-      // 判据与 installFromMarket 一致：缺依赖或缺产物时加载注定失败，见那里的注释
-      const skip = result.setupError !== undefined || result.needsDependencies
-      const loaded = load && !skip ? [...(await deps.plugins.loadAll()).loaded] : []
-      return { ...result, unloaded, loaded }
-    } catch (err) {
-      await restore(occupant, unloaded)
-      throw fail(400, err instanceof Error ? err.message : String(err))
-    }
+    return exclusive(name, async () => {
+      // 先卸载再跑：`build` 会覆盖 `dist/`，而旧模块还在内存里响应命令。
+      // 卸的是这个目录里装着的那个插件，不是与目录同名的那个，见 `pluginInDir`
+      const occupant = pluginInDir(name)
+      const unloaded =
+        occupant !== undefined && deps.plugins.get(occupant) !== undefined ? await deps.plugins.unload(occupant) : false
+      try {
+        const result = await market().setup(name)
+        // 判据与 installFromMarket 一致：缺依赖或缺产物时加载注定失败，见那里的注释
+        const skip = result.setupError !== undefined || result.needsDependencies
+        const report = load && !skip ? await deps.plugins.loadAll() : undefined
+        const failed = (report?.failed ?? []).filter(f => f.name === name || f.name === occupant)
+        return { ...result, unloaded, loaded: [...(report?.loaded ?? [])], ...(failed.length === 0 ? {} : { failed }) }
+      } catch (err) {
+        await restore(occupant, unloaded)
+        throw fail(400, err instanceof Error ? err.message : String(err))
+      }
+    })
   })
 
   add("DELETE", "market/:name", async req => {
     requireWritable()
     const name = req.params.name ?? ""
     refuseSingles(name)
-    // 先卸载再删除目录：若目录已删除而插件仍在内存中运行，其命令仍会响应，
-    // 而重启后则不再存在 —— 此类不一致比一次失败的卸载更难排查。
-    // 同样按目录定位那个插件，见 `pluginInDir`
-    const occupant = pluginInDir(name)
-    const unloaded =
-      occupant !== undefined && deps.plugins.get(occupant) !== undefined ? await deps.plugins.unload(occupant) : false
-    let removed: boolean
-    try {
-      removed = await market().remove(name)
-    } catch (err) {
-      await restore(occupant, unloaded)
-      throw fail(400, err instanceof Error ? err.message : String(err))
-    }
-    // 目录都没删掉就别让插件白白停掉：这一支的典型成因是目录名写错，与插件本身无关
-    if (!removed) {
-      await restore(occupant, unloaded)
-      throw fail(404, `插件目录 ${name} 不存在`)
-    }
-    return { name, unloaded, removed }
+    return exclusive(name, async () => {
+      // 先卸载再删除目录：若目录已删除而插件仍在内存中运行，其命令仍会响应，
+      // 而重启后则不再存在 —— 此类不一致比一次失败的卸载更难排查。
+      // 同样按目录定位那个插件，见 `pluginInDir`
+      const occupant = pluginInDir(name)
+      const unloaded =
+        occupant !== undefined && deps.plugins.get(occupant) !== undefined ? await deps.plugins.unload(occupant) : false
+      let removed: boolean
+      try {
+        removed = await market().remove(name)
+      } catch (err) {
+        await restore(occupant, unloaded)
+        throw fail(400, err instanceof Error ? err.message : String(err))
+      }
+      // 目录都没删掉就别让插件白白停掉：这一支的典型成因是目录名写错，与插件本身无关
+      if (!removed) {
+        await restore(occupant, unloaded)
+        throw fail(404, `插件目录 ${name} 不存在`)
+      }
+      return { name, unloaded, removed }
+    })
   })
 
   add("GET", "commands", () => deps.registries.commands())
@@ -1209,7 +1251,12 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
       ...(after === undefined || after === "" ? {} : { after }),
       limit: countOf(req.query, "limit", 100, 500)
     })
-    return { driver: inspector.driver, readonly: deps.config.get().server.readonly, ...page }
+    return {
+      driver: inspector.driver,
+      ...(inspector.engine === undefined ? {} : { engine: inspector.engine }),
+      readonly: deps.config.get().server.readonly,
+      ...page
+    }
   })
 
   add("GET", "storage/kv/entry", async req => {

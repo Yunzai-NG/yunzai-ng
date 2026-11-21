@@ -629,10 +629,13 @@ export class PluginHost {
     const startedAt = Date.now()
     const registry = new DisposalRegistry(name)
     const abort = new AbortController()
+    /** 配置是否已声明；失败时要撤掉，否则重载时 define 报「已被声明」，只能重启 */
+    let declaredConfig = false
 
     try {
       const dataDir = await ensureDir(join(this.#deps.paths.data, KV_PREFIX, name))
       const config = await this.#defineConfig(definition)
+      declaredConfig = config.declared
       const { ctx, counters } = createPluginContext({
         name,
         version: versionOf(definition, candidate),
@@ -651,8 +654,22 @@ export class PluginHost {
       })
 
       const timeout = this.#deps.setupTimeout ?? DEFAULT_SETUP_TIMEOUT
+      const running = Promise.resolve(definition.setup(ctx))
+      // 超时后 setup 仍可能跑完并交回一个清理函数：没人接就是一份永远回收不了的资源
+      running.then(
+        late => {
+          if (abort.signal.aborted && typeof late === "function") {
+            try {
+              void Promise.resolve(late()).catch(() => undefined)
+            } catch {
+              // 清理本身失败不再追究
+            }
+          }
+        },
+        () => undefined
+      )
       const cleanup = await withTimeout(
-        Promise.resolve(definition.setup(ctx)),
+        running,
         timeout,
         `插件 ${name} 的 setup 超过 ${timeout}ms 未完成。setup 里不要做耗时网络请求，改用 ctx.on("app/ready")`
       )
@@ -694,6 +711,7 @@ export class PluginHost {
       }
       this.#deps.services.removeByOwner(name)
       this.#deps.events.removeByOwner(name)
+      if (declaredConfig) this.#deps.config.remove(name)
 
       this.#markFailed(name, reason, candidate)
       this.#logger.error(`插件 ${name} 加载失败：${reason}`, err)

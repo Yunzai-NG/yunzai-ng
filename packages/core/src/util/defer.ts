@@ -116,6 +116,39 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
+ * 把几个中止信号并成一个，用完可摘掉挂在源信号上的监听
+ *
+ * 不用 `AbortSignal.any`：它产出的信号挂在每个源信号上、源活多久它就活多久。源是插件的卸载信号时，
+ * 每发一次请求就在上面留一个，插件不卸载就永不释放（实测每次约 1.7KB，线性涨）。
+ * @param signals 源信号
+ * @returns 合并后的信号与收尾函数；没有源时 signal 为 undefined
+ */
+export function linkSignals(signals: readonly (AbortSignal | undefined)[]): {
+  signal: AbortSignal | undefined
+  dispose: () => void
+} {
+  const list = signals.filter((s): s is AbortSignal => s !== undefined)
+  if (list.length === 0) return { signal: undefined, dispose: () => undefined }
+  if (list.length === 1) return { signal: list[0], dispose: () => undefined }
+
+  const controller = new AbortController()
+  const fired = list.find(s => s.aborted)
+  if (fired !== undefined) {
+    controller.abort(fired.reason)
+    return { signal: controller.signal, dispose: () => undefined }
+  }
+  const onAbort = (event: Event): void => {
+    dispose()
+    controller.abort((event.target as AbortSignal).reason)
+  }
+  const dispose = (): void => {
+    for (const s of list) s.removeEventListener("abort", onAbort)
+  }
+  for (const s of list) s.addEventListener("abort", onAbort, { once: true })
+  return { signal: controller.signal, dispose }
+}
+
+/**
  * 给 Promise 套超时
  *
  * 注意：超时只是让调用方不再等待，**并不能真正取消**底层操作。需要真取消

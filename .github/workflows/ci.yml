@@ -17,6 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  TZ: Asia/Shanghai
   NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
 
 jobs:
@@ -53,6 +54,10 @@ jobs:
       - name: Lint
         run: pnpm run lint
 
+      - name: 确认原生存储可用（不允许迁移测试静默跳过）
+        working-directory: packages/core
+        run: node -e "require('better-sqlite3')(':memory:').close(); require('classic-level')"
+
       - name: 单元测试
         run: pnpm run test
 
@@ -81,6 +86,10 @@ jobs:
 
       - name: 首次启动门禁
         run: pnpm run check:firstrun
+
+      - name: 确认原生存储可用（不允许迁移测试静默跳过）
+        working-directory: packages/core
+        run: node -e "require('better-sqlite3')(':memory:').close(); require('classic-level')"
 
       - name: 单元测试
         run: pnpm run test

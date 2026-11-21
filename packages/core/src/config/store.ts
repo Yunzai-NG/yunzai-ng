@@ -6,7 +6,8 @@
  *          1) 变更通知按叶子路径：`diffPaths` 算出实际变化的路径，只通知关注它的订阅者
  *          2) 写入走 `atomicWrite`（临时文件 + rename），否则断电或强杀会留下截断的 YAML
  *          3) 配置写坏了不崩：记录错误、退回上一份可用配置（首次加载则用缺省值），且绝不
- *             覆盖使用者那份坏文件
+ *             覆盖使用者那份坏文件 —— 坏着的期间 patch / replace / reset 一律拒绝（`ConfigFileBrokenError`），
+ *             改好文件、热加载成功之后恢复
  *          4) 新增配置项会补进既有文件：校验通过后按当前 schema 重写，新选项连同中文注释
  *             一并补入，幂等 —— 否则升级之后新选项在使用者的配置里根本看不见
  */
@@ -83,6 +84,10 @@ export class ConfigFile<T> implements ConfigHandle<T> {
   readonly #watchers = new Set<{ path: string; cb: (change: ConfigChange<T>) => void }>()
   /** 最近一次由自己写出的文本，用于识别"这次改动是我自己造成的" */
   #lastWritten: string | undefined
+  /** 磁盘上那份文件解析或校验不过时的问题；文件可用时 undefined */
+  #broken: readonly SchemaIssue[] | undefined
+  /** 读写队列：patch / replace / reset / load 依次执行，落盘顺序与提交顺序一致 */
+  #queue: Promise<void> = Promise.resolve()
 
   /**
    * @param params 构造参数
@@ -113,6 +118,11 @@ export class ConfigFile<T> implements ConfigHandle<T> {
     this.#header = params.header
   }
 
+  /** 磁盘上那份文件解析或校验不过时的问题；可用时 undefined。坏着时写入一律被拒 */
+  get broken(): readonly SchemaIssue[] | undefined {
+    return this.#broken
+  }
+
   /**
    * 取当前配置快照
    * @returns 只读快照；未发生变更时多次调用返回同一对象
@@ -129,8 +139,10 @@ export class ConfigFile<T> implements ConfigHandle<T> {
    * @throws SchemaError 校验失败，此时原配置不变、文件不变
    */
   async patch(patch: DeepPartial<T>, source: ConfigChange<T>["source"] = "api"): Promise<DeepReadonly<T>> {
-    const merged = deepMerge(this.#value as unknown as PlainObject, patch as unknown as PlainObject)
-    return this.#commit(merged, source)
+    // 合并放进队列里做：并发的两次 patch 要基于彼此的结果，而不是同一份旧值
+    return this.#serial(() =>
+      this.#commit(deepMerge(this.#value as unknown as PlainObject, patch as unknown as PlainObject), source)
+    )
   }
 
   /**
@@ -141,7 +153,7 @@ export class ConfigFile<T> implements ConfigHandle<T> {
    * @throws SchemaError 校验失败
    */
   async replace(value: T, source: ConfigChange<T>["source"] = "api"): Promise<DeepReadonly<T>> {
-    return this.#commit(value, source)
+    return this.#serial(() => this.#commit(value, source))
   }
 
   /**
@@ -150,7 +162,7 @@ export class ConfigFile<T> implements ConfigHandle<T> {
    * @returns 更新后的快照
    */
   async reset(source: ConfigChange<T>["source"] = "api"): Promise<DeepReadonly<T>> {
-    return this.#commit(this.#validator.defaults(), source)
+    return this.#serial(() => this.#commit(this.#validator.defaults(), source))
   }
 
   /**
@@ -186,11 +198,36 @@ export class ConfigFile<T> implements ConfigHandle<T> {
    * @returns 校验问题列表（可能只含 warn）
    */
   async load(source: ConfigChange<T>["source"], createIfMissing: boolean): Promise<SchemaIssue[]> {
+    return this.#serial(() => this.#load(source, createIfMissing))
+  }
+
+  /**
+   * 排进本文件的读写队列，前一个出错不影响后一个
+   * @param task 任务
+   * @returns 任务结果
+   */
+  #serial<R>(task: () => Promise<R>): Promise<R> {
+    const run = this.#queue.then(task)
+    this.#queue = run.then(
+      () => undefined,
+      () => undefined
+    )
+    return run
+  }
+
+  /**
+   * load 的实际实现
+   * @param source 变更来源
+   * @param createIfMissing 文件不存在时是否写出默认配置
+   * @returns 校验问题列表
+   */
+  async #load(source: ConfigChange<T>["source"], createIfMissing: boolean): Promise<SchemaIssue[]> {
     const text = await readText(this.file)
 
     if (text === undefined) {
       const value = this.#validator.defaults()
       this.#value = value
+      this.#broken = undefined
       if (createIfMissing) await this.#write(value)
       return []
     }
@@ -202,15 +239,19 @@ export class ConfigFile<T> implements ConfigHandle<T> {
     try {
       raw = parseYaml(text)
     } catch (err) {
-      this.#logger.error(`配置 ${this.name} 的 YAML 语法有误，已沿用上一份可用配置`, err)
-      return [{ path: "", message: err instanceof Error ? err.message : String(err), severity: "error" }]
+      const issues: SchemaIssue[] = [{ path: "", message: err instanceof Error ? err.message : String(err), severity: "error" }]
+      this.#broken = issues
+      this.#logger.error(`配置 ${this.name} 的 YAML 语法有误，已沿用上一份可用配置；改好文件之前不会写它`, err)
+      return issues
     }
 
     const result = this.#validator.safeParse(raw)
     if (!result.ok) {
-      this.#logger.error(`配置 ${this.name} 校验失败，已沿用上一份可用配置：\n${formatIssues(result.issues)}`)
+      this.#broken = result.issues
+      this.#logger.error(`配置 ${this.name} 校验失败，已沿用上一份可用配置；改好文件之前不会写它：\n${formatIssues(result.issues)}`)
       return result.issues
     }
+    this.#broken = undefined
 
     for (const issue of result.issues) {
       this.#logger.warn(`配置 ${this.name} 的 ${issue.path}：${issue.message}`)
@@ -237,6 +278,8 @@ export class ConfigFile<T> implements ConfigHandle<T> {
    * @throws SchemaError 校验失败
    */
   async #commit(candidate: unknown, source: ConfigChange<T>["source"]): Promise<DeepReadonly<T>> {
+    // 文件坏着时内存里是上一份可用配置（首次加载则是缺省值）：照它写盘就是用缺省值覆盖使用者的整份配置
+    if (this.#broken !== undefined) throw new ConfigFileBrokenError(this.name, this.file, this.#broken)
     const result = this.#validator.safeParse(candidate)
     if (!result.ok) throw new SchemaError(result.issues)
 
@@ -247,8 +290,9 @@ export class ConfigFile<T> implements ConfigHandle<T> {
     // 无实质变化就不写盘，避免 WebUI 里点一下保存就产生一次磁盘写入与一轮通知
     if (paths.length === 0) return this.get()
 
-    this.#value = next
+    // 先落盘再换值：写盘失败时内存与文件仍一致
     await this.#write(next)
+    this.#value = next
     this.#emit(prev, next, paths, source)
     return this.get()
   }
@@ -314,6 +358,29 @@ export class ConfigFile<T> implements ConfigHandle<T> {
  */
 function formatIssues(issues: readonly SchemaIssue[]): string {
   return issues.map(i => `  · ${i.path === "" ? "(根)" : i.path}：${i.message}`).join("\n")
+}
+
+/** 配置文件坏着时拒绝写入 */
+export class ConfigFileBrokenError extends Error {
+  /** 错误名 */
+  override readonly name = "ConfigFileBrokenError"
+  /** HTTP 状态码，面板 API 据此回 409 */
+  readonly statusCode = 409
+
+  /**
+   * @param config 配置名
+   * @param file 文件路径
+   * @param issues 文件的问题
+   */
+  constructor(
+    readonly config: string,
+    readonly file: string,
+    readonly issues: readonly SchemaIssue[]
+  ) {
+    super(
+      `${file} 有错，改好之前不能保存（保存会用缺省值覆盖它）：\n${formatIssues(issues.filter(i => i.severity === "error"))}`
+    )
+  }
 }
 
 /**

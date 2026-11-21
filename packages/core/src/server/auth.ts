@@ -10,7 +10,9 @@
  *          3) 比较走 SHA-256 摘要 + `timingSafeEqual`：直接对原文用后者会在长度不等时抛错，
  *             等于把「长度对不对」变成旁路信号
  *          4) 没设令牌时只放行本机，判据是 TCP 对端地址，且服务器强制 `trustProxy: false` ——
- *             否则一个 `X-Forwarded-For: 127.0.0.1` 就能把自己伪装成本机
+ *             否则一个 `X-Forwarded-For: 127.0.0.1` 就能把自己伪装成本机；Host 也必须是回环名，挡 DNS 重绑定
+ *          5) 浏览器里别的站点发来的写请求与 WebSocket 握手一律拒绝（`checkCrossSite`）：本机任何页面都能连
+ *             `127.0.0.1`，WebSocket 还不受同源策略约束
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 
@@ -285,11 +287,17 @@ export interface AuthRequest {
  */
 export function checkAuth(token: string | undefined, req: AuthRequest): AuthFailure | undefined {
   if (token === undefined || token === "") {
-    if (isLoopbackAddress(req.ip)) return undefined
-    return {
-      status: 401,
-      message: "本服务器尚未设置访问令牌，因此只接受本机访问。请在 config/yunzai.yaml 的 server.token 里设置令牌后重启"
+    if (!isLoopbackAddress(req.ip)) {
+      return {
+        status: 401,
+        message: "本服务器尚未设置访问令牌，因此只接受本机访问。请在 config/yunzai.yaml 的 server.token 里设置令牌后重启"
+      }
     }
+    // 对端是本机而 Host 不是：DNS 重绑定 —— 恶意域名被解析到 127.0.0.1，浏览器视其为同源
+    if (!isLoopbackHost(firstValue(req.headers.host))) {
+      return { status: 403, message: "未设置访问令牌时只接受以 localhost / 127.0.0.1 访问。要用别的地址访问，请先设置 server.token" }
+    }
+    return undefined
   }
 
   const given = readToken(req.headers)
@@ -314,9 +322,87 @@ export function checkAuth(token: string | undefined, req: AuthRequest): AuthFail
 export function checkForgeableBody(req: AuthRequest): AuthFailure | undefined {
   if (!UNSAFE_METHODS.includes(req.method)) return undefined
   const type = (firstValue(req.headers["content-type"]) ?? "").split(";")[0]?.trim().toLowerCase() ?? ""
-  if (type === "" || !FORGEABLE_TYPES.includes(type)) return undefined
+  if (type === "") {
+    // 不带类型的请求体同样造得出来（no-cors 下 fetch 一个 Blob），而解析器会把它当 JSON
+    if (!hasBody(req.headers)) return undefined
+    return { status: 415, message: "写接口的请求体必须声明 Content-Type: application/json" }
+  }
+  if (!FORGEABLE_TYPES.includes(type)) return undefined
   return {
     status: 415,
     message: `${type} 不被接受：需要鉴权的写接口只收 application/json（这条限制是为了挡住跨站伪造请求）`
   }
+}
+
+/**
+ * 挡掉浏览器里别的站点发来的写请求与 WebSocket 握手
+ *
+ * 前两道（令牌、请求体类型）挡得住大多数跨站伪造，这一道补上剩下的：未设令牌时本机页面带不带令牌都能进，
+ * 浏览器 WebSocket 也不受同源策略约束。判据优先看 `Sec-Fetch-Site`（浏览器自填、页面改不了，经反向代理也不变）；
+ * 没有它的旧浏览器再比 `Origin` 与 `Host`。不是浏览器的客户端两个头都不带，不受影响。
+ * @param req 请求信息
+ * @param upgrade 是否 WebSocket 升级
+ * @returns 校验失败时的描述；通过时 undefined
+ */
+export function checkCrossSite(req: AuthRequest, upgrade = false): AuthFailure | undefined {
+  if (!upgrade && !UNSAFE_METHODS.includes(req.method)) return undefined
+  const site = firstValue(req.headers["sec-fetch-site"])?.toLowerCase()
+  if (site !== undefined) return site === "same-origin" || site === "none" ? undefined : crossSite()
+  const origin = firstValue(req.headers.origin)
+  if (origin === undefined || origin === "") return undefined
+  if (origin === "null") return crossSite()
+  let originHost: string
+  try {
+    originHost = new URL(origin).host.toLowerCase()
+  } catch {
+    return crossSite()
+  }
+  return originHost === (firstValue(req.headers.host) ?? "").toLowerCase() ? undefined : crossSite()
+}
+
+/**
+ * 判断请求是否出自浏览器
+ *
+ * 浏览器会自动带上 `Origin`（跨源请求、WebSocket 握手）与 `Sec-Fetch-*`，页面脚本改不掉；
+ * 协议端、webhook 推送一类的程序都不带。给 `auth: false` 的端点用：它们本不该被网页调用。
+ * @param headers 已小写化键名的请求头
+ * @returns 是否浏览器发起
+ */
+export function isBrowserRequest(headers: Readonly<Record<string, string | string[] | undefined>>): boolean {
+  return (
+    firstValue(headers["sec-fetch-site"]) !== undefined ||
+    firstValue(headers["sec-fetch-mode"]) !== undefined ||
+    firstValue(headers.origin) !== undefined
+  )
+}
+
+/**
+ * 跨站拒绝的统一描述
+ * @returns 描述
+ */
+function crossSite(): AuthFailure {
+  return { status: 403, message: "拒绝了来自其他网页的请求：面板接口只接受面板自己的页面发起" }
+}
+
+/**
+ * 请求是否带了请求体
+ * @param headers 请求头
+ * @returns 是否有请求体
+ */
+function hasBody(headers: Readonly<Record<string, string | string[] | undefined>>): boolean {
+  const length = Number(firstValue(headers["content-length"]) ?? "0")
+  return (Number.isFinite(length) && length > 0) || firstValue(headers["transfer-encoding"]) !== undefined
+}
+
+/**
+ * Host 头是不是回环名
+ * @param host Host 头
+ * @returns 是否 localhost / 127.x / [::1]
+ */
+function isLoopbackHost(host: string | undefined): boolean {
+  // 没有 Host 的只会是非浏览器的本机程序（浏览器恒带），谈不上重绑定
+  if (host === undefined || host === "") return true
+  const lower = host.toLowerCase()
+  const name = lower.startsWith("[") ? lower.slice(1, lower.indexOf("]")) : lower.replace(/:\d+$/, "")
+  return name === "localhost" || name.endsWith(".localhost") || isLoopbackAddress(name)
 }

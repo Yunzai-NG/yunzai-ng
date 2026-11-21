@@ -24,7 +24,6 @@ import type {
   DurationLike,
   HttpClient,
   HttpMethod,
-  KvDriver,
   KvNamespace,
   Logger,
   MessageScene,
@@ -233,6 +232,8 @@ class ChainedCommand implements CommandBuilder {
    */
   priority(value: number): CommandBuilder {
     this.#reg.options.priority = value
+    // 桶在注册时按优先级排好序，只改选项不会让它挪位置
+    this.#sink.reindex(this.#reg)
     return this
   }
 
@@ -575,15 +576,6 @@ class Context implements PluginContext<unknown> {
    */
   registerRenderer(provider: RendererProvider): Disposer {
     return this.#own(this.#deps.hooks.render.register(provider, this.name), `renderer:${provider.id}`)
-  }
-
-  /**
-   * 注册 KV 驱动
-   * @param driver 驱动实现
-   * @returns 注销句柄
-   */
-  registerKvDriver(driver: KvDriver): Disposer {
-    return this.#own(this.#deps.hooks.kvDrivers.register(driver, this.name), `kv-driver:${driver.id}`)
   }
 
   /**

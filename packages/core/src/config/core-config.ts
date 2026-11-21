@@ -9,11 +9,18 @@
  *          不存在"改了校验忘了改表单"的可能。
  */
 import type { DeepReadonly } from "@yunzai-ng/types"
+import { parseDuration } from "../util/duration.js"
 import { s, type Infer } from "./schema.js"
 import type { ConfigFile, ConfigStore } from "./store.js"
 
 /** 内核配置名（对应 `config/yunzai.yaml`） */
 export const CORE_CONFIG_NAME = "yunzai"
+
+/** 用于发送和重连定时器；零不是这些字段的关闭开关。 */
+const positiveDuration = () => s.duration().check("时长须在 1 到 2147483647 毫秒之间", value => {
+  const ms = parseDuration(value, 0)
+  return ms >= 1 && ms <= 2147483647
+})
 
 /**
  * 内核配置 schema
@@ -57,9 +64,10 @@ export const coreConfigSchema = s.object({
   log: s
     .object({
       level: s
-        .enum(["trace", "debug", "info", "warn", "error", "fatal", "silent"], {
+        .enum(["trace", "debug", "mark", "info", "warn", "error", "fatal", "silent"], {
           trace: "全部",
           debug: "调试",
+          mark: "日常标记",
           info: "常规",
           warn: "警告",
           error: "错误",
@@ -70,12 +78,12 @@ export const coreConfigSchema = s.object({
         .title("日志级别")
         .desc("控制台显示什么、面板的日志页缺省看什么。日志文件不受它影响，一律记全量。"),
       consoleLevel: s
-        .enum(["trace", "debug", "info", "warn", "error", "fatal", "silent"])
+        .enum(["trace", "debug", "mark", "info", "warn", "error", "fatal", "silent"])
         .optional()
         .title("控制台级别")
         .desc("留空则跟随日志级别。"),
       fileLevel: s
-        .enum(["trace", "debug", "info", "warn", "error", "fatal", "silent"])
+        .enum(["trace", "debug", "mark", "info", "warn", "error", "fatal", "silent"])
         .optional()
         .title("文件级别")
         .desc(
@@ -101,14 +109,16 @@ export const coreConfigSchema = s.object({
     .object({
       driver: s
         .select([
-          { value: "auto", label: "自动", description: "优先内嵌 level，装不上时退回 JSON 文件" },
-          { value: "level", label: "内嵌 LevelDB", description: "默认；性能好，需原生模块" },
-          { value: "json", label: "JSON 文件", description: "纯 JS，Termux 上最稳" },
+          { value: "sqlite", label: "SQLite", description: "默认；一个 kv.db 文件，电脑与安卓通用" },
           { value: "memory", label: "仅内存", description: "重启即丢，仅测试用" }
         ])
-        .default("auto")
+        .aliases({ auto: "sqlite", level: "sqlite", json: "sqlite" })
+        .default("sqlite")
         .title("键值存储驱动")
-        .desc("缺省自带内嵌存储，无须另装任何服务；Redis 由 store-redis 插件提供，属可选。"),
+        .desc(
+          "数据存在存储目录的 kv.db 里，无须另装任何服务，换机器直接拷。旧版的 LevelDB（kv/）与 JSON（kv.json）" +
+            "数据在首次启动时自动迁入，原件改名保留。存储只由内核负责，插件不能接管。"
+        ),
       dir: s
         .dir()
         .optional()
@@ -117,8 +127,8 @@ export const coreConfigSchema = s.object({
       sqlite: s
         .boolean()
         .default(true)
-        .title("启用 SQLite")
-        .desc("关系型数据（抽卡记录、面板缓存）用 better-sqlite3；原生模块不可用时自动降级为纯 KV。")
+        .title("插件 SQL 库")
+        .desc("给插件建表用的关系库（抽卡记录、面板缓存），需要 better-sqlite3；它装不上时，用到 SQL 的插件拿到一条错误说明，只用 KV 的插件不受影响。")
     })
     .title("存储")
     .group("存储")
@@ -232,7 +242,7 @@ export const coreConfigSchema = s.object({
         .default(3000)
         .title("长文本切分长度")
         .desc("超长文本按此长度切分发送，切分点优先取换行与空白处。"),
-      sendTimeout: s.duration().default("30s").title("发送超时"),
+      sendTimeout: positiveDuration().default("30s").title("发送超时"),
       sequential: s
         .boolean()
         .default(true)
@@ -371,13 +381,11 @@ export const coreConfigSchema = s.object({
             "而无休止的重试会让日志里真正要看的东西被刷走。" +
             "这四项都可以在账号上单独覆盖，账号没填的项才用这里的值。"
         ),
-      reconnectInterval: s
-        .duration()
+      reconnectInterval: positiveDuration()
         .default("5s")
         .title("首次重连间隔")
         .desc("第一次失败之后等多久再试。此后每失败一次乘上「退避倍率」，直到「重连间隔上限」。"),
-      reconnectMaxInterval: s
-        .duration()
+      reconnectMaxInterval: positiveDuration()
         .default("1m")
         .title("重连间隔上限")
         .desc(

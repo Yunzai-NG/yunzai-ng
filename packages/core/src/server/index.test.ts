@@ -12,8 +12,8 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { Socket } from "node:net"
-import { afterEach, beforeEach, describe, expect, it } from "vitest"
+import { createServer, type AddressInfo, type Socket } from "node:net"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { LogLevel, Logger } from "@yunzai-ng/types"
 import { ConfigStore } from "../config/store.js"
 import { defineCoreConfig, type CoreConfigHandle } from "../config/core-config.js"
@@ -56,7 +56,7 @@ function quietLogger(): Logger & { lines: string[] } {
     warn: push("warn"),
     error: push("error"),
     fatal: push("fatal"),
-    mark: push("info"),
+    mark: push("mark"),
     child: () => logger,
     isLevelEnabled: () => false
   }
@@ -256,6 +256,71 @@ describe("ManagedServer", () => {
       const res = await server.raw.inject({ method: "GET", url: "/api/state?token=0123456789abcdef" })
       expect(res.statusCode).toBe(401)
     })
+
+    // 本机任何网页都能向 127.0.0.1 发请求：没设令牌时，没有这一道就能跨站改配置、装插件
+    it("别的网页发来的写请求一律拒绝，面板自己的页面照常", async () => {
+      server.route("/api", "POST", "market/custom", () => ({ ok: true }))
+      const forged = await server.raw.inject({
+        method: "POST",
+        url: "/api/market/custom",
+        headers: { "content-type": "application/json", "sec-fetch-site": "cross-site", origin: "https://evil.example" },
+        payload: { url: "https://evil.example/x.git" }
+      })
+      expect(forged.statusCode).toBe(403)
+      const sameSite = await server.raw.inject({
+        method: "POST",
+        url: "/api/market/custom",
+        headers: { "content-type": "application/json", "sec-fetch-site": "same-site" },
+        payload: {}
+      })
+      expect(sameSite.statusCode).toBe(403)
+      // 旧浏览器没有 Sec-Fetch-Site：退回比 Origin 与 Host
+      const oldBrowser = await server.raw.inject({
+        method: "POST",
+        url: "/api/market/custom",
+        headers: { "content-type": "application/json", origin: "http://evil.example" },
+        payload: {}
+      })
+      expect(oldBrowser.statusCode).toBe(403)
+
+      const panel = await server.raw.inject({
+        method: "POST",
+        url: "/api/market/custom",
+        headers: { "content-type": "application/json", "sec-fetch-site": "same-origin", origin: "http://localhost:80" },
+        payload: {}
+      })
+      expect(panel.statusCode).toBe(200)
+      // 不是浏览器的客户端两个头都不带
+      const script = await server.raw.inject({ method: "POST", url: "/api/market/custom", payload: {} })
+      expect(script.statusCode).toBe(200)
+    })
+
+    it("没声明类型的请求体被拒：no-cors 下 fetch 一个 Blob 就是这个形状", async () => {
+      server.route("/api", "POST", "config", () => ({ ok: true }))
+      const blob = await server.raw.inject({ method: "POST", url: "/api/config", payload: Buffer.from("{\"a\":1}") })
+      expect(blob.statusCode).toBe(415)
+      // 没有请求体的写请求不受影响（面板的 DELETE、无参 POST）
+      const empty = await server.raw.inject({ method: "POST", url: "/api/config" })
+      expect(empty.statusCode).toBe(200)
+    })
+
+    it("没设令牌时 Host 必须是回环名：挡 DNS 重绑定", async () => {
+      server.route("/api", "GET", "state", () => ({ ok: true }))
+      const rebound = await server.raw.inject({ method: "GET", url: "/api/state", headers: { host: "evil.example:2536" } })
+      expect(rebound.statusCode).toBe(403)
+      for (const host of ["localhost:2536", "127.0.0.1:2536", "[::1]:2536", "panel.localhost"]) {
+        const ok = await server.raw.inject({ method: "GET", url: "/api/state", headers: { host } })
+        expect(ok.statusCode).toBe(200)
+      }
+      // 设了令牌就不管 Host：反向代理、局域网地址都靠令牌把关
+      await config.patch({ server: { token: "0123456789abcdef" } }, "api")
+      const proxied = await server.raw.inject({
+        method: "GET",
+        url: "/api/state",
+        headers: { host: "bot.example.com", authorization: "Bearer 0123456789abcdef" }
+      })
+      expect(proxied.statusCode).toBe(200)
+    })
   })
 
   describe("请求体", () => {
@@ -287,12 +352,19 @@ describe("ManagedServer", () => {
       expect(seen).toBeUndefined()
     })
 
+    // 只对 auth: false 的路由（设备端 SDK 的 webhook）：需要鉴权的写接口不带类型直接 415，见「鉴权」一组
     it("没有 Content-Type 时也按 JSON 试一次", async () => {
       let seen: unknown
-      server.route("/plugin/demo", "POST", "guess", req => {
-        seen = req.body
-        return { ok: true }
-      })
+      server.route(
+        "/plugin/demo",
+        "POST",
+        "guess",
+        req => {
+          seen = req.body
+          return { ok: true }
+        },
+        { auth: false }
+      )
       const res = await server.raw.inject({
         method: "POST",
         url: "/plugin/demo/guess",
@@ -518,6 +590,15 @@ describe("ManagedServer", () => {
       ws.terminate()
     })
 
+    it("别的网页发起的握手被拒：浏览器的 WebSocket 不受同源策略约束", async () => {
+      server.websocket("/plugin/demo", "logs", () => undefined)
+      await expect(
+        server.raw.injectWS("/plugin/demo/logs", upgradeCtx({ origin: "https://evil.example", "sec-fetch-site": "cross-site" }))
+      ).rejects.toThrow(/Unexpected server response: 403/)
+      const ws = await server.raw.injectWS("/plugin/demo/logs", upgradeCtx({ "sec-fetch-site": "same-origin" }))
+      ws.terminate()
+    })
+
     it("自定义 verify 完全接管校验，返回 false 时回 401", async () => {
       server.websocket(
         "/plugin/napcat",
@@ -572,13 +653,31 @@ describe("ManagedServer", () => {
       expect(typeof token).toBe("string")
       // 恰好 16 位字母数字：这串东西要从日志里抄进浏览器，见 generateToken
       expect(token).toMatch(/^[A-Za-z0-9]{16}$/)
-      expect(logger.lines.some(line => line.startsWith("warn") && line.includes(token ?? "!"))).toBe(true)
+      expect(logger.lines.some(line => line.includes(token ?? "!"))).toBe(false)
     })
 
     it("已有令牌时不覆盖 —— 使用者自己设的那一个说了算", async () => {
       await config.patch({ server: { token: "kept-by-the-user" } }, "api")
       await server.ensureToken()
       expect(config.get().server.token).toBe("kept-by-the-user")
+    })
+
+    it("令牌写不进配置文件时只放内存，照样要令牌", async () => {
+      vi.spyOn(config, "patch").mockRejectedValueOnce(new Error("EROFS: read-only file system"))
+      await server.ensureToken()
+      expect(config.get().server.token ?? "").toBe("")
+      expect(logger.lines.some(line => line.startsWith("error") && line.includes("只在内存里生效"))).toBe(true)
+      expect(logger.lines.some(line => /只在内存里生效：[A-Za-z0-9]{16}/.test(line))).toBe(false)
+      server.route("/api", "GET", "state", () => ({ ok: true }))
+      const bare = await server.raw.inject({ method: "GET", url: "/api/state" })
+      expect(bare.statusCode).toBe(401)
+    })
+
+    it("运行中令牌被清空，立刻补一个新的", async () => {
+      await config.patch({ server: { token: "kept-by-the-user" } }, "api")
+      await server.ensureToken()
+      await config.patch({ server: { token: "" } }, "api")
+      await vi.waitFor(() => expect(config.get().server.token).toMatch(/^[A-Za-z0-9]{16}$/))
     })
 
     it("close 幂等，且关闭后不能再注册", async () => {
@@ -590,12 +689,32 @@ describe("ManagedServer", () => {
     })
 
     it("真的监听时 info 给出实际端口", async () => {
-      // 配置 schema 不接受 port 0，所以自己挑一个高位端口而不是让内核分配
-      const port = 40000 + Math.floor(Math.random() * 20000)
+      const probe = createServer()
+      const port = await new Promise<number>((resolve, reject) => {
+        probe.once("error", reject)
+        probe.listen(0, "127.0.0.1", () => resolve((probe.address() as AddressInfo).port))
+      })
+      await new Promise<void>((resolve, reject) => probe.close(err => err ? reject(err) : resolve()))
       await config.patch({ server: { port } }, "api")
       await server.listen()
       expect(server.info.enabled).toBe(true)
       expect(server.info.port).toBe(port)
+    })
+
+    // Windows 上通配地址与 127.0.0.1 能同时绑上同一端口，浏览器会落到别人那边
+    it("回环上已有别的服务在应答时拒绝监听，不静默串台", async () => {
+      const other = createServer(socket => socket.end())
+      const port = await new Promise<number>(resolve => {
+        other.listen(0, "127.0.0.1", () => resolve((other.address() as AddressInfo).port))
+      })
+      try {
+        await config.patch({ server: { host: "0.0.0.0", port } }, "api")
+        await expect(server.listen()).rejects.toMatchObject({ code: "EADDRINUSE" })
+        await expect(server.listen()).rejects.toThrow(/http:\/\/127\.0\.0\.1:\d+ 有服务在应答/)
+        expect(server.info.enabled).toBe(false)
+      } finally {
+        await new Promise(resolve => other.close(resolve))
+      }
     })
   })
 

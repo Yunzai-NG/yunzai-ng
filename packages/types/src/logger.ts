@@ -2,11 +2,11 @@
  * 模块职责：日志接口
  * 依赖方向：叶子模块
  * 生命周期：纯类型
- * 注意事项：内核实现用 pino，而插件只看到这个接口 —— 换实现不影响插件。
+ * 注意事项：插件只依赖这个接口 —— 换实现不影响插件。
  */
 
 /** 日志级别，由低到高 */
-export type LogLevel = "trace" | "debug" | "info" | "warn" | "error" | "fatal" | "silent"
+export type LogLevel = "trace" | "debug" | "mark" | "info" | "warn" | "error" | "fatal" | "silent"
 
 /** 一条日志的附加字段 */
 export type LogBindings = Record<string, unknown>
@@ -30,9 +30,7 @@ export interface Logger {
   fatal(msg: unknown, ...args: unknown[]): void
 
   /**
-   * 重要信息
-   *
-   * 等价于 `info`，仅为兼容 Miao-Yunzai 的 `logger.mark` 习惯而保留。
+   * 灰色日常标记，介于 debug 与 info 之间。
    */
   mark(msg: unknown, ...args: unknown[]): void
 

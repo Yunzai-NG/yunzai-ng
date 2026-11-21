@@ -34,6 +34,9 @@ const DEFAULT_MAX_BYTES = 256 * 1024 * 1024
 /** 条目数的缺省上限 */
 const DEFAULT_MAX_ENTRIES = 20_000
 
+/** 每个条目额外容许的解压字节：头部、扩展头与块对齐填充 */
+const GUNZIP_SLACK_PER_ENTRY = 4 * 512
+
 /** 解包选项 */
 export interface ExtractOptions {
   /** 剥离前若干层路径，GitHub 归档带一层仓库名目录，取 1 */
@@ -155,10 +158,10 @@ function stripPath(path: string, strip: number): string {
  * @throws 归档结构非法、超出体积或条目上限时
  */
 export async function extractTarGz(archive: Uint8Array, dest: string, opts: ExtractOptions = {}): Promise<string[]> {
-  const buf = gunzipSync(archive)
   const strip = opts.strip ?? 0
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES
   const maxEntries = opts.maxEntries ?? DEFAULT_MAX_ENTRIES
+  const buf = gunzipBounded(archive, maxBytes, maxEntries)
 
   const written: string[] = []
   let total = 0
@@ -255,6 +258,25 @@ export function joinWithin(base: string, name: string): string {
 }
 
 /** 供测试与调用方复用的块大小 */
+/**
+ * 解压时限定输出体积：先全量解压再数字节，一个几 MB 的 gzip 炸弹就能把进程撑爆
+ * @param archive gzip 数据
+ * @param maxBytes 文件内容上限，另按条目数留出头部余量
+ * @param maxEntries 条目数上限
+ * @returns 解压后的 tar 数据
+ * @throws 输出超过上限时
+ */
+function gunzipBounded(archive: Uint8Array, maxBytes: number, maxEntries: number): Buffer {
+  try {
+    return gunzipSync(archive, { maxOutputLength: maxBytes + (maxEntries + 1) * GUNZIP_SLACK_PER_ENTRY })
+  } catch (err) {
+    if (err instanceof RangeError || (err as { code?: unknown }).code === "ERR_BUFFER_TOO_LARGE") {
+      throw new Error(`归档解包后体积超过上限 ${maxBytes} 字节`)
+    }
+    throw err
+  }
+}
+
 export const TAR_BLOCK_SIZE = BLOCK
 
 /**
