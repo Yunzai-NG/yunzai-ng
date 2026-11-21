@@ -168,7 +168,7 @@ export interface MockDriver extends BotDriver {
    * （摘除 Bot 注册表条目、派发 `bot/offline`、安排退避重连），而不仅是修改一个状态字段。
    * @param reason 下线原因，会出现在账号状态里
    */
-  goOffline(reason?: string): void
+  goOffline(reason?: string, retryable?: boolean): void
 }
 
 /** 创建 Mock 适配器的选项 */
@@ -186,6 +186,10 @@ export interface MockAdapterOptions {
    * 账号状态变 error、排了退避重连"这条路径。
    */
   failConnect?: string
+  /** 连接失败的错误带上 `retryable: false`，模拟「重连也没用」 */
+  failRetryable?: boolean
+  /** `connect()` 返回之前就报一次下线，模拟连上又立刻断开 */
+  dropDuringConnect?: boolean
   /**
    * `callApi` 的实现
    *
@@ -398,8 +402,9 @@ export function createMockAdapter(opts: MockAdapterOptions = {}): MockAdapter {
 
       async connect(): Promise<void> {
         connects += 1
-        if (opts.failConnect !== undefined) throw new Error(opts.failConnect)
+        if (opts.failConnect !== undefined) throw Object.assign(new Error(opts.failConnect), opts.failRetryable === false ? { retryable: false } : {})
         online = true
+        if (opts.dropDuringConnect === true) host.setStatus("offline", { error: "连上就断了" })
         return Promise.resolve()
       },
 
@@ -413,10 +418,10 @@ export function createMockAdapter(opts: MockAdapterOptions = {}): MockAdapter {
         return Promise.resolve(record(selfId, target, toSegments(content), sendOpts))
       },
 
-      async sendForward(target: SendTarget, nodes: ForwardNode[]): Promise<SendResult> {
+      async sendForward(target: SendTarget, nodes: ForwardNode[], sendOpts?: SendOptions): Promise<SendResult> {
         // 转发的文本视图取各节点正文拼接，以使 `texts` 断言对转发同样有效
         const flat = nodes.flatMap(node => node.message ?? [])
-        return Promise.resolve(record(selfId, target, flat, undefined, nodes))
+        return Promise.resolve(record(selfId, target, flat, sendOpts, nodes))
       },
 
       async recallMessage(messageId: string): Promise<boolean> {
@@ -499,9 +504,9 @@ export function createMockAdapter(opts: MockAdapterOptions = {}): MockAdapter {
         return event
       },
 
-      goOffline(reason?: string): void {
+      goOffline(reason?: string, retryable?: boolean): void {
         online = false
-        host.setStatus("offline", { error: reason ?? "Mock 主动下线" })
+        host.setStatus("offline", { error: reason ?? "Mock 主动下线", ...(retryable === undefined ? {} : { retryable }) })
       }
     }
 

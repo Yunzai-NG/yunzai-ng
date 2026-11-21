@@ -113,6 +113,14 @@ describe("渲染埋点", () => {
     expect(done[0]?.renderer).toBe("")
   })
 
+  it("首选渲染器探测挂起时仍能退到下一枚", async () => {
+    const registry = new RenderRegistry({ logger: fakeLogger(), policy: () => ({ ...POLICY, timeout: 30 }) })
+    const result = { images: [new Uint8Array(1)], cost: 1, renderer: "backup" }
+    registry.register({ ...fakeRenderer(async () => result), available: () => new Promise(() => {}) }, "p1")
+    registry.register({ ...fakeRenderer(async () => result), id: "backup" }, "p2")
+    expect(await registry.render(request())).toEqual(result)
+  })
+
   it("不传 onDone 也能正常渲染（现有调用方无须改动）", async () => {
     const logger = fakeLogger()
     const registry = new RenderRegistry({ logger, policy: () => POLICY })

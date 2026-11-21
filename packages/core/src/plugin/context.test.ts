@@ -12,7 +12,6 @@ import type {
   AdapterProvider,
   ConfigHandle,
   ImageSegment,
-  KvDriver,
   KvNamespace,
   RenderResult,
   RendererProvider
@@ -92,15 +91,19 @@ describe("ctx.command", () => {
     expect(recorded.commands[0]?.patterns).toEqual(["#体力", "#树脂", "#tili"])
   })
 
-  it("只有改了索引键才通知路由重新索引", () => {
+  it("只有改了索引键或排序（别名、优先级）才通知路由重新索引", () => {
     const { ctx, recorded } = setup()
     const cmd = ctx.command("#a")
 
-    cmd.desc("说明").master().cooldown("5s").priority(3)
+    cmd.desc("说明").master().cooldown("5s")
     expect(recorded.reindexed).toHaveLength(0)
 
-    cmd.alias("#b")
+    // 桶在注册时按优先级排好序：不重排的话链式 .priority() 毫无作用
+    cmd.priority(3)
     expect(recorded.reindexed).toHaveLength(1)
+
+    cmd.alias("#b")
+    expect(recorded.reindexed).toHaveLength(2)
   })
 
   it("alias() 传空不产生多余的重新索引", () => {
@@ -413,7 +416,6 @@ describe("回收：卸载必须完整归还全部资源", () => {
     ctx.panel(join(ROOT, "panel-dist"))
     ctx.registerAdapter({ id: "fake-adapter" } as unknown as AdapterProvider)
     ctx.registerRenderer({ id: "fake-renderer" } as unknown as RendererProvider)
-    ctx.registerKvDriver({ id: "fake-kv" } as unknown as KvDriver)
     await ctx.sql()
 
     const failures = registry.dispose()
@@ -426,7 +428,6 @@ describe("回收：卸载必须完整归还全部资源", () => {
     expect(recorded.statics).toEqual([])
     expect(recorded.adapters).toEqual([])
     expect(recorded.renderers).toEqual([])
-    expect(recorded.kvDrivers).toEqual([])
     // SQL 连接的生死由存储层按插件统一管理，卸载时要求它关掉本插件的全部库
     expect(recorded.sqlClosed).toEqual(["demo"])
 

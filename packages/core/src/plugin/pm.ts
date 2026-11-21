@@ -123,41 +123,68 @@ function argsOf(pm: string, task: PmTask): string[] {
  * 编译或下载预编译产物的地方，禁掉会装出一份 `import` 即报错的 `node_modules`，而报错
  * 指向缺少 `.node` 文件，离「我禁了脚本」很远。既然已明说要装，就该装成能用的。
  *
- * 两家都失败时把各自的原因都带上：只报最后一个（npm 的）会让「机器上压根没有 pnpm」
- * 与「pnpm 装到一半失败」看起来一样。
+ * 只有「没装这个包管理器」才换下一个：pnpm 已经跑起来又失败时再让 npm 在同一目录重来，
+ * 耗时翻倍不说，还会在 pnpm 的符号链接布局上叠一份 npm 的扁平布局。Windows 上经 shell
+ * 执行时「命令不存在」与「执行失败」退出码都是 1，故先用 `--version` 探一次。
  * @param task 动作
  * @param cwd 插件目录
  * @param timeout 超时毫秒
  * @returns 实际用的是哪个包管理器
- * @throws 全部候选都不可用或都失败时
+ * @throws 没有可用的包管理器，或选中的那个执行失败时
  */
-export const runPm: PmRunner = async (task, cwd, timeout) => {
-  if (task.kind === "run") assertScriptName(task.script)
-  const errors: string[] = []
-  for (const pm of PACKAGE_MANAGERS) {
-    try {
-      await new Promise<void>((resolve, reject) => {
-        execFile(
-          pm,
-          argsOf(pm, task),
-          {
-            cwd,
-            timeout,
-            env: { ...process.env },
-            windowsHide: true,
-            // 理由见文件头：Windows 上 pnpm/npm 是 .cmd，不经 shell 起不来
-            shell: process.platform === "win32"
-          },
-          (err, _stdout, stderr) => {
-            if (err) reject(new Error(stderr.trim() || err.message))
-            else resolve()
-          }
-        )
-      })
+export const runPm: PmRunner = (task, cwd, timeout) => createPmRunner(exec)(task, cwd, timeout)
+
+/**
+ * 以给定的命令执行器组装 {@link PmRunner}
+ * @param execute 执行一条命令，失败时抛
+ * @returns 依次探测并执行的 runner
+ */
+export function createPmRunner(
+  execute: (cmd: string, args: string[], cwd: string, timeout: number) => Promise<void>
+): PmRunner {
+  return async (task, cwd, timeout) => {
+    if (task.kind === "run") assertScriptName(task.script)
+    for (const pm of PACKAGE_MANAGERS) {
+      if (!(await execute(pm, ["--version"], cwd, PROBE_TIMEOUT_MS).then(() => true, () => false))) continue
+      try {
+        await execute(pm, argsOf(pm, task), cwd, timeout)
+      } catch (err) {
+        throw new Error(`${pm} 执行失败：${err instanceof Error ? err.message : String(err)}`)
+      }
       return pm
-    } catch (err) {
-      errors.push(`${pm}：${err instanceof Error ? err.message : String(err)}`)
     }
+    throw new Error(`没有可用的包管理器（试过 ${PACKAGE_MANAGERS.join("、")}）`)
   }
-  throw new Error(`包管理器均不可用或执行失败 —— ${errors.join("；")}`)
+}
+
+/** 探测包管理器是否可用的超时毫秒 */
+const PROBE_TIMEOUT_MS = 30_000
+
+/**
+ * 执行一次命令
+ * @param cmd 命令
+ * @param args 实参
+ * @param cwd 工作目录
+ * @param timeout 超时毫秒
+ * @throws 退出码非 0 或超时，消息取 stderr
+ */
+function exec(cmd: string, args: string[], cwd: string, timeout: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    execFile(
+      cmd,
+      args,
+      {
+        cwd,
+        timeout,
+        env: { ...process.env },
+        windowsHide: true,
+        // 理由见文件头：Windows 上 pnpm/npm 是 .cmd，不经 shell 起不来
+        shell: process.platform === "win32"
+      },
+      (err, _stdout, stderr) => {
+        if (err) reject(new Error(stderr.trim() || err.message))
+        else resolve()
+      }
+    )
+  })
 }

@@ -4,7 +4,7 @@
  * 生命周期：KV 检视器由 `openKv()` 创建，与驱动同寿；其余为纯函数
  * 注意事项：检视器不经命名空间直接读写驱动，仅供面板 API 使用，不进入 `AppView`，以免破坏插件间的前缀隔离。
  *
- *          memory / json 驱动按插入序扫描，故先收集全部键再排序分页；收集数量设上限，超出时标记截断。
+ *          memory 驱动按插入序扫描，故先收集全部键再排序分页；收集数量设上限，超出时标记截断。
  */
 import type { KvDriver, SqlHandle, SqlParam, StoredEnvelope } from "@yunzai-ng/types"
 import { isExpired } from "./kv.js"
@@ -106,6 +106,8 @@ export interface KvEntryView {
 export interface KvInspector {
   /** 实际生效的驱动 id */
   readonly driver: string
+  /** SQLite 绑定名（better-sqlite3 / node:sqlite）；内存驱动时 undefined */
+  readonly engine?: string
 
   /**
    * 浏览一个前缀
@@ -177,9 +179,10 @@ function itemOf(key: string, env: StoredEnvelope): KvItem {
 /**
  * 创建 KV 检视器
  * @param driver 已打开的驱动
+ * @param engine SQLite 绑定名
  * @returns 检视器
  */
-export function createKvInspector(driver: KvDriver): KvInspector {
+export function createKvInspector(driver: KvDriver, engine?: string): KvInspector {
   const alive = async (key: string): Promise<StoredEnvelope | undefined> => {
     const env = await driver.get(key)
     return env === undefined || isExpired(env) ? undefined : env
@@ -187,6 +190,7 @@ export function createKvInspector(driver: KvDriver): KvInspector {
 
   return {
     driver: driver.id,
+    ...(engine === undefined ? {} : { engine }),
 
     async browse(opts = {}): Promise<KvPage> {
       const prefix = opts.prefix ?? ""

@@ -99,6 +99,8 @@ export interface PluginRuntimeView {
 
 /** 内核内部持有的消息事件：比插件看到的多一个绑定入口 */
 export interface RuntimeMessageEvent extends MessageEvent {
+  /** 本次消息处理期间是否尝试了非空回复。 */
+  readonly replyAttempted: boolean
   /**
    * 绑定当前正在执行的插件
    *
@@ -181,6 +183,8 @@ function noticeTargetOf(n: IncomingNoticeEvent): SendTarget | undefined {
 
 /** 运行时消息事件实现 */
 class MessageEventImpl implements RuntimeMessageEvent {
+  #replyAttempted = false
+  get replyAttempted(): boolean { return this.#replyAttempted }
   /** 事件大类 */
   readonly kind = "message" as const
 
@@ -417,7 +421,8 @@ class MessageEventImpl implements RuntimeMessageEvent {
     const payload: Segment[] =
       opts.at === true && this.isGroup ? [seg.at(this.sender.uid, this.sender.name), ...segments] : segments
 
-    const send: SendOptions = {}
+    this.#replyAttempted = true
+    const send: SendOptions = { replyTo: this.messageId }
     if (opts.quote === true) send.quote = this.messageId
     else if (typeof opts.quote === "string") send.quote = opts.quote
     if (opts.recallAfter !== undefined) send.recallAfter = opts.recallAfter

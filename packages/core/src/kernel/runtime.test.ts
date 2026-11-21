@@ -47,10 +47,13 @@ export default {
   name: "${PLUGIN}",
   version: "0.0.1",
   description: "测试用：注册内存 Mock 适配器并挂几条命令",
+  groupRules: globalThis.__yzngGroupRules !== false,
   setup(ctx) {
     ctx.registerAdapter(globalThis.__yzngMock)
 
     ctx.command("#ping").action(e => e.reply("pong"))
+    ctx.command("#分片").action(e => e.reply("abcdef", { quote: "Q", splitLength: 2 }))
+    ctx.command("#合并").action(e => e.reply("abcdef", { autoForward: true, splitLength: 2 }))
     ctx.command("#谁", { desc: "回显发送者" }).action(e => e.reply("你是 " + e.sender.uid))
     ctx.command("#重启", { master: true }).action(e => e.reply("好的主人"))
     // 故意抛错：验证 command/done 在失败路径同样触发（统计要算成功率）
@@ -137,6 +140,9 @@ async function login(app: App, selfId = "10000"): Promise<string> {
   return record.id
 }
 
+// 每条都起一个真实例；首条还要等整个内核第一次 import，机器忙时会越过缺省的 5 秒
+vi.setConfig({ testTimeout: 20_000 })
+
 afterEach(async () => {
   await current?.stop()
   current = undefined
@@ -159,8 +165,8 @@ describe("installRuntime 装配", () => {
     expect(app.subsystems.adapters).toBe(app.runtime.adapters)
     expect(app.subsystems.bots).toBe(app.runtime.bots)
     expect(app.subsystems.accounts).toBe(app.runtime.accounts)
-    // registries 是新造的闭包，只能验行为：夹具插件注册了 6 条命令
-    expect(app.subsystems.registries.commands()).toHaveLength(6)
+    // registries 是新造的闭包，只能验行为：夹具插件注册了 8 条命令
+    expect(app.subsystems.registries.commands()).toHaveLength(8)
 
     // AppView 是活的：装配期填的子系统立刻能从插件那一侧看到
     expect(app.view.adapters.list().map(a => a.id)).toEqual(["mock"])
@@ -371,6 +377,49 @@ describe("适配器生命周期", () => {
     expect(mock.driver.disconnects).toBe(1)
   })
 
+  it("回复分片复用原消息 id，仅第一片显示引用；自动转发也保留回复锚点", async () => {
+    const { app, mock } = await boot()
+    await login(app)
+    const a = mock.driver.receivePrivate("#分片")
+    await mock.waitForSend(3)
+    expect(mock.sent.map(s => s.opts)).toEqual([{ replyTo: a.messageId, quote: "Q" }, { replyTo: a.messageId }, { replyTo: a.messageId }])
+    const b = mock.driver.receivePrivate("#合并")
+    await mock.waitForSend(4)
+    expect(mock.sent[3]?.opts).toEqual({ replyTo: b.messageId })
+    expect(mock.sent[3]?.nodes).toHaveLength(3)
+  })
+
+  it("不可恢复的下线清理驱动并保留错误，手动重连仍可用", async () => {
+    const { app, mock } = await boot(`adapter:
+  reconnectInterval: 60ms
+`)
+    const id = await login(app)
+    mock.driver.goOffline("机器人已下架", false)
+    await vi.waitFor(() => expect(app.runtime.accounts.get(id)?.status).toBe("error"))
+    expect(app.runtime.bots.total).toBe(0)
+    expect(app.runtime.accounts.get(id)?.error).toBe("机器人已下架")
+    await new Promise(r => setTimeout(r, 200))
+    expect(mock.drivers).toHaveLength(1)
+    await app.runtime.accounts.reconnect(id)
+    expect(app.runtime.accounts.get(id)?.status).toBe("online")
+  })
+
+  it("重连后旧驱动迟到的下线上报不影响新连接", async () => {
+    const { app, mock } = await boot()
+    const id = await login(app)
+    const stale = mock.driver
+
+    await app.runtime.accounts.reconnect(id)
+    await vi.waitFor(() => expect(mock.drivers).toHaveLength(2))
+    await vi.waitFor(() => expect(app.runtime.accounts.get(id)?.status).toBe("online"))
+
+    stale.goOffline("旧 socket 晚到的 close")
+    await new Promise(r => setTimeout(r, 50))
+    expect(app.runtime.accounts.get(id)?.status).toBe("online")
+    expect(app.view.bots.size).toBe(1)
+    expect(mock.drivers[1]!.disconnects).toBe(0)
+  })
+
   it("连接失败的账号不进 Bot 注册表，状态是 error", async () => {
     const { app, mock } = await boot("", { failConnect: "Mock 就是不让连" })
 
@@ -385,6 +434,22 @@ describe("适配器生命周期", () => {
     expect(mock.driver.disconnects).toBe(1)
   })
 
+  // 早先 connecting 期间报的下线只改了个字段，随即被 online 盖掉：显示在线、却再不重连
+  it("connect() 返回前就报了下线：不显示在线，照常排重连", async () => {
+    const { app, mock } = await boot("adapter:\n  reconnectInterval: 60ms\n", { dropDuringConnect: true })
+    const record = await app.runtime.accounts.create("mock", { selfId: "10000" })
+    // 每次重连新建一个驱动
+    await vi.waitFor(() => expect(mock.drivers.length).toBeGreaterThan(1), { timeout: 5000, interval: 50 })
+    expect(app.runtime.accounts.get(record.id)?.status).not.toBe("online")
+  })
+  it("适配器判定重连无用（retryable: false）时不排重连，停在 error", async () => {
+    const { app, mock } = await boot("adapter:\n  reconnectInterval: 60ms\n", { failConnect: "机器人已封禁", failRetryable: false })
+    const record = await app.runtime.accounts.create("mock", { selfId: "10000" })
+    await new Promise(r => setTimeout(r, 400))
+    expect(mock.driver.connects).toBe(1)
+    expect(app.runtime.accounts.get(record.id)?.status).toBe("error")
+    expect(app.loggerHub.tail({ level: "warn" }).some(r => r.msg.includes("不再自动重连"))).toBe(true)
+  })
   it("重连次数达到上限后停止自动重连，并把原因说清", async () => {
     // 上限取 1：第一次失败排一次重试，那一次再失败即超限
     // 间隔显式压到 60ms —— 不写就吃缺省的 5 秒，这条用例便押在「5 秒带抖动仍小于超时」上，
@@ -594,6 +659,93 @@ describe("适配器生命周期", () => {
   })
 })
 
+describe("群规则", () => {
+  /**
+   * 发一串消息，再补一条私聊 `#ping`，等够预期条数后返回全部回复（已排序）
+   *
+   * 末尾那条恒能回复；等够之后再让一拍，被拦下的那几条若漏了出来，会让条数多于预期。
+   * @param mock Mock 适配器
+   * @param send 发消息
+   * @param expected 预期回复条数，含末尾的 pong
+   * @returns 回复文本，排过序
+   */
+  const repliesOf = async (mock: MockAdapter, send: () => void, expected: number): Promise<string[]> => {
+    send()
+    mock.driver.receivePrivate("#ping")
+    await mock.waitForSend(expected)
+    await new Promise(resolve => setTimeout(resolve, 50))
+    return [...mock.texts].sort()
+  }
+
+  it("全局前缀：群里不带前缀不理，带了照常；私聊不受影响", async () => {
+    const { app, mock } = await boot("scope:\n  prefix: [小云, 阿云]\n")
+    await login(app)
+    const texts = await repliesOf(mock, () => {
+      mock.driver.receiveGroup("#谁", { gid: "800001", uid: "20001" })
+      mock.driver.receiveGroup("小云 #谁", { gid: "800001", uid: "20002" })
+      mock.driver.receiveGroup("阿云#谁", { gid: "800001", uid: "20009" })
+    }, 3)
+    expect(texts).toEqual(["pong", "你是 20002", "你是 20009"].sort())
+  })
+
+  it("群前缀与机器人昵称是同一个词时照常响应", async () => {
+    const { app, mock } = await boot("bot:\n  nickname: [小云]\nscope:\n  prefix: 小云\n")
+    await login(app)
+    const texts = await repliesOf(mock, () => {
+      mock.driver.receiveGroup("小云#谁", { gid: "800001", uid: "20012" })
+      mock.driver.receiveGroup("#谁", { gid: "800001", uid: "20013" })
+    }, 2)
+    expect(texts).toEqual(["pong", "你是 20012"].sort())
+  })
+
+  it("群规则优先：本群不要前缀时直接发 #命令", async () => {
+    const yaml =
+      "scope:\n  prefix: 小云\n  rules:\n    - account: '*'\n      groups: ['800002']\n      prefixMode: none\n"
+    const { app, mock } = await boot(yaml)
+    await login(app)
+    const texts = await repliesOf(mock, () => {
+      mock.driver.receiveGroup("#谁", { gid: "800002", uid: "20003" })
+      mock.driver.receiveGroup("#谁", { gid: "800001", uid: "20004" })
+    }, 2)
+    expect(texts).toEqual(["pong", "你是 20003"].sort())
+  })
+
+  it("全局禁用单条命令；某个群套用「放开」套餐后照常响应", async () => {
+    const yaml =
+      "scope:\n  disabled:\n    - 'mock-adapter:#谁'\n  presets:\n    - name: 放开\n      ownDisabled: true\n      disabled: []\n  rules:\n" +
+      "    - account: '10000'\n      groups: ['800003']\n      preset: 放开\n"
+    const { app, mock } = await boot(yaml)
+    await login(app)
+    const texts = await repliesOf(mock, () => {
+      mock.driver.receiveGroup("#谁", { gid: "800001", uid: "20005" })
+      mock.driver.receiveGroup("#谁", { gid: "800003", uid: "20006" })
+      mock.driver.receivePrivate("#谁", { uid: "20007" })
+    }, 3)
+    expect(texts).toEqual(["pong", "你是 20006", "你是 20007"].sort())
+  })
+
+  it("适配器插件没声明 groupRules 时，它的机器人在群里不受群配置约束", async () => {
+    ;(globalThis as Record<string, unknown>).__yzngGroupRules = false
+    try {
+      const { app, mock } = await boot("scope:\n  prefix: 小云\n  disabled: ['mock-adapter:#谁']\n")
+      await login(app)
+      const texts = await repliesOf(mock, () => mock.driver.receiveGroup("#谁", { gid: "800001", uid: "20011" }), 2)
+      expect(texts).toEqual(["pong", "你是 20011"].sort())
+    } finally {
+      delete (globalThis as Record<string, unknown>).__yzngGroupRules
+    }
+  })
+
+  it("指名账号的「全部群」规则只管那个号", async () => {
+    const yaml =
+      "scope:\n  rules:\n    - account: '99999'\n      ownDisabled: true\n      disabled: [mock-adapter]\n"
+    const { app, mock } = await boot(yaml)
+    await login(app)
+    const texts = await repliesOf(mock, () => mock.driver.receiveGroup("#谁", { gid: "800004", uid: "20008" }), 2)
+    expect(texts).toEqual(["pong", "你是 20008"].sort())
+  })
+})
+
 /*
  * 埋点与统计事件
  *
@@ -606,15 +758,30 @@ describe("埋点与统计事件", () => {
     const { app, mock } = await boot()
     await login(app, "10086")
 
-    mock.driver.receivePrivate("#ping", { uid: "20007" })
+    mock.driver.receivePrivate("#ping 正文样本不应进入日志", { uid: "20007" })
     await mock.waitForSend()
 
-    const line = app.loggerHub.tail().find(r => r.msg.includes("20007"))
+    await vi.waitFor(() => expect(app.loggerHub.tail().some(r => r.msg.includes("20007") && r.msg.includes("收到消息"))).toBe(true))
+    const line = app.loggerHub.tail().find(r => r.msg.includes("20007") && r.msg.includes("收到消息"))
     expect(line).toBeDefined()
     // 同一进程可同时挂多个平台的多个号，缺了这一段就答不出「这条是哪个号收到的」
     expect(line?.msg).toContain("[mock:10086]")
     expect(line?.msg).toContain("[私聊]")
     expect(line?.level).toBe("info")
+    expect(app.loggerHub.tail().some(r => r.msg.includes("正文样本不应进入日志"))).toBe(false)
+  })
+
+  it("仅旁听的普通消息进 mark；监听器就地回复仍进 info", async () => {
+    const { app, mock } = await boot()
+    await login(app)
+    app.events.on("message", async e => { if (e.sender.uid === "20012") await e.reply("已接收") })
+    mock.driver.receivePrivate("普通文本", { uid: "20011" })
+    mock.driver.receivePrivate("普通文本", { uid: "20012" })
+    await vi.waitFor(() => {
+      const lines = app.loggerHub.tail({ level: "mark" }).filter(r => r.msg.includes("收到消息"))
+      expect(lines.find(r => r.msg.includes("20011"))?.level).toBe("mark")
+      expect(lines.find(r => r.msg.includes("20012"))?.level).toBe("info")
+    })
   })
 
   it("命令命中与处理完毕都记在 info 级 —— 默认级别下看得见", async () => {

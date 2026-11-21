@@ -1,7 +1,7 @@
 /**
  * 模块职责：包管理器动作的 script 名白名单与实参译法测试
  * 依赖方向：测试文件，依赖 plugin/pm
- * 生命周期：无状态，无临时目录
+ * 生命周期：无状态，无临时目录；runner 的选择逻辑经 `createPmRunner` 注入假执行器来测
  * 注意事项：**这里钉的是一道安全边界。** `runPm` 在 Windows 上必须带 shell 执行（pnpm/npm
  *          是 `.cmd`，node 在 CVE-2024-27980 之后拒绝不经 shell 起它们），而带了 shell
  *          之后参数就是被解释的字符串 —— 索引里一个 `build && curl … | sh` 就是任意命令
@@ -11,7 +11,50 @@
  *          pnpm 自己而非本模块。本模块要负责的只有「下发了什么」。
  */
 import { describe, expect, it } from "vitest"
-import { INSTALL_TIMEOUT_MS, PACKAGE_MANAGERS, SCRIPT_TIMEOUT_MS, assertScriptName, isScriptName } from "./pm.js"
+import {
+  INSTALL_TIMEOUT_MS,
+  PACKAGE_MANAGERS,
+  SCRIPT_TIMEOUT_MS,
+  assertScriptName,
+  createPmRunner,
+  isScriptName
+} from "./pm.js"
+
+describe("createPmRunner", () => {
+  /**
+   * 造一个记录调用的执行器
+   * @param installed 视为已装的包管理器
+   * @param failing 执行正式命令时失败的包管理器
+   */
+  function fakeExec(installed: string[], failing: string[] = []) {
+    const calls: string[] = []
+    const execute = async (cmd: string, args: string[]): Promise<void> => {
+      calls.push(`${cmd} ${args.join(" ")}`)
+      if (!installed.includes(cmd)) throw new Error("不是内部或外部命令")
+      if (args[0] !== "--version" && failing.includes(cmd)) throw new Error("ERR_PNPM_FETCH_404")
+    }
+    return { calls, execute }
+  }
+
+  it("pnpm 已装但执行失败时直接报错，不在同一目录再跑一遍 npm", async () => {
+    const { calls, execute } = fakeExec(["pnpm", "npm"], ["pnpm"])
+    await expect(createPmRunner(execute)({ kind: "install", dev: false }, "/p", 1000)).rejects.toThrow(
+      "pnpm 执行失败：ERR_PNPM_FETCH_404"
+    )
+    expect(calls).toEqual(["pnpm --version", "pnpm install --prod"])
+  })
+
+  it("没装 pnpm 时用 npm", async () => {
+    const { calls, execute } = fakeExec(["npm"])
+    await expect(createPmRunner(execute)({ kind: "run", script: "build" }, "/p", 1000)).resolves.toBe("npm")
+    expect(calls).toEqual(["pnpm --version", "npm --version", "npm run build"])
+  })
+
+  it("一个都没装时说清试过哪些", async () => {
+    const { execute } = fakeExec([])
+    await expect(createPmRunner(execute)({ kind: "install", dev: true }, "/p", 1000)).rejects.toThrow("试过 pnpm、npm")
+  })
+})
 
 describe("isScriptName", () => {
   it("接受常规 script 名，含冒号分段", () => {

@@ -13,6 +13,7 @@
  *          （不认识 core），若在顶部静态 import 任何一个 import 了 core 的命令，父进程就会
  *          连带把整个内核加载进来 —— 那正是自带守护要省掉的一份常驻内存。
  */
+import { resolve } from "node:path"
 import { createRequire } from "node:module"
 import type { LogLevel } from "@yunzai-ng/types"
 import { flagBoolean, flagString, parseArgs, type ParsedArgs } from "./args.js"
@@ -49,6 +50,7 @@ function pluginDirs(args: ParsedArgs): string[] | undefined {
     .split(",")
     .map(s => s.trim())
     .filter(s => s !== "")
+    .map(dir => resolve(dir))
   return dirs.length > 0 ? dirs : undefined
 }
 
@@ -136,6 +138,17 @@ export async function run(argv: readonly string[]): Promise<number> {
         to: flagString(args, "to"),
         prune: flagBoolean(args, "prune", true)
       })
+    }
+
+    case "data": {
+      const sub = args.positional[0] ?? ""
+      const target = args.positional[1] ?? ""
+      if ((sub !== "export" && sub !== "import") || target === "") {
+        printErr(red("用法：yzng data export <输出目录>  ·  yzng data import <导出目录> [--force]"))
+        return 1
+      }
+      const { runData } = await import("./commands/data.js")
+      return runData({ sub, target, home, force: flagBoolean(args, "force"), version })
     }
 
     case "plugin": {

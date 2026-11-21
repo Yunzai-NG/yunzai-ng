@@ -184,11 +184,11 @@ export function createBotFacade(opts: BotFacadeOptions): BotFacade {
    * 发出一条（已切分好的）消息
    * @param target 发送目标
    * @param chunk 消息段
-   * @param quote 引用的消息 id
+   * @param opts 仅下传回复锚点与引用样式
    * @returns 发送结果
    */
-  const sendChunk = async (target: SendTarget, chunk: Segment[], quote: string | undefined): Promise<SendResult> => {
-    const pending = quote === undefined ? driver.sendMessage(target, chunk) : driver.sendMessage(target, chunk, { quote })
+  const sendChunk = async (target: SendTarget, chunk: Segment[], opts: SendOptions | undefined): Promise<SendResult> => {
+    const pending = opts === undefined ? driver.sendMessage(target, chunk) : driver.sendMessage(target, chunk, opts)
     return await withTimeout(pending, policy.sendTimeout, `向${describeTarget(target)}发送消息超时`)
   }
 
@@ -216,6 +216,9 @@ export function createBotFacade(opts: BotFacadeOptions): BotFacade {
     ensureAlive()
 
     const chunks = splitMessage(segments, opts?.splitLength ?? policy.splitLength)
+    const replyTo = opts?.replyTo ?? opts?.quote
+    const anchor = replyTo === undefined ? undefined : { replyTo }
+    const firstOpts = opts?.quote === undefined ? anchor : { ...anchor, quote: opts.quote }
     const recallAfter = opts?.recallAfter ?? 0
     const results: SendResult[] = []
 
@@ -224,7 +227,7 @@ export function createBotFacade(opts: BotFacadeOptions): BotFacade {
     if (chunks.length > 1 && opts?.autoForward === true) {
       if (forward !== undefined && driver.caps.has("forward")) {
         const result = await withTimeout(
-          forward.call(driver, target, forwardNodes(chunks)),
+          forward.call(driver, target, forwardNodes(chunks), firstOpts),
           policy.sendTimeout,
           `向${describeTarget(target)}发送合并转发超时`
         )
@@ -237,7 +240,7 @@ export function createBotFacade(opts: BotFacadeOptions): BotFacade {
     for (const [i, chunk] of chunks.entries()) {
       // 只有第一条带引用：每条都引用会让整屏都是回复箭头，
       // 而用户想看到的是"这一串是对那条消息的回答"
-      results.push(await sendChunk(target, chunk, i === 0 ? opts?.quote : undefined))
+      results.push(await sendChunk(target, chunk, i === 0 ? firstOpts : anchor))
     }
     if (recallAfter > 0) for (const r of results) scheduleRecall(r.messageId, recallAfter)
 

@@ -9,11 +9,18 @@
  *          不存在"改了校验忘了改表单"的可能。
  */
 import type { DeepReadonly } from "@yunzai-ng/types"
+import { parseDuration } from "../util/duration.js"
 import { s, type Infer } from "./schema.js"
 import type { ConfigFile, ConfigStore } from "./store.js"
 
 /** 内核配置名（对应 `config/yunzai.yaml`） */
 export const CORE_CONFIG_NAME = "yunzai"
+
+/** 用于发送和重连定时器；零不是这些字段的关闭开关。 */
+const positiveDuration = () => s.duration().check("时长须在 1 到 2147483647 毫秒之间", value => {
+  const ms = parseDuration(value, 0)
+  return ms >= 1 && ms <= 2147483647
+})
 
 /**
  * 内核配置 schema
@@ -57,9 +64,10 @@ export const coreConfigSchema = s.object({
   log: s
     .object({
       level: s
-        .enum(["trace", "debug", "info", "warn", "error", "fatal", "silent"], {
+        .enum(["trace", "debug", "mark", "info", "warn", "error", "fatal", "silent"], {
           trace: "全部",
           debug: "调试",
+          mark: "日常标记",
           info: "常规",
           warn: "警告",
           error: "错误",
@@ -70,12 +78,12 @@ export const coreConfigSchema = s.object({
         .title("日志级别")
         .desc("控制台显示什么、面板的日志页缺省看什么。日志文件不受它影响，一律记全量。"),
       consoleLevel: s
-        .enum(["trace", "debug", "info", "warn", "error", "fatal", "silent"])
+        .enum(["trace", "debug", "mark", "info", "warn", "error", "fatal", "silent"])
         .optional()
         .title("控制台级别")
         .desc("留空则跟随日志级别。"),
       fileLevel: s
-        .enum(["trace", "debug", "info", "warn", "error", "fatal", "silent"])
+        .enum(["trace", "debug", "mark", "info", "warn", "error", "fatal", "silent"])
         .optional()
         .title("文件级别")
         .desc(
@@ -101,14 +109,16 @@ export const coreConfigSchema = s.object({
     .object({
       driver: s
         .select([
-          { value: "auto", label: "自动", description: "优先内嵌 level，装不上时退回 JSON 文件" },
-          { value: "level", label: "内嵌 LevelDB", description: "默认；性能好，需原生模块" },
-          { value: "json", label: "JSON 文件", description: "纯 JS，Termux 上最稳" },
+          { value: "sqlite", label: "SQLite", description: "默认；一个 kv.db 文件，电脑与安卓通用" },
           { value: "memory", label: "仅内存", description: "重启即丢，仅测试用" }
         ])
-        .default("auto")
+        .aliases({ auto: "sqlite", level: "sqlite", json: "sqlite" })
+        .default("sqlite")
         .title("键值存储驱动")
-        .desc("缺省自带内嵌存储，无须另装任何服务；Redis 由 store-redis 插件提供，属可选。"),
+        .desc(
+          "数据存在存储目录的 kv.db 里，无须另装任何服务，换机器直接拷。旧版的 LevelDB（kv/）与 JSON（kv.json）" +
+            "数据在首次启动时自动迁入，原件改名保留。存储只由内核负责，插件不能接管。"
+        ),
       dir: s
         .dir()
         .optional()
@@ -117,8 +127,8 @@ export const coreConfigSchema = s.object({
       sqlite: s
         .boolean()
         .default(true)
-        .title("启用 SQLite")
-        .desc("关系型数据（抽卡记录、面板缓存）用 better-sqlite3；原生模块不可用时自动降级为纯 KV。")
+        .title("插件 SQL 库")
+        .desc("给插件建表用的关系库（抽卡记录、面板缓存），需要 better-sqlite3；它装不上时，用到 SQL 的插件拿到一条错误说明，只用 KV 的插件不受影响。")
     })
     .title("存储")
     .group("存储")
@@ -165,6 +175,14 @@ export const coreConfigSchema = s.object({
         .default([])
         .title("禁用的插件")
         .desc("按插件名精确匹配。禁用后完全不加载，不占内存。"),
+      watchScripts: s
+        .boolean()
+        .default(true)
+        .title("单文件插件热加载")
+        .desc(
+          "盯住插件目录里的单文件 js（如 plugins/example/ 下的）：放进来即加载，拿走即卸载，改了即重载，不用重启。" +
+            "目录插件不在此列，它们要编译、装依赖，改完在插件页重载。改本项后需重启生效。"
+        ),
       hotReload: s
         .boolean()
         .default(false)
@@ -224,7 +242,7 @@ export const coreConfigSchema = s.object({
         .default(3000)
         .title("长文本切分长度")
         .desc("超长文本按此长度切分发送，切分点优先取换行与空白处。"),
-      sendTimeout: s.duration().default("30s").title("发送超时"),
+      sendTimeout: positiveDuration().default("30s").title("发送超时"),
       sequential: s
         .boolean()
         .default(true)
@@ -248,6 +266,75 @@ export const coreConfigSchema = s.object({
     .group("消息")
     .order(60),
 
+  scope: s
+    .object({
+      prefix: s
+        .tags()
+        .default([])
+        .title("全局群前缀")
+        .desc(
+          "填了之后，群里的命令要先带上其中一个才响应：前缀填「小云」时发「小云#帮助」才算，直接发「#帮助」不理。" +
+            "可以填几个，带上任意一个都算。留空表示不要前缀。私聊不受影响。"
+        ),
+      disabled: s
+        .tags()
+        .default([])
+        .title("全局禁用")
+        .desc("在所有群里都不响应的插件或命令：写插件名禁掉整个插件，写「插件名:命令名」只禁那一条。私聊不受影响。"),
+      presets: s
+        .array(
+          s.object({
+            name: s.string().default("").title("名字"),
+            prefixMode: s
+              .select([
+                { value: "inherit", label: "沿用全局" },
+                { value: "custom", label: "单独设" },
+                { value: "none", label: "不要前缀" }
+              ])
+              .default("inherit")
+              .title("前缀"),
+            prefix: s.tags().default([]).title("前缀").showWhen({ prefixMode: ["custom"] }),
+            ownDisabled: s.boolean().default(false).title("单独设禁用"),
+            disabled: s.tags().default([]).title("禁用").showWhen({ ownDisabled: [true] })
+          })
+        )
+        .default([])
+        .title("规则组")
+        .desc("起好名字的一套前缀与禁用，群配置里选它即整套套用；改规则组，用了它的群一并跟着变。"),
+      rules: s
+        .array(
+          s.object({
+            account: s
+              .string()
+              .default("*")
+              .title("机器人账号")
+              .desc("机器人的 QQ 号（或其他平台的账号 id）；* 表示所有机器人。"),
+            groups: s.tags().default([]).title("群号").desc("留空表示这个账号的全部群。"),
+            preset: s.string().default("").title("套用").desc("填规则组的名字即整套套用，下面几项不再看；留空用下面几项。"),
+            prefixMode: s
+              .select([
+                { value: "inherit", label: "沿用全局" },
+                { value: "custom", label: "单独设" },
+                { value: "none", label: "不要前缀" }
+              ])
+              .default("inherit")
+              .title("前缀"),
+            prefix: s.tags().default([]).title("前缀").showWhen({ prefixMode: ["custom"] }),
+            ownDisabled: s.boolean().default(false).title("单独设禁用").desc("打开后只认下面这份，全局禁用不再生效。"),
+            disabled: s.tags().default([]).title("禁用").showWhen({ ownDisabled: [true] })
+          })
+        )
+        .default([])
+        .title("群配置")
+        .desc(
+          "优先于全局。一个群同时落进几条规则时：写了群号的优先于「全部群」，指名账号的优先于 *，同一档里靠后的那条优先。"
+        )
+    })
+    // 0.7.1 开发期的旧写法，一条规则只管一个群
+    .deprecated("groups")
+    .title("群配置")
+    .group("消息")
+    .order(65),
   render: s
     .object({
       default: s
@@ -294,13 +381,11 @@ export const coreConfigSchema = s.object({
             "而无休止的重试会让日志里真正要看的东西被刷走。" +
             "这四项都可以在账号上单独覆盖，账号没填的项才用这里的值。"
         ),
-      reconnectInterval: s
-        .duration()
+      reconnectInterval: positiveDuration()
         .default("5s")
         .title("首次重连间隔")
         .desc("第一次失败之后等多久再试。此后每失败一次乘上「退避倍率」，直到「重连间隔上限」。"),
-      reconnectMaxInterval: s
-        .duration()
+      reconnectMaxInterval: positiveDuration()
         .default("1m")
         .title("重连间隔上限")
         .desc(

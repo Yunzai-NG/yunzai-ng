@@ -12,12 +12,13 @@
  */
 import { inspect } from "node:util"
 import type { LogLevel } from "@yunzai-ng/types"
-import { padVisualEnd, visualWidth } from "../util/text.js"
+import { padVisualEnd, stripAnsi, visualWidth } from "../util/text.js"
 
 /** 数字级别 → 级别名（与 pino 同一套数值，旧日志文件照样读得懂） */
 const LEVEL_NAMES: Record<number, LogLevel> = {
   10: "trace",
   20: "debug",
+  25: "mark",
   30: "info",
   40: "warn",
   50: "error",
@@ -28,6 +29,7 @@ const LEVEL_NAMES: Record<number, LogLevel> = {
 export const LEVEL_VALUES: Record<Exclude<LogLevel, "silent">, number> = {
   trace: 10,
   debug: 20,
+  mark: 25,
   info: 30,
   warn: 40,
   error: 50,
@@ -38,6 +40,7 @@ export const LEVEL_VALUES: Record<Exclude<LogLevel, "silent">, number> = {
 const LEVEL_LABELS: Record<LogLevel, string> = {
   trace: "TRACE",
   debug: "DEBUG",
+  mark: "MARK ",
   info: "INFO ",
   warn: "WARN ",
   error: "ERROR",
@@ -49,6 +52,7 @@ const LEVEL_LABELS: Record<LogLevel, string> = {
 const LEVEL_COLORS: Record<LogLevel, string> = {
   trace: "90", // 亮黑（灰）
   debug: "36", // 青
+  mark: "90",
   info: "32", // 绿
   warn: "33", // 黄
   error: "31", // 红
@@ -238,14 +242,21 @@ export function formatRecord(rec: LogRecord, opts: FormatOptions): string {
   const time = paint("90", formatTime(rec.time), color)
   const level = paint(levelColor, LEVEL_LABELS[rec.level], color)
 
-  let scope = ""
-  if (rec.scope) {
-    const width = opts.scopeWidth ?? 14
-    // 作用域超宽时不截断（宁可错行也不让用户看不出是哪个插件），
-    // 只在未超宽时补齐
-    const label = width > 0 && visualWidth(rec.scope) < width ? padVisualEnd(rec.scope, width) : rec.scope
-    scope = ` ${paint("36", label, color)}`
+  const width = opts.scopeWidth ?? 14
+  const fullScope = rec.scope ?? ""
+  let label = fullScope
+  if (width > 0 && visualWidth(label) > width) {
+    label = ""
+    let used = 0
+    for (const ch of stripAnsi(fullScope)) {
+      const n = visualWidth(ch)
+      if (used + n > width - 1) break
+      used += n
+      label += ch
+    }
+    label += "…"
   }
+  const scope = width > 0 || label ? ` ${paint("36", width > 0 ? padVisualEnd(label, width) : label, color)}` : ""
 
   let extra = ""
   if (rec.fields) {
@@ -256,7 +267,9 @@ export function formatRecord(rec: LogRecord, opts: FormatOptions): string {
     if (parts.length > 0) extra = ` ${parts.join(" ")}`
   }
 
-  let out = `${time} ${level}${scope} ${rec.msg}${extra}\n`
+  if (label !== fullScope) extra += ` scope=${JSON.stringify(fullScope)}`
+
+  let out = `${time} ${level}${scope} ${rec.level === "mark" ? paint("90", rec.msg, color) : rec.msg}${extra}\n`
 
   if (rec.stack && opts.stack !== false) {
     out += `${paint("90", indent(rec.stack), color)}\n`

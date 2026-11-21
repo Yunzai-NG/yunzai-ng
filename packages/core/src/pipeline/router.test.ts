@@ -228,6 +228,42 @@ describe("首字符分桶", () => {
     expect(hits(router, "abc 小写")).toEqual(["p"])
   })
 
+  it("顶层有 | 的正则不分桶：每一支都命中得了", () => {
+    const { router } = make()
+    router.register(reg(/^#抽卡|^\*抽卡/))
+    router.register(reg(/^#帮助|菜单$/, {}, "help"))
+
+    expect(hits(router, "*抽卡")).toEqual(["p"])
+    expect(hits(router, "#抽卡")).toEqual(["p"])
+    expect(hits(router, "我的菜单")).toEqual(["help"])
+  })
+
+  it("括号里的 | 不算顶层，照常分桶", () => {
+    const { router } = make()
+    const re = /^#(体力|树脂)/
+    const spy = vi.spyOn(re, "exec")
+    router.register(reg(re))
+
+    expect(router.match(msg("!别的"))).toEqual([])
+    expect(spy).not.toHaveBeenCalled()
+    expect(hits(router, "#树脂")).toEqual(["p"])
+  })
+
+  it("以 emoji 开头的正则照样命中，带不带 u 都一样", () => {
+    const { router } = make()
+    router.register(reg(/^🎲(\d+)$/))
+    router.register(reg(/^🎲(\d+)$/u, {}, "u"))
+
+    expect(hits(router, "🎲6")).toEqual(["p", "u"])
+  })
+
+  it("带 i 标志且首字符有大小写的非 ASCII 字母也不分桶", () => {
+    const { router } = make()
+    router.register(reg(/^é/i))
+
+    expect(hits(router, "É")).toEqual(["p"])
+  })
+
   it("同一条命令的多个别名落在同一个桶里也只命中一次", () => {
     const { router } = make()
     router.register(reg(["#a", "#ab"]))
@@ -254,6 +290,18 @@ describe("优先级与顺序", () => {
     router.register(reg("#a", {}, "后注册"))
 
     expect(hits(router, "#a")).toEqual(["更优先", "先注册", "后注册"])
+  })
+
+  it("注册之后改优先级再 reindex，桶内顺序跟着变", () => {
+    const { router } = make()
+    router.register(reg("#树脂", {}, "短"))
+    const long = reg("#树脂上限", {}, "长")
+    router.register(long)
+    expect(hits(router, "#树脂上限")).toEqual(["短", "长"])
+
+    long.options.priority = 50
+    router.reindex(long)
+    expect(hits(router, "#树脂上限")).toEqual(["长", "短"])
   })
 
   it("桶内与不分桶的候选按同一套优先级归并", () => {

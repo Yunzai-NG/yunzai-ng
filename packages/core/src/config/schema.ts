@@ -122,6 +122,9 @@ interface SchemaDef {
   strict?: boolean
   /** 曾经存在、现已移除的键；命中时静默丢弃而不告警 */
   deprecatedKeys?: string[]
+  /** 枚举的旧值到现值的映射；命中时静默换成现值 */
+  enumAliases?: Record<string, string | number | boolean>
+
   /** record 的值 schema */
    
   valueSchema?: Schema<any>
@@ -346,6 +349,18 @@ export class Schema<T> {
    */
   deprecated(...keys: string[]): Schema<T> {
     return this.#patch({ deprecatedKeys: [...(this.#def.deprecatedKeys ?? []), ...keys] })
+  }
+
+  /**
+   * 枚举：声明已改名或已合并的旧取值
+   *
+   * 旧配置文件里还写着旧值；拒收会让整份配置校验失败、沿用缺省值，比一个过时的取值严重得多。
+   * 理由同 `deprecated`：静默换成现值，下次写盘时文件自然更新。
+   * @param map 旧值 → 现值
+   * @returns 新 schema
+   */
+  aliases(map: Record<string, T>): Schema<T> {
+    return this.#patch({ enumAliases: { ...(this.#def.enumAliases ?? {}), ...(map as Record<string, string | number | boolean>) } })
   }
 
   /**
@@ -698,6 +713,8 @@ export class Schema<T> {
    */
   #validateEnum(input: unknown, path: string, issues: SchemaIssue[]): unknown {
     const items = this.#def.enumItems ?? []
+    const aliases = this.#def.enumAliases
+    if (aliases !== undefined && Object.hasOwn(aliases, String(input))) return aliases[String(input)]
     for (const item of items) {
       if (item.value === input) return input
       // WebUI 的 select 只会回传字符串，数字枚举需要按文本比一次

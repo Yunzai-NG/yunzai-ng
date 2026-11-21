@@ -18,7 +18,6 @@ export * from "./kernel/app.js"
 export * from "./kernel/runtime.js"
 export * from "./kernel/policy.js"
 export * from "./kernel/sql-sink.js"
-export * from "./kernel/kv-sink.js"
 
 /* ────────────────────────────── 插件体系 ────────────────────────────── */
 export * from "./plugin/define.js"
@@ -75,8 +74,10 @@ export * from "./store/inspect.js"
 export * from "./store/kv.js"
 export * from "./store/sql.js"
 export * from "./store/memory.js"
-export * from "./store/json.js"
-export * from "./store/level.js"
+export * from "./store/sqlite-kv.js"
+export * from "./store/sqlite-binding.js"
+export * from "./store/migrate.js"
+export { findLegacy, withLegacyLevelLock, stampOf, LEGACY_JSON_FILE, LEGACY_LEVEL_DIR, type LegacyKind, type LegacySource } from "./store/legacy.js"
 
 /* ────────────────────────────── 网络 ────────────────────────────── */
 export * from "./http/client.js"

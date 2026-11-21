@@ -566,18 +566,26 @@ export class AccountManager implements AccountsView {
     // 提到 try 外面：`rt.driver` 要等连上之后才赋值，而 `connect()` 抛错恰恰是
     // 最常见的失败路径，那时只有这个引用能把半成品驱动交给 #teardown 关掉
     let driver: BotDriver | undefined
+    /** 置 online 之前驱动就报了下线时的原因 */
+    let attached = false
+    let droppedEarly: { reason: string; retryable: boolean } | undefined
     try {
       handle = this.#createHost({
         record,
         controller,
         registry,
         setStatus: (status, detail) => {
+          // 已被收掉的旧驱动迟到的上报，不能拿去改新连接的状态，更不能把它踢下线
+          if (controller.signal.aborted || rt.controller !== controller) return
           // 适配器自报状态（如"正在扫码"）。它报 offline 时走完整的下线流程
           // 而不是仅修改一个字段：socket 已不存在，Bot 注册表中的对应条目也必须摘除。
-          if (status === "offline" && rt.status === "online") {
-            void this.#onDriverOffline(rt, detail?.error ?? "适配器报告已下线")
+          if (status === "offline" && attached) {
+            void this.#onDriverOffline(rt, detail?.error ?? "适配器报告已下线", detail?.retryable)
             return
           }
+          // connect() 返回之前就报了下线：先记下，等置 online 那一刻再走下线流程，
+          // 否则这次下线只改了个字段，随即被 online 盖掉，账号显示在线却不会再重连
+          if (status === "offline") droppedEarly = { reason: detail?.error ?? "适配器报告已下线", retryable: detail?.retryable !== false }
           this.#setStatus(rt, status, detail?.error)
         }
       })
@@ -621,10 +629,12 @@ export class AccountManager implements AccountsView {
         })
       }
 
+      attached = true
       rt.retries = 0
       this.#setStatus(rt, "online", undefined)
       this.#logger.info(`账号上线：${this.#describe(record)}（${driver.nickname || driver.selfId}）`)
       this.#events.emitDetached("bot/online", facade)
+      if (droppedEarly !== undefined) await this.#onDriverOffline(rt, droppedEarly.reason, droppedEarly.retryable)
     } catch (err) {
       handle?.detach()
       // 补登记再收拾：失败点在 `rt.driver = driver` 之前时（`connect()` 抛错就是），
@@ -640,6 +650,11 @@ export class AccountManager implements AccountsView {
       // 这个新排的定时器没人清，几秒后会把一个刚被停掉的账号重新连起来
       if (deliberate) return
       this.#setStatus(rt, "error", errText(err))
+      // 适配器说重连没用（机器人被封、凭据被拒、订阅非法）：退避重试只会刷屏，留在 error 等人处理
+      if ((err as { retryable?: unknown } | null)?.retryable === false) {
+        this.#logger.warn(`账号 ${this.#describe(rt.record)} 连接失败且适配器判定重连无用，不再自动重连：${errText(err)}。处理后在面板点「重连」`)
+        return
+      }
       this.#scheduleReconnect(rt, err)
     }
   }
@@ -648,11 +663,17 @@ export class AccountManager implements AccountsView {
    * 驱动侧断线：清理并安排重连
    * @param rt 账号运行时
    * @param reason 原因
+   * @param retryable 是否安排重连
    */
-  async #onDriverOffline(rt: AccountRuntime, reason: string): Promise<void> {
+  async #onDriverOffline(rt: AccountRuntime, reason: string, retryable = true): Promise<void> {
     if (rt.status !== "online" && rt.status !== "connecting") return
     await this.#teardown(rt, reason)
     if (rt.removed || this.#stopped) return
+    if (rt.record.enabled && !retryable) {
+      this.#setStatus(rt, "error", reason)
+      this.#logger.warn(`账号 ${this.#describe(rt.record)} 不再自动重连：${reason}。处理后在面板点「重连」`)
+      return
+    }
     this.#setStatus(rt, rt.record.enabled ? "offline" : "disabled", reason)
     if (rt.record.enabled) this.#scheduleReconnect(rt, new Error(reason))
   }

@@ -31,7 +31,7 @@ function fakeLogger(): Logger & { lines: string[] } {
     warn: push("warn"),
     error: push("error"),
     fatal: push("fatal"),
-    mark: push("info"),
+    mark: push("mark"),
     child: () => logger,
     isLevelEnabled: () => true
   }
@@ -134,6 +134,33 @@ describe("ConfigStore", () => {
     expect(await readFile(conf.file, "utf8")).toBe(bad)
   })
 
+  // 早先这两条只在 define/load 之后比对文件，从不 patch —— 而覆盖恰恰发生在之后的第一次保存
+  it("文件坏着时 patch / replace / reset 一律拒绝，坏文件原样留着", async () => {
+    const broken = "bot:\n  masterQQ: [1, 2\n"
+    const file = join(dir, "demo.yaml")
+    await writeFile(file, broken, "utf8")
+    const conf = await store.define("demo", demoSchema)
+    expect(conf.broken?.length).toBeGreaterThan(0)
+
+    await expect(conf.patch({ bot: { prefix: "!" } })).rejects.toThrow(/改好之前不能保存/)
+    await expect(conf.replace(demoSchema.defaults())).rejects.toMatchObject({ name: "ConfigFileBrokenError", statusCode: 409 })
+    await expect(conf.reset()).rejects.toThrow(/改好之前不能保存/)
+    expect(await readFile(file, "utf8")).toBe(broken)
+  })
+
+  it("坏文件改好、重新加载之后恢复写入", async () => {
+    const file = join(dir, "demo.yaml")
+    await writeFile(file, "render:\n  quality: 999\n", "utf8")
+    const conf = await store.define("demo", demoSchema)
+    expect(conf.broken).toBeDefined()
+
+    await writeFile(file, "render:\n  quality: 80\n", "utf8")
+    await conf.load("file", false)
+    expect(conf.broken).toBeUndefined()
+    await conf.patch({ render: { quality: 60 } })
+    expect(await readFile(file, "utf8")).toContain("quality: 60")
+  })
+
   it("patch 校验失败时抛错且配置与文件都不变", async () => {
     const conf = await store.define("demo", demoSchema)
     const before = await readFile(conf.file, "utf8")
@@ -167,6 +194,25 @@ describe("ConfigStore", () => {
     await conf.replace({ bot: { masterQQ: ["1"], prefix: "#" }, render: { quality: 80 } })
     expect(botCb).toHaveBeenCalledTimes(1)
     expect(renderCb).toHaveBeenCalledTimes(1)
+  })
+
+  it("并发 patch 依次生效，文件与内存一致", async () => {
+    const conf = await store.define("demo", demoSchema)
+    const ids = Array.from({ length: 20 }, (_, i) => String(10000 + i))
+    await Promise.all(ids.map((_, i) => conf.patch({ bot: { masterQQ: ids.slice(0, i + 1) } })))
+    await conf.patch({ render: { quality: 60 } })
+    expect(conf.get()).toEqual({ bot: { masterQQ: ids, prefix: "#" }, render: { quality: 60 } })
+
+    const store2 = new ConfigStore({ dir, logger, watch: false })
+    expect((await store2.define("demo", demoSchema)).get()).toEqual(conf.get())
+    store2.dispose()
+  })
+
+  it("并发的 patch 与 load 不会把刚写的值读回成旧文件", async () => {
+    const conf = await store.define("demo", demoSchema)
+    const done = [conf.patch({ render: { quality: 70 } }), conf.load("file", false), conf.patch({ bot: { prefix: "/" } })]
+    await Promise.all(done)
+    expect(conf.get()).toEqual({ bot: { masterQQ: [], prefix: "/" }, render: { quality: 70 } })
   })
 
   it("值没有实质变化时不触发通知也不写盘", async () => {

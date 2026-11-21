@@ -155,28 +155,50 @@ export function maskSecret(input: string, keep = 4): string {
  */
 export function splitText(input: string, max: number): string[] {
   if (max <= 0) return [input]
-  const chars = [...input]
-  if (chars.length === 0) return []
-  if (chars.length <= max) return [input]
+  if (input === "") return []
 
   const out: string[] = []
-  let rest = input
-
-  while ([...rest].length > max) {
-    const window = [...rest].slice(0, max).join("")
-    let cut = window.lastIndexOf("\n")
-    if (cut < max * 0.5) {
-      const space = window.search(/\s+\S*$/)
-      cut = space > max * 0.5 ? space : -1
-    }
-    if (cut <= 0) cut = window.length
-
-    out.push(rest.slice(0, cut).trimEnd())
-    rest = rest.slice(cut).replace(/^\s+/, "")
+  let at = 0
+  for (;;) {
+    const step = splitStep(input, at, max)
+    if (step === undefined) break
+    out.push(step.head)
+    at = step.next
   }
-
+  const rest = input.slice(at)
   if (rest !== "") out.push(rest)
   return out
+}
+
+/**
+ * 切下一段
+ *
+ * 从 `start` 起只看 `max` 个码点的窗口，不展开、不复制剩余全文 —— 逐段对剩余全文 `[...rest]`
+ * 是平方级的，30 万字的回复会同步卡住进程十几秒。
+ * @param input 全文
+ * @param start 本段起点（UTF-16 下标）
+ * @param max 本段最大码点数
+ * @returns 本段与下一段起点（已跳过断点处空白）；剩余部分不超过 `max` 时 undefined
+ */
+export function splitStep(input: string, start: number, max: number): { head: string; next: number } | undefined {
+  let end = start
+  for (let n = 0; n < max && end < input.length; n++) {
+    const cp = input.codePointAt(end) ?? 0
+    end += cp > 0xffff ? 2 : 1
+  }
+  if (end >= input.length) return undefined
+
+  const window = input.slice(start, end)
+  let cut = window.lastIndexOf("\n")
+  if (cut < max * 0.5) {
+    const space = window.search(/\s+\S*$/)
+    cut = space > max * 0.5 ? space : -1
+  }
+  if (cut <= 0) cut = window.length
+
+  let next = start + cut
+  while (next < input.length && /\s/.test(input[next] ?? "")) next++
+  return { head: input.slice(start, start + cut).trimEnd(), next }
 }
 
 /**

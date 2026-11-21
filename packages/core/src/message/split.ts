@@ -12,7 +12,21 @@
  *          在句中强制切分会使长文本回复的可读性显著下降。
  */
 import type { Segment } from "@yunzai-ng/types"
-import { splitText } from "../util/text.js"
+import { splitStep } from "../util/text.js"
+
+/**
+ * 码点数
+ * @param text 文本
+ * @returns 码点数
+ */
+function codePoints(text: string): number {
+  let n = 0
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if (code < 0xd800 || code > 0xdbff) n++
+  }
+  return n
+}
 
 /**
  * 统计消息里的文本总长度（按码点）
@@ -25,7 +39,7 @@ import { splitText } from "../util/text.js"
 export function textLength(segments: readonly Segment[]): number {
   let n = 0
   for (const s of segments) {
-    if (s.type === "text") n += [...s.text].length
+    if (s.type === "text") n += codePoints(s.text)
   }
   return n
 }
@@ -60,32 +74,35 @@ export function splitMessage(segments: Segment[], maxLength: number): Segment[][
       continue
     }
 
-    let rest = s.text
-    while (rest !== "") {
+    const text = s.text
+    let at = 0
+    while (at < text.length) {
       const room = maxLength - used
       if (room <= 0) {
         flush()
         continue
       }
 
-      const pieces = splitText(rest, room)
-      const head = pieces[0]
-      // rest 只剩空白时 splitText 返回空数组；这段没有信息量，丢掉
-      if (head === undefined) break
-      if (head === "") {
-        // 理论上不会发生（splitText 的硬切兜底保证非空）。留这一手是因为
-        // 一旦发生就是死循环，而死循环比多发一条消息严重得多。
-        rest = rest.slice(1)
+      // 每次只看 room 个码点的窗口：对剩余全文反复调 splitText 是平方级的
+      const step = splitStep(text, at, room)
+      if (step === undefined) {
+        const tail = text.slice(at)
+        current.push({ type: "text", text: tail })
+        used += codePoints(tail)
+        break
+      }
+      if (step.head === "") {
+        // 窗口里全是空白：逐字往前挪，免得死循环
+        at += 1
         continue
       }
 
-      current.push({ type: "text", text: head })
-      used += [...head].length
-      if (pieces.length === 1) break
-
-      // head 可能被 trimEnd 过，因此按长度回切后再抹掉断点处的空白，
-      // 否则下一条会以空格或换行开头
-      rest = rest.slice(head.length).replace(/^\s+/, "")
+      current.push({ type: "text", text: step.head })
+      used += codePoints(step.head)
+      // 断点之后只剩空白：这一段到此为止，后面的图片等仍跟在这一条里
+      if (step.next >= text.length) break
+      // 断点处的空白已跳过，下一条不会以空格或换行开头
+      at = step.next
       flush()
     }
   }

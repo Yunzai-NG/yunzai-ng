@@ -8,6 +8,8 @@
 |---|---|
 | `yzng start` | 启动 |
 | `yzng dev` | 启动,缺省日志级别更低 |
+| `yzng update` | 更新 CLI 与框架包 |
+| `yzng data export / import` | 导出或恢复配置与数据 |
 | `yzng init` | 只生成主目录与默认配置,不启动 |
 | `yzng doctor` | 体检:Node 版本、目录权限、可选原生模块、端口占用 |
 | `yzng plugin new <名>` | 生成一个插件骨架 |
@@ -17,14 +19,12 @@
 ```bash
 yzng start --home D:\yunzai          # 指定主目录（也可用环境变量 YZNG_HOME）
 yzng start --plugins ../a,../b       # 额外加载这几个目录（开发时用）
-yzng start --log-level debug
+yzng start --debug
 ```
 
 ## `dev` 与 `start` 的唯一区别是缺省日志级别
 
-**刻意不提供文件监听自动重载。** Node 的 ESM 模块缓存无法真正清除 —— 每次重载都会永久留下一份
-旧模块连同其闭包。一个「保存即重载」的开发模式会让人在几十次保存之后面对一个内存里堆着几十份
-旧闭包的进程,而那时的行为已经无从解释。开发期改了插件,重启进程。
+`plugins.watchScripts` 可以监听单文件插件。多文件插件的子模块仍有 ESM 缓存，开发时要验证子模块改动请重启进程。
 
 ## 主目录怎么定
 

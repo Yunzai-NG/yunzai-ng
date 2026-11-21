@@ -1,8 +1,9 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
-import { parseRecord } from "./format.js"
+import { visualWidth } from "../util/text.js"
+import { formatRecord, parseRecord } from "./format.js"
 import { createLoggerHub, type LoggerHub } from "./index.js"
 
 /** 每个用例各自的日志目录，收尾一并删掉 */
@@ -42,6 +43,39 @@ afterEach(async () => {
 })
 
 describe("LoggerHub 的级别语义", () => {
+  it("有无作用域、长中文名和不同级别都保持正文起始列", () => {
+    for (const scope of [undefined, "kernel", "这是超过十四列的测试作用域"]) {
+      const row = formatRecord({ time: 0, level: "warn", scope, msg: "正文" }, { color: false })
+      expect(visualWidth(row.split("正文")[0]!)).toBe(34)
+      if (scope?.startsWith("这是")) expect(row).toContain(`scope=${JSON.stringify(scope)}`)
+    }
+  })
+
+  it("插件 mark 单独写入 25，历史阈值与终端着色一致", async () => {
+    const { hub } = await make()
+    hub.root.child({ scope: "demo" }).mark("日常事件")
+    const line = (await fileText(hub)).trim()
+    expect(JSON.parse(line).level).toBe(25)
+    const rec = parseRecord(line)!
+    expect(rec.level).toBe("mark")
+    expect(hub.tail({ level: "info" })).toHaveLength(0)
+    expect(hub.tail({ level: "mark" })).toHaveLength(1)
+    expect(formatRecord(rec, { color: true })).toContain("[90m日常事件")
+    expect(formatRecord(rec, { color: false })).not.toContain("")
+  })
+
+  it("配置就绪后同一写入器使用新的大小和保留上限", async () => {
+    const { hub, dir } = await make()
+    hub.configureOutput({ color: false, maxSize: 65536, maxFiles: 1, keepDays: 1 })
+    for (let i = 0; i < 3; i++) {
+      hub.root.info(String(i).repeat(40000))
+      hub.flush()
+    }
+    const files = (await readdir(dir)).filter(name => name.endsWith(".log"))
+    expect(files).toHaveLength(1)
+    expect(await readFile(join(dir, files[0]!), "utf8")).toContain("2".repeat(40000))
+  })
+
   it("级别设为 info 时，debug 仍然落盘 —— 历史日志留全量", async () => {
     const { hub } = await make("info")
     hub.root.debug("一条调试")

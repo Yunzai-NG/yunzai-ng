@@ -306,9 +306,9 @@ export interface AdapterHost {
   /**
    * 上报状态变化（连接中 / 在线 / 出错），WebUI 会实时反映
    * @param status 新状态
-   * @param detail 附加信息（错误消息、昵称等）
+   * @param detail 附加信息（错误消息、昵称等）；offline 携带 retryable: false 时不自动重连
    */
-  setStatus(status: AccountStatus, detail?: { error?: string; nickname?: string }): void
+  setStatus(status: AccountStatus, detail?: { error?: string; nickname?: string; retryable?: boolean }): void
 }
 
 /**
@@ -321,7 +321,8 @@ export interface AdapterHost {
 export interface BotDriver extends BotApi {
   /**
    * 建立连接
-   * @throws 连接失败时抛出，内核据此进入退避重连
+   * @throws 连接失败时抛出，内核据此进入退避重连；错误对象带 `retryable: false`（机器人被封、
+   *         凭据被拒、订阅非法这类重连也没用的情形）时内核不再重连，账号停在 error 等人处理
    */
   connect(): Promise<void>
 

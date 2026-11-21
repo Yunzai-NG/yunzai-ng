@@ -44,6 +44,8 @@ import { createCache } from "../util/lru.js"
 export interface StatusDetail {
   /** 错误消息 */
   error?: string
+  /** 下线后能否自动重连 */
+  retryable?: boolean
   /** 账号昵称 */
   nickname?: string
 }

@@ -146,6 +146,10 @@ interface Spies {
     unload: ReturnType<typeof vi.fn>
     /** 全量加载 */
     loadAll: ReturnType<typeof vi.fn>
+    /** 单文件插件同步 */
+    syncSingles: ReturnType<typeof vi.fn>
+    /** 是否声明 groupRules */
+    acceptsGroupRules: ReturnType<typeof vi.fn>
   }
   /** 插件市场 */
   market: {
@@ -269,7 +273,9 @@ describe("面板 API", () => {
         get: vi.fn((name: string) => (name === "demo" ? { name: "demo", status: "loaded" } : undefined)),
         reload: vi.fn(async (name: string) => name === "demo"),
         unload: vi.fn(async (name: string) => name === "demo"),
-        loadAll: vi.fn(async () => ({ loaded: ["fresh"], failed: [], skipped: [], cost: 1 }))
+        loadAll: vi.fn(async () => ({ loaded: ["fresh"], failed: [], skipped: [], cost: 1 })),
+        acceptsGroupRules: vi.fn((name: string) => name === "adapter-onebot"),
+        syncSingles: vi.fn(async () => ({ loaded: ["dice"], failed: [], cost: 1, removed: ["coin"] }))
       },
       market: {
         list: vi.fn(async () => ({
@@ -373,6 +379,7 @@ describe("面板 API", () => {
         middlewares: () => [{ plugin: "demo", priority: 50, kinds: ["message"] as const }] as never
       },
       adapters,
+      adapterOwner: id => (id === "napcat" ? "adapter-onebot" : undefined),
       accounts: spies.accounts as unknown as AccountManager,
       logins: spies.logins as unknown as LoginManager,
       bots,
@@ -427,6 +434,7 @@ describe("面板 API", () => {
       expect(body.counts).toEqual({
         plugins: 1,
         pluginsFailed: 0,
+        scripts: 0,
         commands: 1,
         tasks: 1,
         adapters: 1,
@@ -632,6 +640,19 @@ describe("面板 API", () => {
       expect((await call("POST", "plugins/无名/unload")).statusCode).toBe(404)
     })
 
+    it("rescan 先同步单文件插件再装回卸掉的，三份结果合在一起", async () => {
+      const res = await call("POST", "plugins/rescan")
+      expect(res.statusCode).toBe(200)
+      expect(res.json()).toEqual({ loaded: ["dice", "fresh"], failed: [], removed: ["coin"] })
+      expect(spies.plugins.syncSingles).toHaveBeenCalledOnce()
+      expect(spies.plugins.loadAll).toHaveBeenCalledOnce()
+    })
+
+    it("适配器清单标出名下机器人接不接受群配置", async () => {
+      const list = (await call("GET", "adapters")).json() as unknown as { id: string; groupRules?: boolean }[]
+      expect(list.map(a => [a.id, a.groupRules])).toEqual([["napcat", true]])
+    })
+
     it("命令、任务、渲染器清单都能读", async () => {
       expect(((await call("GET", "commands")).json() as unknown as unknown[]).length).toBe(1)
       expect(((await call("GET", "tasks")).json() as unknown as unknown[]).length).toBe(1)
@@ -702,6 +723,16 @@ describe("面板 API", () => {
       expect((await call("POST", "accounts/nope/connect")).statusCode).toBe(404)
       expect(spies.accounts.update).not.toHaveBeenCalled()
       expect(spies.accounts.connect).not.toHaveBeenCalled()
+    })
+
+    it("群列表问的是在线的那个 Bot；不在线回 409", async () => {
+      expect((await call("GET", "accounts/a1/groups")).statusCode).toBe(409)
+      const getGroupList = vi.fn(async () => [{ gid: "800001", name: "测试群", memberCount: 3, owner: "1" }])
+      deps.bots.get = () => ({ getGroupList }) as never
+      const res = await call("GET", "accounts/a1/groups")
+      expect(res.statusCode).toBe(200)
+      expect(res.json()).toEqual([{ gid: "800001", name: "测试群", memberCount: 3 }])
+      expect((await call("GET", "accounts/nope/groups")).statusCode).toBe(404)
     })
 
     it("连接类动作回动作之后的状态，删除回 204", async () => {
@@ -1111,6 +1142,35 @@ describe("面板 API", () => {
       expect(String(res.json().error)).toContain("未提交的改动")
       expect(spies.plugins.unload).toHaveBeenCalledWith("demo")
       expect(spies.plugins.reload).toHaveBeenCalledWith("demo")
+    })
+
+    // 连点两次「更新」：两次 git 撞 index.lock，或一边删一边装
+    it("同一插件的第二次操作在第一次做完之前 409", async () => {
+      let release!: () => void
+      spies.market.update.mockImplementationOnce(
+        () => new Promise(resolve => (release = () => resolve({ name: "demo", dir, via: "pull", version: "1.0.0" })))
+      )
+      const first = call("POST", "market/demo/update", {})
+      await vi.waitFor(() => expect(spies.market.update).toHaveBeenCalled())
+      const second = await call("DELETE", "market/demo")
+      expect(second.statusCode).toBe(409)
+      release()
+      expect((await first).statusCode).toBe(200)
+    })
+
+    // 新版 setup 抛错时，早先只回一个空的 loaded，使用者看不出插件没起来
+    it("装完加载失败时带回这个插件的失败原因", async () => {
+      spies.plugins.loadAll.mockResolvedValueOnce({
+        loaded: [],
+        failed: [
+          { name: "demo", reason: "setup 抛错：缺少配置" },
+          { name: "other", reason: "与本次无关" }
+        ],
+        cost: 1
+      })
+      const res = await call("POST", "market/demo/update", {})
+      expect(res.statusCode).toBe(200)
+      expect(res.json().failed).toEqual([{ name: "demo", reason: "setup 抛错：缺少配置" }])
     })
 
     // 安装（replace 为假）压根不卸载，失败时自然也没什么可装回来的

@@ -11,10 +11,11 @@
  *             `setup.scripts` 里的名字要拼进命令行，另有一道白名单，见 `pm.ts`
  */
 import { execFile } from "node:child_process"
-import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { cp, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import type { HttpClient, Logger, PluginCommit } from "@yunzai-ng/types"
-import { isDirectory, isFile } from "../util/fs.js"
+import { errorCode, isDirectory, isFile, readJson, writeJson } from "../util/fs.js"
+import { KeyedQueue } from "../util/queue.js"
 import {
   INSTALL_TIMEOUT_MS,
   SCRIPT_TIMEOUT_MS,
@@ -24,6 +25,14 @@ import {
   type PmRunner
 } from "./pm.js"
 import { extractTarGz, joinWithin, singleRoot } from "./tar.js"
+
+/** worktree 和子模块的 .git 可以是文件；探测异常不能降级成覆盖安装。 */
+async function hasGitMarker(dir: string): Promise<boolean> {
+  try { await lstat(join(dir, ".git")); return true } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false
+    throw err
+  }
+}
 
 /** 合法插件名：字母或数字开头，其余可含字母、数字、点、下划线与连字符 */
 const NAME_RE = /^[a-z\d][a-z\d._-]*$/i
@@ -53,6 +62,9 @@ const COMMIT_LOG_LIMIT = 30
  * 且它与任何真实地址都不会相撞（不是一个 URL）。
  */
 export const CUSTOM_SOURCE = "custom"
+
+/** 同一进程内按登记文件串行读改写。 */
+const customWrites = new KeyedQueue()
 
 /** 判定"看起来是一个插件"时接受的入口文件 */
 const ENTRY_FILES: readonly string[] = ["index.js", "index.mjs", "index.cjs", "dist/index.js", "dist/index.mjs"]
@@ -268,6 +280,8 @@ export interface UpdateProbe {
   readonly willPull: boolean
   /** 目录里有没有未提交的改动（含未跟踪文件）。`willPull` 为假时恒为假 */
   readonly dirty: boolean
+  /** 更新会被拒绝的原因：目录是 git 仓库却拉不了（无 git / 来源不是 git）。只有「整份重装」能走 */
+  readonly blocked?: string
 }
 
 /**
@@ -590,6 +604,17 @@ function parseEntry(raw: unknown, source: string, logger?: Logger): MarketEntry 
   }
 }
 
+/** 取索引或登记文件的原始条目；形状不符时拒绝整份文档。 */
+function indexRows(raw: unknown): unknown[] {
+  const list = Array.isArray(raw)
+    ? raw
+    : typeof raw === "object" && raw !== null && Array.isArray((raw as { plugins?: unknown }).plugins)
+      ? (raw as { plugins: unknown[] }).plugins
+      : undefined
+  if (list === undefined) throw new Error("索引格式不符：期望数组或含 plugins 数组的对象")
+  return list
+}
+
 /**
  * 解析一份索引文档
  *
@@ -602,12 +627,7 @@ function parseEntry(raw: unknown, source: string, logger?: Logger): MarketEntry 
  * @throws 文档既不是数组也不含 `plugins` 数组时
  */
 export function parseIndex(raw: unknown, source: string, logger?: Logger): MarketEntry[] {
-  const list = Array.isArray(raw)
-    ? raw
-    : typeof raw === "object" && raw !== null && Array.isArray((raw as { plugins?: unknown }).plugins)
-      ? (raw as { plugins: unknown[] }).plugins
-      : undefined
-  if (list === undefined) throw new Error("索引格式不符：期望数组或含 plugins 数组的对象")
+  const list = indexRows(raw)
   const entries: MarketEntry[] = []
   for (const item of list) {
     const entry = parseEntry(item, source, logger)
@@ -675,17 +695,8 @@ export class PluginMarket {
   /** 依赖 */
   readonly #deps: MarketDeps
 
-  /** 内存中的索引条目，已含自登记的那几条（见 `#apply`） */
-  #entries: MarketEntry[] = []
-
-  /**
-   * 自登记的那几条，与索引条目分开存着
-   *
-   * 分开存是因为 `#entries` 会被一次索引刷新整体换掉，而自登记那几条不该随之消失 ——
-   * 合在一处的话每次刷新都要先把它们捞出来再放回去，漏一次的表现是「刷新一下自定义
-   * 插件就没了」。
-   */
-  #customs: MarketEntry[] = []
+  /** 仅含索引条目，自定义登记在查询时合并。 */
+  #indexed: MarketEntry[] = []
 
   /** 内存索引的获取时间，0 表示尚未取到 */
   #fetchedAt = 0
@@ -723,12 +734,11 @@ export class PluginMarket {
    * @returns 索引快照
    */
   async list(force = false): Promise<MarketSnapshot> {
-    const settings = this.#deps.settings()
-    const fresh = this.#fetchedAt > 0 && Date.now() - this.#fetchedAt < settings.cacheTtl
-    const cached = !force && fresh
-    if (force || !fresh) await this.#refresh(force)
+    const cached = await this.#ensureIndex(force)
+    const byName = new Map(this.#indexed.map(item => [item.name, item]))
+    for (const item of await this.customs()) if (!byName.has(item.name)) byName.set(item.name, item)
     const plugins: MarketListing[] = []
-    for (const entry of this.#entries) {
+    for (const entry of byName.values()) {
       const installed = await this.#isInstalled(entry.name)
       // 已装那份的版本从磁盘读，不能沿用索引里那个：索引说的是「现在最新是多少」
       const dir = installed ? joinWithin(this.#deps.pluginsDir, entry.name) : undefined
@@ -753,8 +763,17 @@ export class PluginMarket {
    * @returns 条目；索引中没有时 undefined
    */
   async entry(name: string): Promise<MarketEntry | undefined> {
-    await this.list()
-    return this.#entries.find(item => item.name === name)
+    await this.#ensureIndex(false)
+    return this.#indexed.find(item => item.name === name) ?? (await this.customs()).find(item => item.name === name)
+  }
+
+  /** 保证索引可用，返回是否命中内存缓存。 */
+  async #ensureIndex(force: boolean): Promise<boolean> {
+    const settings = this.#deps.settings()
+    const fresh = this.#fetchedAt > 0 && Date.now() - this.#fetchedAt < settings.cacheTtl
+    const cached = !force && fresh
+    if (force || !fresh) await this.#refresh(force)
+    return cached
   }
 
   /**
@@ -785,13 +804,10 @@ export class PluginMarket {
   async #fetchAll(force: boolean): Promise<void> {
     const { sources, mirror, timeout, cacheTtl } = this.#deps.settings()
 
-    // 自登记的那几条每次都重读：它由另一条路径（`addCustom`）写入，且那条路径不刷索引
-    this.#customs = await this.#loadCustoms()
-
     if (!force && this.#fetchedAt === 0) {
       const cache = await this.#loadCache()
       if (cache !== undefined && Date.now() - cache.fetchedAt < cacheTtl) {
-        this.#apply(cache.entries)
+        this.#indexed = cache.entries
         this.#fetchedAt = cache.fetchedAt
         this.#sources = [{ url: this.#deps.cacheFile, ok: true, count: cache.entries.length }]
         return
@@ -819,72 +835,35 @@ export class PluginMarket {
     if (merged.size === 0 && results.every(item => !item.ok)) {
       const cache = await this.#loadCache()
       if (cache !== undefined) {
-        this.#apply(cache.entries)
+        this.#indexed = cache.entries
         this.#fetchedAt = cache.fetchedAt
         this.#deps.logger.warn("插件市场全部索引不可达，沿用上次缓存")
         return
       }
     }
-    this.#apply([...merged.values()])
+    this.#indexed = [...merged.values()]
     this.#fetchedAt = Date.now()
     await this.#saveCache()
   }
 
-  /**
-   * 把索引条目与自登记条目合成 `#entries`
-   *
-   * **一个 setter 而非三处各拼一遍。** `#fetchAll` 有三个出口（磁盘缓存新鲜、全部源
-   * 不可达而沿用缓存、正常取到），少写一处的表现是「自定义插件平时在、断网时不见了」
-   * —— 那种缺失极难与网络问题区分开。
-   *
-   * **索引里的同名条目优先**：某个插件哪天进了官方索引，索引那份自动接管，而使用者
-   * 那条登记留着也不碍事。反过来（自登记覆盖索引）会让「我明明装的是官方那份」
-   * 变成一句无从查证的话。
-   * @param indexed 来自索引或磁盘缓存的条目
-   */
-  #apply(indexed: readonly MarketEntry[]): void {
-    const byName = new Map<string, MarketEntry>()
-    for (const item of indexed) byName.set(item.name, item)
-    for (const item of this.#customs) if (!byName.has(item.name)) byName.set(item.name, item)
-    this.#entries = [...byName.values()]
-  }
-
-  /**
-   * 读回自登记的那几条
-   *
-   * **按不可信输入对待**，与索引缓存同一道理（那个文件同样在使用者手边）：逐条重新
-   * 经 `parseIndex` 校验，一条坏的只丢那一条。`custom` 标记在此处补回 —— 它不在
-   * `parseEntry` 的认领范围内，而少了它面板上分不出这条打哪来。
-   * @returns 自登记条目；文件不存在或整份读不动时空数组
-   */
-  async #loadCustoms(): Promise<MarketEntry[]> {
-    const file = this.#deps.customFile
-    if (file === undefined) return []
+  /** 浏览可跳过坏条目；修改时必须能读全，否则拒绝写回。 */
+  async #loadCustoms(file: string, strict: boolean): Promise<MarketEntry[]> {
     try {
-      const raw = JSON.parse(await readFile(file, "utf8")) as unknown
-      const entries = parseIndex(raw, CUSTOM_SOURCE, this.#deps.logger)
-      return entries.map(item => ({ ...item, source: CUSTOM_SOURCE, custom: true as const }))
-    } catch {
+      const raw = await readJson(file)
+      if (raw === undefined) return []
+      const entries: MarketEntry[] = []
+      for (const row of indexRows(raw)) {
+        const item = parseEntry(row, CUSTOM_SOURCE, this.#deps.logger)
+        if (item !== undefined) entries.push({ ...item, custom: true })
+        else if (strict) throw new Error("含有无效登记条目")
+      }
+      return entries
+    } catch (err) {
+      const message = `无法完整读取自定义登记 ${file}：${err instanceof Error ? err.message : String(err)}`
+      if (strict) throw new Error(message, { cause: err })
+      this.#deps.logger.warn(message)
       return []
     }
-  }
-
-  /**
-   * 写下自登记的那几条
-   *
-   * **写失败要抛**，与索引缓存那处相反：缓存写不进去只是下次多发一次网络请求，而这里
-   * 写不进去意味着「装完了、重启后更新不了」—— 那时该让使用者当场知道，而不是几天后
-   * 发现更新按钮不亮。
-   * @param entries 全部自登记条目
-   * @throws 写入失败时
-   */
-  async #saveCustoms(entries: readonly MarketEntry[]): Promise<void> {
-    const file = this.#deps.customFile
-    // 没配这一项即本部署不支持自定义安装。抛而不是静默不写：静默的表现是「登记了、
-    // 重启后没了」，而那与「写失败」在界面上分不出来
-    if (file === undefined) throw new Error("当前部署未启用自定义插件安装")
-    await mkdir(dirname(file), { recursive: true })
-    await writeFile(file, JSON.stringify({ plugins: entries }, undefined, 2), "utf8")
   }
 
   /**
@@ -904,21 +883,20 @@ export class PluginMarket {
   async registerCustom(spec: CustomSpec): Promise<MarketEntry> {
     const entry = customEntry(spec)
 
-    // 索引里已有同名的一条时不许登记：那会让两份来源指向同一个目录名，而谁生效取决于
-    // `#apply` 的优先级 —— 使用者看到的是「我填的地址没生效」
-    const existing = await this.entry(entry.name)
-    if (existing !== undefined && existing.custom !== true) {
-      throw new Error(
-        `插件索引里已有名为 ${entry.name} 的插件，请在市场里直接安装它，或为这一条另填一个「安装目录名」`
-      )
-    }
-
-    const kept = this.#customs.filter(item => item.name !== entry.name)
-    await this.#saveCustoms([...kept, entry])
-    this.#customs = [...kept, entry]
-    this.#apply(this.#entries.filter(item => item.custom !== true))
-    this.#deps.logger.info(`已登记自定义插件 ${entry.name}：${entry.install.url}`)
-    return entry
+    const file = this.#deps.customFile
+    if (file === undefined) throw new Error("当前部署未启用自定义插件安装")
+    return customWrites.run(file, async () => {
+      await this.#ensureIndex(false)
+      if (this.#indexed.some(item => item.name === entry.name)) {
+        throw new Error(
+          `插件索引里已有名为 ${entry.name} 的插件，请在市场里直接安装它，或为这一条另填一个「安装目录名」`
+        )
+      }
+      const current = await this.#loadCustoms(file, true)
+      await writeJson(file, { plugins: [...current.filter(item => item.name !== entry.name), entry] })
+      this.#deps.logger.info(`已登记自定义插件 ${entry.name}：${entry.install.url}`)
+      return entry
+    })
   }
 
   /**
@@ -933,14 +911,16 @@ export class PluginMarket {
    */
   async removeCustom(name: string): Promise<boolean> {
     assertPluginName(name)
-    this.#customs = await this.#loadCustoms()
-    const kept = this.#customs.filter(item => item.name !== name)
-    if (kept.length === this.#customs.length) return false
-    await this.#saveCustoms(kept)
-    this.#customs = kept
-    this.#entries = this.#entries.filter(item => !(item.name === name && item.custom === true))
-    this.#deps.logger.info(`已撤掉自定义插件 ${name} 的登记（插件目录未动）`)
-    return true
+    const file = this.#deps.customFile
+    if (file === undefined) return false
+    return customWrites.run(file, async () => {
+      const current = await this.#loadCustoms(file, true)
+      const kept = current.filter(item => item.name !== name)
+      if (kept.length === current.length) return false
+      await writeJson(file, { plugins: kept })
+      this.#deps.logger.info(`已撤掉自定义插件 ${name} 的登记（插件目录未动）`)
+      return true
+    })
   }
 
   /**
@@ -948,8 +928,8 @@ export class PluginMarket {
    * @returns 自登记条目
    */
   async customs(): Promise<MarketEntry[]> {
-    this.#customs = await this.#loadCustoms()
-    return [...this.#customs]
+    const file = this.#deps.customFile
+    return file === undefined ? [] : this.#loadCustoms(file, false)
   }
 
   /**
@@ -965,7 +945,10 @@ export class PluginMarket {
       if (typeof raw !== "object" || raw === null) return undefined
       const record = raw as { fetchedAt?: unknown; entries?: unknown }
       if (typeof record.fetchedAt !== "number") return undefined
-      const entries = parseIndex(record.entries ?? [], this.#deps.cacheFile)
+      if (!Array.isArray(record.entries)) return undefined
+      // 旧版缓存混入过自定义登记，须在 parseIndex 丢弃来源标记前过滤。
+      const indexed = record.entries.filter(item => item?.custom !== true && item?.source !== CUSTOM_SOURCE)
+      const entries = parseIndex(indexed, this.#deps.cacheFile)
       return { fetchedAt: record.fetchedAt, entries }
     } catch {
       return undefined
@@ -978,7 +961,7 @@ export class PluginMarket {
    * 写入失败只记日志：缓存是加速手段，写不进去不应当让一次成功的索引获取失败。
    */
   async #saveCache(): Promise<void> {
-    const doc: CacheFile = { fetchedAt: this.#fetchedAt, entries: this.#entries }
+    const doc: CacheFile = { fetchedAt: this.#fetchedAt, entries: this.#indexed }
     try {
       await mkdir(dirname(this.#deps.cacheFile), { recursive: true })
       await writeFile(this.#deps.cacheFile, JSON.stringify(doc, undefined, 2), "utf8")
@@ -1020,6 +1003,8 @@ export class PluginMarket {
     const entry = await this.entry(name)
     if (entry === undefined) throw new Error(`插件市场中没有名为 ${name} 的插件`)
     const target = joinWithin(this.#deps.pluginsDir, name)
+    const backup = joinWithin(this.#deps.pluginsDir, `.${name}.replacing`)
+    await this.#recoverBackup(target, backup)
     const exists = await isDirectory(target)
     if (exists && opts.replace !== true) throw new Error(`插件 ${name} 已安装，如需覆盖请先卸载`)
     if (entry.minCore !== undefined && compareVersion(this.#deps.coreVersion, entry.minCore) < 0) {
@@ -1033,9 +1018,8 @@ export class PluginMarket {
       await this.#assertLooksLikePlugin(root, name)
       const manifest = await this.#manifest(root)
       const version = manifest?.version ?? entry.version ?? "0.0.0"
-      if (exists) await rm(target, { recursive: true, force: true })
       await mkdir(this.#deps.pluginsDir, { recursive: true })
-      await this.#move(root, target)
+      await this.#swapIn(name, root, target, backup)
       this.#deps.logger.info(`插件 ${name}@${version} 已安装至 ${target}`)
       // 带 `.git` 的目录此后可就地拉取；归档装出来的每次更新都要整目录重下
       const updatable = via === "git" ? "pull" : "reinstall"
@@ -1140,7 +1124,21 @@ export class PluginMarket {
     assertPluginName(name)
     const target = joinWithin(this.#deps.pluginsDir, name)
     if (!(await isDirectory(target))) return false
-    await rm(target, { recursive: true, force: true })
+    // 先改名再删：直接删在 Windows 上遇到被占用的 DLL 会删到一半，剩下一个既不能用也不完整的目录
+    const doomed = joinWithin(this.#deps.pluginsDir, `.${name}.removing`)
+    await rm(doomed, { recursive: true, force: true })
+    try {
+      await rename(target, doomed)
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === "EBUSY" || code === "EPERM" || code === "EACCES") {
+        throw new Error(`插件目录 ${target} 正被占用（${code}），没有动它。多半是还有进程在用其中的文件，重启实例后再试`)
+      }
+      throw err
+    }
+    await rm(doomed, { recursive: true, force: true }).catch(err => {
+      this.#deps.logger.warn(`插件 ${name} 已移出插件目录，但 ${doomed} 没能删干净（${err instanceof Error ? err.message : String(err)}），可手动删除`)
+    })
     this.#deps.logger.info(`插件 ${name} 目录已删除：${target}`)
     return true
   }
@@ -1157,11 +1155,13 @@ export class PluginMarket {
   async inspectUpdate(name: string): Promise<UpdateProbe> {
     assertPluginName(name)
     const dir = joinWithin(this.#deps.pluginsDir, name)
-    // 前置条件与 `#tryPull` 同一串；任一条不满足即整目录重装那条路，那条路不碰 git，故 dirty 恒为假
-    if (!(await isDirectory(join(dir, ".git")))) return { willPull: false, dirty: false }
+    // 前置条件与 `#tryPull` 同一串；目录不是仓库即整目录重装那条路，那条路不碰 git，故 dirty 恒为假
+    if (!(await hasGitMarker(dir))) return { willPull: false, dirty: false }
     const entry = await this.entry(name)
-    if (entry === undefined || entry.install.type !== "git") return { willPull: false, dirty: false }
-    if (!(await this.#hasGit())) return { willPull: false, dirty: false }
+    if (entry === undefined) return { willPull: false, dirty: false }
+    // 是仓库却拉不了：update() 会拒绝，见那里的说明
+    if (entry.install.type !== "git") return { willPull: false, dirty: false, blocked: "索引里它不是 git 来源" }
+    if (!(await this.#hasGit())) return { willPull: false, dirty: false, blocked: "本机没有 git" }
     const dirty = await this.#isDirty(dir)
     return { willPull: true, dirty }
   }
@@ -1197,7 +1197,17 @@ export class PluginMarket {
     // 老调用方只给 `stash`，新调用方给 `onDirty`；两者都没给即中止，与从前一致
     const onDirty: DirtyAction = opts.onDirty ?? (opts.stash === true ? "stash" : "abort")
     const pulled = await this.#tryPull(name, target, opts.dependencies === true, onDirty)
-    return pulled ?? this.install(name, { replace: true, ...opts })
+    if (typeof pulled === "object") return pulled
+    // 目录是 git 仓库却拉不了（没有 git、索引说它是归档分发的）：整目录重装会连 .git 与本地改动一起删掉，
+    // 且不经「有没有改动」那道检查。不替使用者做这个决定
+    if (pulled !== "not-a-repo") {
+      const why = pulled === "no-git" ? "本机没有 git，就地拉取无从做起" : "索引里它不是 git 来源，就地拉取无从做起"
+      throw new Error(
+        `插件 ${name} 的目录是一个 git 仓库，而${why}。整目录重装会删掉其中的 .git 与本地改动，故没有替你做。` +
+          `要更新：在该目录自行 git pull；确认不要那些改动时，在面板上选「整份重装」`
+      )
+    }
+    return this.install(name, { replace: true, ...opts })
   }
 
   /**
@@ -1206,7 +1216,7 @@ export class PluginMarket {
    * @param dir 插件安装目录
    * @param dependencies 拉完之后按需装依赖、跑装后步骤
    * @param onDirty 撞上本地改动时怎么办：暂存、丢弃，还是中止整次更新
-   * @returns 拉取结果；不具备就地拉取条件（无 git、目录不是仓库、来源不是 git）时 undefined
+   * @returns 拉取结果；不具备就地拉取条件时给出是哪一条（目录不是仓库、本机无 git、来源不是 git）
    * @throws 拉取过程本身失败时 —— 那意味着网络或仓库状态有问题，此时退回重新安装会把一次
    *         可修复的失败变成一次目录删除；有改动而 `onDirty` 为 `abort` 时同样抛出，见下
    */
@@ -1215,16 +1225,16 @@ export class PluginMarket {
     dir: string,
     dependencies: boolean,
     onDirty: DirtyAction
-  ): Promise<InstallResult | undefined> {
+  ): Promise<InstallResult | "not-a-repo" | "no-git" | "not-git-source"> {
     /*
      * 两条不能改的次序：用 `fetch` + `reset --hard` 而非 `pull`（后者会试图合并，
      * 冲突时目录停在半新半旧）；stash 必须先于 reset，反过来即数据丢失。
      */
-    if (!(await isDirectory(join(dir, ".git")))) return undefined
+    if (!(await hasGitMarker(dir))) return "not-a-repo"
     const entry = await this.entry(name)
     if (entry === undefined) throw new Error(`插件市场中没有名为 ${name} 的插件`)
-    if (entry.install.type !== "git") return undefined
-    if (!(await this.#hasGit())) return undefined
+    if (entry.install.type !== "git") return "not-git-source"
+    if (!(await this.#hasGit())) return "no-git"
     if (entry.minCore !== undefined && compareVersion(this.#deps.coreVersion, entry.minCore) < 0) {
       throw new Error(`插件 ${name} 要求内核版本不低于 ${entry.minCore}，当前为 ${this.#deps.coreVersion}`)
     }
@@ -1262,7 +1272,18 @@ export class PluginMarket {
     // 地址每次现算，不沿用目录里记着的 origin：镜像是可改的配置项，旧镜像可能已关站
     const url = applyMirror(entry.install.url, mirror)
     const ref = branch ?? "HEAD"
-    await this.#git(["fetch", "--depth", "1", url, ref], dir, TRANSFER_TIMEOUT_MS)
+    try {
+      await this.#git(["fetch", "--depth", "1", url, ref], dir, TRANSFER_TIMEOUT_MS)
+    } catch (err) {
+      // 拉取失败时 reset 还没发生，目录仍在原提交：把刚暂存的改动放回去，免得使用者以为它们丢了
+      if (stashed) {
+        await this.#git(["stash", "pop"], dir, GIT_LOCAL_TIMEOUT_MS).then(
+          () => this.#deps.logger.info(`插件 ${name} 拉取失败，先前暂存的改动已放回目录`),
+          () => this.#deps.logger.warn(`插件 ${name} 拉取失败，先前暂存的改动没能自动放回：在该目录执行 git stash pop`)
+        )
+      }
+      throw err
+    }
     await this.#git(["reset", "--hard", "FETCH_HEAD"], dir, GIT_LOCAL_TIMEOUT_MS)
 
     const nowAt = await head()
@@ -1381,7 +1402,12 @@ export class PluginMarket {
       await mkdir(this.#deps.tempDir, { recursive: true })
       await this.#git(["--version"], this.#deps.tempDir, GIT_LOCAL_TIMEOUT_MS)
       this.#gitAvailable = true
-    } catch {
+    } catch (err) {
+      // 只有「找不到 git 这个程序」才记住：超时、杀毒软件拦了一下这类偶发失败下次再探
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.#deps.logger.debug("探测 git 失败，本次按没有 git 处理，下次再探", err)
+        return false
+      }
       this.#gitAvailable = false
       this.#deps.logger.debug("本机未检测到 git，插件安装改用归档下载")
     }
@@ -1420,6 +1446,70 @@ export class PluginMarket {
       return { ...(version === undefined ? {} : { version }), ...(dependencies === undefined ? {} : { dependencies }) }
     } catch {
       return undefined
+    }
+  }
+
+  /** 只有备份时先恢复；两份都在时无法判断正式目录是否完整。 */
+  async #recoverBackup(target: string, backup: string): Promise<void> {
+    const stat = await lstat(backup).catch(err => {
+      if (errorCode(err) !== "ENOENT") throw err
+    })
+    if (!stat) return
+    if (!stat.isDirectory()) throw new Error(`备份路径 ${backup} 不是普通目录，请人工核对`)
+    const current = await lstat(target).catch(err => {
+      if (errorCode(err) !== "ENOENT") throw err
+    })
+    if (current) throw new Error(`插件目录 ${target} 和备份 ${backup} 同时存在，请人工核对；两处均未改动`)
+    try {
+      await rename(backup, target)
+    } catch (err) {
+      throw new Error(`无法从备份 ${backup} 还原到 ${target}：${err}。请保留备份，排除故障后重试`, { cause: err })
+    }
+    throw new Error(`已还原上次中断的插件目录 ${target}，本次没有安装新版本。请确认后重试`)
+  }
+
+  /**
+   * 把新内容换进插件目录：旧目录先改名留着，新的就位后才删
+   *
+   * 早先是先删旧目录再移入：移入失败插件就没了，而失败后的「装回来」只是重载同一个目录，旧代码已删。
+   * Windows 上原生模块的 DLL 被占用时删到一半报 EBUSY，目录只剩一半；改名要么整个成功、要么原样不动。
+   * 备份放在插件目录旁边（点开头，不会被当成插件扫到），同一分区，改名不会 EXDEV。
+   * @param name 插件名
+   * @param root 新内容的根目录
+   * @param target 插件目录
+   * @param backup 同目录下的备份路径
+   * @throws 移入或回滚失败时
+   */
+  async #swapIn(name: string, root: string, target: string, backup: string): Promise<void> {
+    const hadOld = await isDirectory(target)
+    if (hadOld) {
+      try {
+        await rename(target, backup)
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code
+        if (code === "EBUSY" || code === "EPERM" || code === "EACCES") {
+          throw new Error(`插件目录 ${target} 正被占用（${code}），没有动它。多半是还有进程在用其中的文件，重启实例后再试`)
+        }
+        throw err
+      }
+    }
+    try {
+      await this.#move(root, target)
+    } catch (err) {
+      if (hadOld) {
+        try {
+          await rm(target, { recursive: true, force: true })
+          await rename(backup, target)
+        } catch (restoreError) {
+          throw new Error(`移入 ${target} 失败（${err}），从备份 ${backup} 还原失败（${restoreError}）。请保留备份，排除故障后重试`, { cause: restoreError })
+        }
+      }
+      throw err
+    }
+    if (hadOld) {
+      await rm(backup, { recursive: true, force: true }).catch(err => {
+        this.#deps.logger.warn(`插件 ${name} 的旧版本留在 ${backup} 没能删掉（${err instanceof Error ? err.message : String(err)}），可手动删除`)
+      })
     }
   }
 

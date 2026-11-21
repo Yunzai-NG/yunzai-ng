@@ -38,6 +38,11 @@ export interface StartOptions {
   readonly supervise?: boolean | undefined
 }
 
+/** 非交互或重定向输出只提示配置位置。 */
+export function bannerToken(token: string, inputTTY: boolean | undefined, outputTTY: boolean | undefined): string {
+  return inputTTY === true && outputTTY === true ? token : "请查看 config/yunzai.yaml 的 server.token"
+}
+
 /**
  * 输出启动横幅
  *
@@ -56,9 +61,7 @@ function printBanner(app: App): void {
   if (settings.server.enable) {
     const host = settings.server.host === "0.0.0.0" ? "127.0.0.1" : settings.server.host
     rows.push(["面板", cyan(`http://${host}:${settings.server.port}/`)])
-    // 令牌完整输出而非掩码：此处为本机终端，使用者此刻正需将其复制至浏览器。
-    // 掩码只会迫使其转往 config/yunzai.yaml 查阅，安全性并无变化，却增加一道步骤
-    if (settings.server.token) rows.push(["令牌", settings.server.token])
+    if (settings.server.token) rows.push(["令牌", bannerToken(settings.server.token, process.stdin.isTTY, process.stdout.isTTY)])
   } else {
     rows.push(["面板", dim("已在配置中关闭（server.enable）")])
   }

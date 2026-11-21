@@ -12,6 +12,7 @@
  *             那会把 auth.ts 避开的 CSRF 面引回来
  */
 import { isAbsolute } from "node:path"
+import { connect } from "node:net"
 import type { IncomingMessage } from "node:http"
 import type { FastifyInstance, FastifyReply, FastifyRequest, FastifyServerOptions } from "fastify"
 // 只为 WebSocket 插件对 Fastify 类型的扩充（`websocket: true`）；运行期见 `loadFastify`
@@ -38,6 +39,7 @@ import {
   AuthLimiter,
   WS_PROTOCOL,
   checkAuth,
+  checkCrossSite,
   checkForgeableBody,
   generateToken,
   isLocalHost,
@@ -402,6 +404,49 @@ function displayHost(host: string): string {
   return host.includes(":") ? `[${host}]` : host
 }
 
+/** 监听前探测端口的等待上限：本机连接要么立刻应答，要么就是没人在听 */
+const PROBE_TIMEOUT_MS = 200
+
+/**
+ * 找出本机在这个端口上已经在应答的地址
+ *
+ * Windows 允许一个进程绑 `0.0.0.0:P`、另一个绑 `127.0.0.1:P`，两边都不报 EADDRINUSE，
+ * 访问 127.0.0.1 时落到绑得更具体的那个 —— 面板静默串到别人的服务器上。故监听前先连一下：
+ * 通配地址探回环，具体地址探它自己。
+ * @param host 配置里的监听地址
+ * @param port 端口
+ * @returns 有人应答的地址；都没人时 undefined
+ */
+async function findOccupant(host: string, port: number): Promise<string | undefined> {
+  const targets =
+    host === "" || host === "0.0.0.0"
+      ? ["127.0.0.1"]
+      : host === "::" || host === "::0"
+        ? ["127.0.0.1", "::1"]
+        : [host]
+  const hits = await Promise.all(targets.map(target => answers(target, port)))
+  return targets.find((_, i) => hits[i])
+}
+
+/**
+ * 某地址的端口上是否有人接受连接
+ * @param host 地址
+ * @param port 端口
+ * @returns 连上即 true；被拒、出错或超时为 false
+ */
+function answers(host: string, port: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = connect({ host, port })
+    const done = (ok: boolean): void => {
+      socket.destroy()
+      resolve(ok)
+    }
+    socket.setTimeout(PROBE_TIMEOUT_MS, () => done(false))
+    socket.once("connect", () => done(true))
+    socket.once("error", () => done(false))
+  })
+}
+
 /**
  * 造一个带状态码的错误
  * @param status HTTP 状态码
@@ -660,6 +705,10 @@ export class ManagedServer implements ServerSink {
   #closed = false
   /** 实际监听到的端口，`listen()` 之后才有值 */
   #port = 0
+  /** 令牌被清空时补发的订阅，`ensureToken()` 首次调用时装上 */
+  #tokenWatch: Disposer | undefined
+  /** 写不进配置文件时只放在内存里的令牌；配置里有令牌时 undefined */
+  #memoryToken: string | undefined
 
   /**
    * 建好实例但不监听
@@ -830,14 +879,30 @@ export class ManagedServer implements ServerSink {
    * @returns 完成时 resolve
    */
   async ensureToken(): Promise<void> {
+    // 运行中把令牌清空（面板里改、手改文件）同样补一个：否则从那一刻起本机任何页面都不需要令牌
+    this.#tokenWatch ??= this.#config.watch("server.token", change => {
+      if (change.next.server.token === "" || change.next.server.token === undefined) {
+        void this.ensureToken().catch(err => this.#logger.error(`令牌被清空后重新生成失败：${messageOf(err)}`))
+      }
+    })
+
     const cfg = this.#config.get().server
-    if (cfg.token !== undefined && cfg.token !== "") return
+    if (cfg.token !== undefined && cfg.token !== "") {
+      this.#memoryToken = undefined
+      return
+    }
 
     const token = generateToken()
-    await this.#config.patch({ server: { token } }, "api")
-    // 明文输出一次是必要的：使用者此时即需以其登录面板，且它本已写入配置文件
-    this.#logger.warn(`已自动生成面板访问令牌：${token}`)
-    this.#logger.warn("首次打开面板须填入它。该令牌已写入配置项 server.token，可随时自行修改")
+    try {
+      await this.#config.patch({ server: { token } }, "api")
+    } catch (err) {
+      // 写不进去（配置目录只读、文件坏着）也照样有门：令牌只放内存，本次运行有效，重启换一个
+      this.#memoryToken = token
+      this.#logger.error(`面板访问令牌写不进配置文件（${messageOf(err)}），本次只在内存里生效。请修复配置文件或手动填写 server.token`)
+      return
+    }
+    this.#memoryToken = undefined
+    this.#logger.warn("已生成面板访问令牌，请在配置文件中查看 server.token")
   }
 
   /**
@@ -853,6 +918,15 @@ export class ManagedServer implements ServerSink {
     if (this.#listening) return
 
     const cfg = this.#config.get().server
+    const occupant = await findOccupant(cfg.host, cfg.port)
+    if (occupant !== undefined) {
+      const url = `http://${displayHost(occupant)}:${cfg.port}`
+      const err = new Error(
+        `端口 ${cfg.port} 已被本机另一个进程占用（${url} 有服务在应答，浏览器会打开到它）：换一个 server.port，或先停掉占用者`
+      ) as Error & { code: string }
+      err.code = "EADDRINUSE"
+      throw err
+    }
     await this.#fastify.listen({ host: cfg.host, port: cfg.port })
     const addr = this.#fastify.server.address()
     this.#port = typeof addr === "object" && addr !== null ? addr.port : cfg.port
@@ -912,6 +986,8 @@ export class ManagedServer implements ServerSink {
   async close(): Promise<void> {
     if (this.#closed) return
     this.#closed = true
+    this.#tokenWatch?.()
+    this.#tokenWatch = undefined
     try {
       await this.#fastify.close()
     } finally {
@@ -1111,7 +1187,7 @@ export class ManagedServer implements ServerSink {
    */
   #token(): string | undefined {
     const token = this.#config.get().server.token
-    return token === "" ? undefined : token
+    return token === undefined || token === "" ? this.#memoryToken : token
   }
 
   /**
@@ -1170,7 +1246,7 @@ export class ManagedServer implements ServerSink {
       const entry = route.value
       if (entry.auth) {
         const authReq: AuthRequest = { ip: ipOf(request), method, headers: request.headers }
-        const failure = this.#authorize(authReq) ?? checkForgeableBody(authReq)
+        const failure = checkCrossSite(authReq) ?? this.#authorize(authReq) ?? checkForgeableBody(authReq)
         if (failure !== undefined) return this.#reject(reply, failure.status, failure.message, failure.headers)
       }
 
@@ -1275,7 +1351,8 @@ export class ManagedServer implements ServerSink {
 
     const verify = hit.value.verify
     if (verify === undefined) {
-      const failure = this.#authorize({ ip: ipOf(request), method: "GET", headers: request.headers })
+      const authReq: AuthRequest = { ip: ipOf(request), method: "GET", headers: request.headers }
+      const failure = checkCrossSite(authReq, true) ?? this.#authorize(authReq)
       if (failure !== undefined) return this.#rejectUpgrade(reply, failure.status, failure.message)
     } else {
       let ok = false

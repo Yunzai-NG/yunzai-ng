@@ -1,5 +1,5 @@
 /**
- * 模块职责：`yzng doctor` —— 环境自检：运行环境、目录、内核配置、可选原生依赖、端口占用
+ * 模块职责：`yzng doctor` —— 环境自检：运行环境、目录、内核配置、KV 存储与旧数据、插件 SQL、端口占用
  * 依赖方向：依赖 @yunzai-ng/core 的公开入口与 node:net
  * 生命周期：一次性，执行完毕即退出
  * 注意事项：**每一项均须给出后续处置方式，否则本命令不具备存在价值。**
@@ -12,10 +12,20 @@
 import net from "node:net"
 import process from "node:process"
 import { createRequire } from "node:module"
-import { constants } from "node:fs"
+import { constants, existsSync } from "node:fs"
 import { access, readFile } from "node:fs/promises"
-import { join } from "node:path"
-import { CORE_CONFIG_NAME, coreConfigSchema, detectPlatform, legacyInstance, parseYaml, resolvePaths } from "@yunzai-ng/core"
+import { isAbsolute, join, resolve } from "node:path"
+import {
+  CORE_CONFIG_NAME,
+  KV_DB_FILE,
+  coreConfigSchema,
+  detectPlatform,
+  findLegacy,
+  legacyInstance,
+  loadSqliteBinding,
+  parseYaml,
+  resolvePaths
+} from "@yunzai-ng/core"
 import { bold, cyan, dim, green, print, printRows, red, yellow } from "../terminal.js"
 
 /** Node 最低版本，与根 package.json 的 engines（>=20.11.0）保持一致 */
@@ -68,11 +78,11 @@ export interface ServerProbe {
 /**
  * 读内核配置并校验，取出要探测的监听地址
  *
- * 启动时配置写错只记一条 error 并沿用缺省值，使用者多半只看到「面板端口不对」；自检要把原因直接报出来。
+ * 内核配置写错时内核拒绝启动，报错只给前几行；自检把每一项都列出来。
  * @param configDir 配置目录
  * @returns 结论（文件不存在时为 undefined：首次启动会按缺省值生成）与监听参数
  */
-export async function checkConfig(configDir: string): Promise<{ finding?: Finding; server: ServerProbe }> {
+export async function checkConfig(configDir: string): Promise<{ finding?: Finding; server: ServerProbe; storeDir?: string }> {
   const file = join(configDir, `${CORE_CONFIG_NAME}.yaml`)
   const defaults = coreConfigSchema.defaults().server
   const fallback = { enable: defaults.enable, host: defaults.host, port: defaults.port }
@@ -88,7 +98,7 @@ export async function checkConfig(configDir: string): Promise<{ finding?: Findin
         level: "error",
         title: "内核配置",
         detail: `${cyan(file)} 语法有误：${err instanceof Error ? err.message.split("\n")[0] : String(err)}`,
-        next: "启动时会整份沿用缺省值，改动全不生效。按提示的行号修正后再启动"
+        next: "内核不会启动（沿用缺省值起来，存储目录、端口都不是你的那份）。按提示的行号修正后再启动"
       },
       server: fallback
     }
@@ -104,13 +114,64 @@ export async function checkConfig(configDir: string): Promise<{ finding?: Findin
         level: "error",
         title: "内核配置",
         detail: `${cyan(file)} 校验失败：${shown.join("；")}`,
-        next: "启动时会整份沿用缺省值，改动全不生效。改正这几项，或在面板的设置页里改"
+        next: "内核不会启动（沿用缺省值起来，存储目录、端口都不是你的那份）。改正这几项后再启动"
       },
       server: fallback
     }
   }
   const { enable, host, port } = result.value.server
-  return { finding: { level: "ok", title: "内核配置", detail: cyan(file) }, server: { enable, host, port } }
+  const storeDir = result.value.store.dir
+  return {
+    finding: { level: "ok", title: "内核配置", detail: cyan(file) },
+    server: { enable, host, port },
+    ...(storeDir === undefined || storeDir === "" ? {} : { storeDir })
+  }
+}
+
+/**
+ * 检查 KV 存储：有没有可用的 SQLite 绑定、旧版数据能不能迁移
+ * @param storeDir 存储目录
+ * @returns 结论
+ */
+export async function checkStorage(storeDir: string): Promise<Finding[]> {
+  const loaded = await loadSqliteBinding()
+  const findings: Finding[] = []
+  const db = join(storeDir, KV_DB_FILE)
+  if (loaded.binding === undefined) {
+    findings.push({
+      level: "error",
+      title: "KV 存储",
+      detail: `没有可用的 SQLite：${loaded.reason ?? "未知原因"}`,
+      next: "内核起不来。在实例目录重新安装依赖让 better-sqlite3 装上（留意它的编译报错），或换用 Node 22.13 及以上（自带 node:sqlite）"
+    })
+  } else {
+    findings.push({ level: "ok", title: "KV 存储", detail: `${cyan(db)} ${dim(`（${loaded.binding.engine}）`)}` })
+  }
+
+  if (existsSync(db)) return findings
+  const sources = await findLegacy(storeDir)
+  if (sources.length > 1) {
+    findings.push({ level: "error", title: "旧版 KV 数据", detail: "发现 JSON 和 LevelDB 两种旧数据，无法自动选择", next: "先停机并备份，再把不迁移的那份移到其他目录" })
+    return findings
+  }
+  const legacy = sources[0]
+  if (legacy === undefined) return findings
+  if (legacy.kind === "json") {
+    findings.push({ level: "ok", title: "旧版 KV 数据", detail: `${cyan(legacy.path)}，下次启动自动迁入 ${KV_DB_FILE}` })
+    return findings
+  }
+  const level = checkNative("classic-level", "读旧版 LevelDB 数据", "")
+  findings.push(
+    level.level === "ok"
+      ? { level: "ok", title: "旧版 KV 数据", detail: `${cyan(legacy.path)}，下次启动自动迁入 ${KV_DB_FILE}` }
+      : {
+          level: "error",
+          title: "旧版 KV 数据",
+          detail: `${cyan(legacy.path)} 是 LevelDB，而本机读不了它（classic-level 不可用）`,
+          next: "内核起不来。回到原来那台机器上升级并启动一次完成迁移，或在那里执行 yzng data export，再到这里 yzng data import"
+        }
+  )
+  return findings
 }
 
 /**
@@ -284,6 +345,12 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<number> {
   const legacy = checkLegacy(paths.home)
   const config = await checkConfig(paths.config)
   const server = config.server
+  const storeDir =
+    config.storeDir === undefined
+      ? join(paths.data, "store")
+      : isAbsolute(config.storeDir)
+        ? config.storeDir
+        : resolve(paths.home, config.storeDir)
   // 命令行给了就探命令行的；面板关着且没人指定时不探
   const probePort = opts.port !== undefined || opts.host !== undefined || server.enable
   const findings: Finding[] = [
@@ -293,8 +360,12 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<number> {
     await checkDir("配置目录", paths.config),
     await checkDir("数据目录", paths.data),
     ...(config.finding === undefined ? [] : [config.finding]),
-    checkNative("classic-level", "内嵌 KV，用于计数与冷却", "缺失时内核降级为 JSON 文件存储，功能不受影响但写入速度较低"),
-    checkNative("better-sqlite3", "关系数据，用于插件建表", "缺失时依赖 SQL 的插件将取得一条错误说明，而非静默失效"),
+    ...(await checkStorage(storeDir)),
+    checkNative(
+      "better-sqlite3",
+      "插件 SQL 库",
+      "缺失时依赖 SQL 的插件将取得一条错误说明，而非静默失效；KV 存储会改用 node:sqlite"
+    ),
     probePort
       ? await checkPort(opts.host ?? server.host, opts.port ?? server.port)
       : { level: "ok", title: "面板端口", detail: dim("面板已关闭（server.enable: false），不探测") }

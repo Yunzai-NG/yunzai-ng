@@ -73,7 +73,7 @@ const LOG_TAIL_MAX = 2000
 const WRITE_SOURCE = "webui"
 
 /** 合法的日志级别，用于校验查询参数 */
-const LOG_LEVELS: readonly string[] = ["trace", "debug", "info", "warn", "error", "fatal", "silent"]
+const LOG_LEVELS: readonly string[] = ["trace", "debug", "mark", "info", "warn", "error", "fatal", "silent"]
 
 /**
  * 两次「把令牌打进日志」之间的最小间隔
@@ -165,6 +165,12 @@ export interface ApiDeps {
   readonly registries: ApiRegistries
   /** 适配器注册表（此处只读视图即可满足需要：注册由插件负责） */
   readonly adapters: AdapterRegistryView
+  /**
+   * 适配器由哪个插件提供；用来判它名下的机器人接不接受群配置。省略时一律当不接受
+   * @param id 适配器 id
+   * @returns 插件名
+   */
+  readonly adapterOwner?: (id: string) => string | undefined
   /** 账号管理器 */
   readonly accounts: AccountManager
   /** 登录会话管理器 */
@@ -401,7 +407,8 @@ function retryOverrideOf(body: Record<string, unknown>): AccountRetryOverride | 
     if (!isDurationLike(value)) {
       throw fail(400, `字段 retry.${key} 必须是毫秒数字或形如 "2s" 的时长字符串`)
     }
-    if (parseDuration(value, -1) < 0) throw fail(400, `字段 retry.${key} 不能是负数`)
+    const ms = parseDuration(value, 0)
+    if (ms < 1 || ms > 2147483647) throw fail(400, `字段 retry.${key} 须在 1 到 2147483647 毫秒之间`)
     override[key] = value
   }
   return override
@@ -531,6 +538,8 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
       counts: {
         plugins: plugins.length,
         pluginsFailed: plugins.filter(p => p.status === "error").length,
+        // 其中单文件插件几个：`plugins` 仍是总数，旧面板照旧读得对
+        scripts: plugins.filter(p => p.file !== undefined).length,
         commands: deps.registries.commands().length,
         tasks: deps.registries.tasks().length,
         adapters: deps.adapters.list().length,
@@ -587,6 +596,23 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     const state = deps.plugins.get(name)
     if (state === undefined) throw fail(404, `没有名为 ${name} 的插件`)
     return state
+  })
+
+  /*
+   * 重新扫一遍插件目录：加载新出现的与先前卸掉的，单文件插件另按磁盘增删改同步
+   *
+   * 面板「全部更新」的收尾：逐个更新时都带 `load: false`，最后在这里一次装回，
+   * 而不是每更新完一个就整份扫一遍。段数与 `plugins/:name` 相同，故注册在它之前。
+   */
+  add("POST", "plugins/rescan", async () => {
+    requireWritable()
+    const scripts = await deps.plugins.syncSingles()
+    const report = await deps.plugins.loadAll()
+    return {
+      loaded: [...scripts.loaded, ...report.loaded],
+      failed: [...scripts.failed, ...report.failed],
+      removed: scripts.removed
+    }
   })
 
   add("POST", "plugins/:name/reload", async req => {
@@ -662,6 +688,29 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
    * @param name 先前卸掉的插件声明名
    * @param unloaded 当时是否确实卸掉了
    */
+  /** 正在被安装、更新、重跑装依赖或删除的插件目录 */
+  const busy = new Set<string>()
+
+  /**
+   * 同一个插件目录同时只做一件事
+   *
+   * 连点两次「更新」时两次 git 在同一个仓库里撞 index.lock，或一边在删目录一边在往里装。
+   * 第二次直接 409，不排队：排队等于让使用者以为第二下也生效了。
+   * @param name 插件目录名
+   * @param task 要做的事
+   * @returns task 的结果
+   * @throws 该目录已有一件事在做时，409
+   */
+  const exclusive = async <T>(name: string, task: () => Promise<T>): Promise<T> => {
+    if (busy.has(name)) throw fail(409, `插件 ${name} 正在安装、更新或删除，等这一次做完再操作`)
+    busy.add(name)
+    try {
+      return await task()
+    } finally {
+      busy.delete(name)
+    }
+  }
+
   const restore = async (name: string | undefined, unloaded: boolean): Promise<void> => {
     if (!unloaded || name === undefined) return
     const back = await deps.plugins.reload(name).catch(() => false)
@@ -682,13 +731,24 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
    * @returns 安装结果，附本次加载成功的插件名
    * @throws 安装失败时以 400 结束请求
    */
-  const installFromMarket = async (
+  const installFromMarket = (
     name: string,
     load: boolean,
     replace: boolean,
     dependencies: boolean,
     fresh = false,
     onDirty: DirtyAction = "abort"
+  ): Promise<Record<string, unknown>> =>
+    exclusive(name, () => installFromMarketNow(name, load, replace, dependencies, fresh, onDirty))
+
+  /** 实际执行；参数见 `installFromMarket` */
+  const installFromMarketNow = async (
+    name: string,
+    load: boolean,
+    replace: boolean,
+    dependencies: boolean,
+    fresh: boolean,
+    onDirty: DirtyAction
   ): Promise<Record<string, unknown>> => {
     const instance = market()
     refuseSingles(name)
@@ -714,8 +774,10 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
       else result = await instance.update(name, { dependencies, onDirty })
       // 缺依赖或装后步骤失败时不加载：加载注定失败，且报出的错离原因很远
       const skip = result.setupError !== undefined || result.dependencyError !== undefined || result.needsDependencies
-      const loaded = load && !skip ? [...(await deps.plugins.loadAll()).loaded] : []
-      return { ...result, unloaded, loaded }
+      const report = load && !skip ? await deps.plugins.loadAll() : undefined
+      // 只报这一个插件的加载失败：新版 setup 抛错时，早先只回一个空的 loaded，使用者看不出它没起来
+      const failed = (report?.failed ?? []).filter(f => f.name === name || f.name === occupant)
+      return { ...result, unloaded, loaded: [...(report?.loaded ?? [])], ...(failed.length === 0 ? {} : { failed }) }
     } catch (err) {
       await restore(occupant, unloaded)
       throw fail(400, err instanceof Error ? err.message : String(err))
@@ -853,46 +915,51 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     const body = req.body === undefined ? {} : objectOf(req.body)
     const load = optionalBoolean(body, "load") ?? true
     refuseSingles(name)
-    // 先卸载再跑：`build` 会覆盖 `dist/`，而旧模块还在内存里响应命令。
-    // 卸的是这个目录里装着的那个插件，不是与目录同名的那个，见 `pluginInDir`
-    const occupant = pluginInDir(name)
-    const unloaded =
-      occupant !== undefined && deps.plugins.get(occupant) !== undefined ? await deps.plugins.unload(occupant) : false
-    try {
-      const result = await market().setup(name)
-      // 判据与 installFromMarket 一致：缺依赖或缺产物时加载注定失败，见那里的注释
-      const skip = result.setupError !== undefined || result.needsDependencies
-      const loaded = load && !skip ? [...(await deps.plugins.loadAll()).loaded] : []
-      return { ...result, unloaded, loaded }
-    } catch (err) {
-      await restore(occupant, unloaded)
-      throw fail(400, err instanceof Error ? err.message : String(err))
-    }
+    return exclusive(name, async () => {
+      // 先卸载再跑：`build` 会覆盖 `dist/`，而旧模块还在内存里响应命令。
+      // 卸的是这个目录里装着的那个插件，不是与目录同名的那个，见 `pluginInDir`
+      const occupant = pluginInDir(name)
+      const unloaded =
+        occupant !== undefined && deps.plugins.get(occupant) !== undefined ? await deps.plugins.unload(occupant) : false
+      try {
+        const result = await market().setup(name)
+        // 判据与 installFromMarket 一致：缺依赖或缺产物时加载注定失败，见那里的注释
+        const skip = result.setupError !== undefined || result.needsDependencies
+        const report = load && !skip ? await deps.plugins.loadAll() : undefined
+        const failed = (report?.failed ?? []).filter(f => f.name === name || f.name === occupant)
+        return { ...result, unloaded, loaded: [...(report?.loaded ?? [])], ...(failed.length === 0 ? {} : { failed }) }
+      } catch (err) {
+        await restore(occupant, unloaded)
+        throw fail(400, err instanceof Error ? err.message : String(err))
+      }
+    })
   })
 
   add("DELETE", "market/:name", async req => {
     requireWritable()
     const name = req.params.name ?? ""
     refuseSingles(name)
-    // 先卸载再删除目录：若目录已删除而插件仍在内存中运行，其命令仍会响应，
-    // 而重启后则不再存在 —— 此类不一致比一次失败的卸载更难排查。
-    // 同样按目录定位那个插件，见 `pluginInDir`
-    const occupant = pluginInDir(name)
-    const unloaded =
-      occupant !== undefined && deps.plugins.get(occupant) !== undefined ? await deps.plugins.unload(occupant) : false
-    let removed: boolean
-    try {
-      removed = await market().remove(name)
-    } catch (err) {
-      await restore(occupant, unloaded)
-      throw fail(400, err instanceof Error ? err.message : String(err))
-    }
-    // 目录都没删掉就别让插件白白停掉：这一支的典型成因是目录名写错，与插件本身无关
-    if (!removed) {
-      await restore(occupant, unloaded)
-      throw fail(404, `插件目录 ${name} 不存在`)
-    }
-    return { name, unloaded, removed }
+    return exclusive(name, async () => {
+      // 先卸载再删除目录：若目录已删除而插件仍在内存中运行，其命令仍会响应，
+      // 而重启后则不再存在 —— 此类不一致比一次失败的卸载更难排查。
+      // 同样按目录定位那个插件，见 `pluginInDir`
+      const occupant = pluginInDir(name)
+      const unloaded =
+        occupant !== undefined && deps.plugins.get(occupant) !== undefined ? await deps.plugins.unload(occupant) : false
+      let removed: boolean
+      try {
+        removed = await market().remove(name)
+      } catch (err) {
+        await restore(occupant, unloaded)
+        throw fail(400, err instanceof Error ? err.message : String(err))
+      }
+      // 目录都没删掉就别让插件白白停掉：这一支的典型成因是目录名写错，与插件本身无关
+      if (!removed) {
+        await restore(occupant, unloaded)
+        throw fail(404, `插件目录 ${name} 不存在`)
+      }
+      return { name, unloaded, removed }
+    })
   })
 
   add("GET", "commands", () => deps.registries.commands())
@@ -905,7 +972,13 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
 
   /* ────────────────────── 适配器与账号 ────────────────────── */
 
-  add("GET", "adapters", () => deps.adapters.list())
+  // 补上「名下机器人接不接受群配置」：判据在插件宿主那边，注册表不认识插件
+  add("GET", "adapters", () =>
+    deps.adapters.list().map(a => {
+      const owner = deps.adapterOwner?.(a.id)
+      return owner !== undefined && deps.plugins.acceptsGroupRules(owner) ? { ...a, groupRules: true } : a
+    })
+  )
 
   // 账号配置里含连接密钥，同 GET config/:name 一样刻意不脱敏
   add("GET", "accounts", () => deps.accounts.list())
@@ -981,6 +1054,22 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
     const state = accountOf(req.params.id)
     await deps.accounts.reconnect(state.record.id)
     return deps.accounts.get(state.record.id)
+  })
+
+  // 面板「群规则」挑群用：只读，问的是平台，故账号须在线
+  add("GET", "accounts/:id/groups", async req => {
+    const state = accountOf(req.params.id)
+    const bot = deps.bots.get(state.record.id)
+    if (bot === undefined) throw fail(409, "账号不在线，取不到群列表")
+    try {
+      return (await bot.getGroupList()).map(group => ({
+        gid: group.gid,
+        ...(group.name === undefined ? {} : { name: group.name }),
+        ...(group.memberCount === undefined ? {} : { memberCount: group.memberCount })
+      }))
+    } catch (err) {
+      throw fail(502, `取群列表失败：${messageOf(err)}`)
+    }
   })
 
   /* ────────────────────────── 交互式登录 ────────────────────────── */
@@ -1162,7 +1251,12 @@ export function createApiRoutes(deps: ApiDeps): ApiSurface {
       ...(after === undefined || after === "" ? {} : { after }),
       limit: countOf(req.query, "limit", 100, 500)
     })
-    return { driver: inspector.driver, readonly: deps.config.get().server.readonly, ...page }
+    return {
+      driver: inspector.driver,
+      ...(inspector.engine === undefined ? {} : { engine: inspector.engine }),
+      readonly: deps.config.get().server.readonly,
+      ...page
+    }
   })
 
   add("GET", "storage/kv/entry", async req => {

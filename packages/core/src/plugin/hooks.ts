@@ -17,7 +17,6 @@ import type {
   CommandPattern,
   Disposer,
   HttpMethod,
-  KvDriver,
   Middleware,
   MiddlewareOptions,
   RenderRequest,
@@ -210,17 +209,6 @@ export interface AdapterSink {
   register(provider: AdapterProvider, owner: string): Disposer
 }
 
-/** KV 驱动注册目标（由存储层实现） */
-export interface KvDriverSink {
-  /**
-   * 注册 KV 驱动
-   * @param driver 驱动实现
-   * @param owner 提供方插件名
-   * @returns 注销句柄
-   */
-  register(driver: KvDriver, owner: string): Disposer
-}
-
 /** SQL 打开目标（由存储层实现） */
 export interface SqlSink {
   /**
@@ -272,8 +260,6 @@ export interface KernelHooks {
   render: RenderSink
   /** 适配器注册表 */
   adapters: AdapterSink
-  /** KV 驱动注册表 */
-  kvDrivers: KvDriverSink
   /** SQL */
   sql: SqlSink
   /** Bot 选取 */
@@ -356,7 +342,6 @@ export function unavailableHooks(): KernelHooks {
     server: unavailableServer("服务器子系统未初始化"),
     render: unavailableRender(),
     adapters: { register: failing("适配器注册表", "适配器子系统未初始化") },
-    kvDrivers: { register: failing("KV 驱动注册表", "存储子系统未初始化") },
     sql: {
       open: () => Promise.reject(new SubsystemUnavailableError("SQL", "better-sqlite3 未安装或存储子系统未初始化")),
       close: () => Promise.resolve()

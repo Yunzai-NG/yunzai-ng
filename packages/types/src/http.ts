@@ -36,9 +36,12 @@ export interface HttpRequestOptions {
   json?: unknown
   /** 表单请求体，自动 urlencode */
   form?: Record<string, string | number | boolean>
-  /** 超时，缺省 10s */
+  /**
+   * 超时，缺省 10s。缓冲读取限整次请求；`stream` / `download()` 只限到响应头，
+   * 之后按两次收到数据的间隔计
+   */
   timeout?: DurationLike
-  /** 重试策略 */
+  /** 重试策略；不给时 GET/HEAD/OPTIONS/PUT/DELETE 用客户端默认，POST/PATCH 不重试 */
   retry?: number | HttpRetryOptions
   /** 代理地址，缺省用全局配置 */
   proxy?: string | false
@@ -78,7 +81,7 @@ export interface HttpDefaults {
   headers?: Record<string, string>
   /** 默认超时 */
   timeout?: DurationLike
-  /** 默认重试 */
+  /** 默认重试，只作用于幂等方法；POST/PATCH 要重试须在那一次请求上显式给 `retry` */
   retry?: number | HttpRetryOptions
   /** 默认代理 */
   proxy?: string | false

@@ -3,8 +3,8 @@
  * 依赖方向：依赖类型包与 util/deep
  * 生命周期：`close()` 后可再 `open()`
  * 注意事项：**存取都做深拷贝**。若直接存引用，调用方在 set 之后修改对象会连带改掉
- *          "已落盘"的值；这样内存驱动下能跑通的代码换到 level/json 驱动就会出错，
- *          属于最难查的一类问题。宁可多一次拷贝，也要让三种驱动语义完全一致。
+ *          "已落盘"的值；这样内存驱动下能跑通的代码换到 SQLite 驱动就会出错，
+ *          属于最难查的一类问题。宁可多一次拷贝，也要让两种驱动语义完全一致。
  */
 import type { KvBatchOp, KvDriver, StoredEnvelope } from "@yunzai-ng/types"
 import { deepClone } from "../util/deep.js"

@@ -6,12 +6,14 @@
  *
  *          **事务手写 BEGIN/COMMIT 并用互斥锁串行化**：better-sqlite3 的 `db.transaction()`
  *          只收同步函数，而本框架的接口是异步的（要容得下别的驱动）。一条连接上开不了两个
- *          事务，故事务之间必须排队；嵌套事务改用 SAVEPOINT，不重复抢锁。
+ *          事务，故事务之间必须排队；嵌套事务改用 SAVEPOINT，不重复抢锁。根句柄上的语句
+ *          在别处事务进行中同样排队，否则会落进那个事务。
  *
  *          **语句缓存有界。** `prepare()` 有真实开销，但无上限的缓存在动态拼 SQL 的插件手里
  *          就是内存泄漏。
  */
 import type { SqlHandle, SqlMigration, SqlParam } from "@yunzai-ng/types"
+import { AsyncLocalStorage } from "node:async_hooks"
 import { dirname } from "node:path"
 import { performance } from "node:perf_hooks"
 import { LruCache } from "../util/lru.js"
@@ -78,6 +80,10 @@ interface SqlState {
   mutex: Semaphore
   /** SAVEPOINT 命名计数器 */
   savepoint: number
+  /** 正在进行的顶层事务；不在事务中为 undefined */
+  current: SqliteHandle | undefined
+  /** 本连接上当前异步链所属的事务 */
+  scope: AsyncLocalStorage<SqliteHandle>
 }
 
 /**
@@ -96,22 +102,24 @@ export async function loadSqlite(): Promise<SqliteCtor | undefined> {
 /**
  * SQLite 句柄
  *
- * 根句柄由 `openSql()` 创建；事务内传给回调的是 `depth > 0` 的子句柄，
+ * 根句柄由 `openSql()` 创建；事务内传给回调的是 独立的子句柄，
  * 它们共享同一条连接，因此**不能**在事务回调里持有子句柄留到事务外使用。
  */
 export class SqliteHandle implements SqlHandle {
   /** 共享状态 */
   readonly #state: SqlState
-  /** 事务嵌套深度，0 表示不在事务中 */
-  readonly #depth: number
+  readonly #parent?: SqliteHandle
+  #active = false
+  /** 同一作用域的嵌套事务串行，子作用域另持一把锁 */
+  readonly #nested = new Semaphore(1)
 
   /**
    * @param state 共享状态
-   * @param depth 事务嵌套深度
+   * @param parent 所属的外层句柄
    */
-  constructor(state: SqlState, depth = 0) {
+  constructor(state: SqlState, parent?: SqliteHandle) {
     this.#state = state
-    this.#depth = depth
+    this.#parent = parent
   }
 
   /**
@@ -124,11 +132,13 @@ export class SqliteHandle implements SqlHandle {
    * @returns 受影响行数与最后插入 id
    */
   async run(sql: string, params: SqlParam[] = []): Promise<{ changes: number; lastInsertRowid: number | bigint }> {
-    if (params.length === 0 && isMultiStatement(sql)) {
-      this.#state.db.exec(sql)
-      return { changes: 0, lastInsertRowid: 0 }
-    }
-    return this.#prepare(sql).run(...params)
+    return this.#exclusive(() => {
+      if (params.length === 0 && isMultiStatement(sql)) {
+        this.#state.db.exec(sql)
+        return { changes: 0, lastInsertRowid: 0 }
+      }
+      return this.#prepare(sql).run(...params)
+    })
   }
 
   /**
@@ -138,7 +148,7 @@ export class SqliteHandle implements SqlHandle {
    * @returns 结果行数组
    */
   async all<T = Record<string, unknown>>(sql: string, params: SqlParam[] = []): Promise<T[]> {
-    return this.#prepare(sql).all(...params) as T[]
+    return this.#exclusive(() => this.#prepare(sql).all(...params) as T[])
   }
 
   /**
@@ -148,7 +158,7 @@ export class SqliteHandle implements SqlHandle {
    * @returns 首行；无结果时 undefined
    */
   async get<T = Record<string, unknown>>(sql: string, params: SqlParam[] = []): Promise<T | undefined> {
-    return (this.#prepare(sql).get(...params) as T | undefined) ?? undefined
+    return this.#exclusive(() => (this.#prepare(sql).get(...params) as T | undefined) ?? undefined)
   }
 
   /**
@@ -160,13 +170,16 @@ export class SqliteHandle implements SqlHandle {
    * @returns 事务体的返回值
    */
   async transaction<T>(fn: (tx: SqlHandle) => Promise<T>): Promise<T> {
-    if (this.#depth > 0) return this.#savepoint(fn)
+    // 事务体里误用根句柄再开事务，按嵌套处理，否则会等自己释放锁而死锁
+    const owner = this.#owner()
+    if (owner) return owner.#nested.use(() => owner.#savepoint(fn))
     // 同一条连接上不能并发开事务，排队等前一个事务结束
     return this.#state.mutex.use(async () => {
-      const tx = new SqliteHandle(this.#state, 1)
+      const tx = new SqliteHandle(this.#state, this)
       this.#state.db.exec("BEGIN IMMEDIATE")
+      this.#state.current = tx
       try {
-        const result = await fn(tx)
+        const result = await tx.#within(fn)
         this.#state.db.exec("COMMIT")
         return result
       } catch (err) {
@@ -177,8 +190,43 @@ export class SqliteHandle implements SqlHandle {
           /* 忽略 */
         }
         throw err
+      } finally {
+        this.#state.current = undefined
       }
     })
+  }
+
+  /**
+   * 根句柄上的单条语句：有别处的事务未结束时排到它后面，免得被卷进那个事务一起提交或回滚
+   * @param task 同步执行语句
+   * @returns 语句结果
+   */
+  async #exclusive<T>(task: () => T): Promise<T> {
+    const owner = this.#owner()
+    if (owner) return owner.#nested.use(task)
+    if (this.#state.current === undefined) return task()
+    return this.#state.mutex.use(task)
+  }
+
+  /** 根句柄及祖先句柄都归到当前事务层；已经退出的子句柄不再可用。 */
+  #owner(): SqliteHandle | undefined {
+    const scope = this.#state.scope.getStore()
+    if (!this.#parent) return scope && scope.#active ? scope : undefined
+    for (let it = scope; it && it.#active; it = it.#parent) {
+      if (it === this) return scope
+    }
+    throw new Error("事务句柄已离开所属事务，不能继续使用")
+  }
+
+  /** 即使 Promise.all 提前拒绝，也要等已提交的同层操作退出再释放保存点。 */
+  async #within<T>(fn: (tx: SqlHandle) => Promise<T>): Promise<T> {
+    this.#active = true
+    try {
+      return await this.#state.scope.run(this, () => fn(this))
+    } finally {
+      this.#active = false
+      await this.#nested.use(() => undefined)
+    }
   }
 
   /**
@@ -228,10 +276,10 @@ export class SqliteHandle implements SqlHandle {
    */
   async #savepoint<T>(fn: (tx: SqlHandle) => Promise<T>): Promise<T> {
     const name = `yzng_sp_${++this.#state.savepoint}`
-    const tx = new SqliteHandle(this.#state, this.#depth + 1)
+    const tx = new SqliteHandle(this.#state, this)
     this.#state.db.exec(`SAVEPOINT ${name}`)
     try {
-      const result = await fn(tx)
+      const result = await tx.#within(fn)
       this.#state.db.exec(`RELEASE ${name}`)
       return result
     } catch (err) {
@@ -302,7 +350,9 @@ export async function openSql(opts: OpenSqlOptions): Promise<SqlStore | undefine
     db,
     stmts: new LruCache<SqliteStatement>({ max: STMT_CACHE_MAX }),
     mutex: new Semaphore(1),
-    savepoint: 0
+    savepoint: 0,
+    current: undefined,
+    scope: new AsyncLocalStorage<SqliteHandle>()
   }
 
   return {
@@ -314,6 +364,7 @@ export async function openSql(opts: OpenSqlOptions): Promise<SqlStore | undefine
       // 缓存里的语句必须先丢掉：连接关了之后再用它们会直接崩进程
       state.stmts.clear()
       db.close()
+      state.scope.disable()
     }
   }
 }

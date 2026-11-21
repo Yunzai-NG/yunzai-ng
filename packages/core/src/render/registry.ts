@@ -197,7 +197,7 @@ export class RenderRegistry implements RenderSink {
 
     for (const entry of this.#candidates(policy.default)) {
       const id = entry.provider.id
-      if (!(await this.#available(entry))) {
+      if (!(await this.#available(entry, timeout))) {
         reasons.push(`${id}：不可用（${entry.lastError ?? "available() 返回 false"}）`)
         continue
       }
@@ -327,9 +327,10 @@ export class RenderRegistry implements RenderSink {
    *
    * 带 TTL 缓存 + 单例探测，见文件头第 1 点。
    * @param entry 条目
+   * @param timeout 单次渲染的超时上限
    * @returns 是否可用
    */
-  async #available(entry: RendererEntry): Promise<boolean> {
+  async #available(entry: RendererEntry, timeout: number): Promise<boolean> {
     const now = Date.now()
     if (entry.ok !== undefined) {
       const ttl = entry.ok ? AVAILABLE_TTL_OK : AVAILABLE_TTL_FAIL
@@ -340,7 +341,7 @@ export class RenderRegistry implements RenderSink {
 
     const probing = (async (): Promise<boolean> => {
       try {
-        return await entry.provider.available()
+        return await withTimeout(entry.provider.available(), Math.min(timeout, 5000), `渲染器 ${entry.provider.id} 可用性探测超时`)
       } catch (err) {
         // available() 自己抛错等同于不可用：一个探测都做不成的渲染器不能拿来出图
         entry.lastError = `available() 抛出异常：${errText(err)}`
