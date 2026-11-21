@@ -8,7 +8,7 @@ import { existsSync } from "node:fs"
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import { createRequire } from "node:module"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, toNamespacedPath } from "node:path"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Logger } from "@yunzai-ng/types"
 import { KV_DB_FILE, loadSqliteBinding, openKv, stampOf } from "@yunzai-ng/core"
@@ -91,6 +91,18 @@ describe.skipIf(binding === undefined)("yzng data", () => {
     await exportInstance({ home: src, out, version: "test" })
     expect(existsSync(join(out, "data", "store"))).toBe(false)
     expect(existsSync(join(out, "store", KV_DB_FILE))).toBe(true)
+  })
+
+  it.skipIf(process.platform !== "win32")("长路径形式的 store.dir 不重复导出，也不误排相近目录名", async () => {
+    const store = join(src, "data", "store")
+    await writeFile(join(src, "config", "yunzai.yaml"), `store: {dir: ${JSON.stringify(toNamespacedPath(store))}}`)
+    await writeFile(join(store, "kv.json"), JSON.stringify({ format: 1, data: { k: { v: 1 } } }))
+    await mkdir(join(src, "data", "store-extra"))
+    await writeFile(join(src, "data", "store-extra", "keep"), "保留")
+    const manifest = await exportInstance({ home: src, out, version: "test" })
+    expect(manifest.kv).toBe(1)
+    expect(existsSync(join(out, "data", "store"))).toBe(false)
+    expect(await readFile(join(out, "data", "store-extra", "keep"), "utf8")).toBe("保留")
   })
 
   it("实例还在跑（kv.db 被占着）时拒绝导出，不留半截目录", async () => {

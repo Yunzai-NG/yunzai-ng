@@ -14,7 +14,7 @@
 import { existsSync } from "node:fs"
 import { copyFile, cp, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { basename, dirname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path"
+import { basename, dirname, isAbsolute, join, relative, resolve, sep, toNamespacedPath, win32 } from "node:path"
 import process from "node:process"
 import {
   CORE_CONFIG_NAME,
@@ -109,6 +109,11 @@ function storeDirOf(home: string, data: string, setting: string | undefined): st
   return isAbsolute(setting) ? setting : resolve(home, setting)
 }
 
+/** Windows 的 fs.cp 过滤回调可能传长路径形式；两端同形再比较，涵盖盘符与 UNC。 */
+function relativePath(from: string, to: string): string {
+  return relative(toNamespacedPath(from), toNamespacedPath(to))
+}
+
 /**
  * inner 是否就是 outer 或在它里面
  * @param outer 外层目录
@@ -116,7 +121,7 @@ function storeDirOf(home: string, data: string, setting: string | undefined): st
  * @returns 是否在内
  */
 function within(outer: string, inner: string): boolean {
-  const rel = relative(outer, inner)
+  const rel = relativePath(outer, inner)
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 }
 
@@ -187,8 +192,8 @@ export async function exportInstance(opts: ExportOptions): Promise<ExportManifes
         dereference: true,
         filter: src => {
           if (within(sqlDir, src)) return false
-          if (relative(paths.data, storeDir) !== "") return !within(storeDir, src)
-          const first = relative(storeDir, src).split(sep)[0] ?? ""
+          if (relativePath(paths.data, storeDir) !== "") return !within(storeDir, src)
+          const first = relativePath(storeDir, src).split(sep)[0] ?? ""
           return !/^(?:kv(?:\.json)?(?:$|\.migrated-|\.corrupt-)|kv\.db(?:$|[-.]))/.test(first)
         }
       })
@@ -367,7 +372,7 @@ async function installSnapshot(from: string, manifest: ExportManifest, snapshot:
         return true
       } })
     }
-    const stagedStore = separate ? parts[2]!.stage : join(data, relative(paths.data, storeDir))
+    const stagedStore = separate ? parts[2]!.stage : join(data, relativePath(paths.data, storeDir))
     await mkdir(stagedStore, { recursive: true })
     const leftovers = await readdir(stagedStore)
     if (leftovers.some(name => [KV_DB_FILE, `${KV_DB_FILE}-wal`, `${KV_DB_FILE}-shm`, `${KV_DB_FILE}-journal`].includes(name))) {
