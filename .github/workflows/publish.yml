@@ -58,7 +58,7 @@ jobs:
 
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
-      # 发布前跑满门禁：构建、分层、首次启动、类型检查、lint、604 个用例。
+      # 发布前跑满门禁：构建、分层、首次启动、测试类型检查、lint 与单元测试。
       # 发出去的包改不回来，这是最后一道拦得住的地方。
       - name: 全量校验
         run: pnpm run verify
