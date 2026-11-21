@@ -29,6 +29,12 @@ export class KernelPolicy implements PolicyView {
     this.#config = config
   }
 
+
+  /** 日志是否显示限长且脱敏的入站正文摘要。 */
+  get logMessageContent(): boolean {
+    return this.#config.get().log.messageContent
+  }
+
   /** 主人账号列表 */
   get masters(): readonly string[] {
     return this.#config.get().bot.masterQQ

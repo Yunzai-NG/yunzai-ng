@@ -327,6 +327,30 @@ describe("日志摘要", () => {
     expect(out).not.toContain("QQQ")
   })
 
+  it("日志摘要支持较长预览并遮蔽常见凭据、ANSI 与 URL 用户信息", () => {
+    expect(describeMessage([seg.text("#bind " + "x".repeat(100))], 120)).toContain("#bind")
+    for (const secret of ["cookie_value", "BearerSecret", "pass_value", "url-secret", "secret-cn"]) {
+      const source = secret === "cookie_value" ? "#绑定cookie=" + secret
+        : secret === "BearerSecret" ? "Authorization: Bearer " + secret
+          : secret === "pass_value" ? "password=" + secret
+            : secret === "secret-cn" ? "密码：" + secret : "https://user:" + secret + "@example.com/"
+      const out = describeMessage([seg.text(source)], 200)
+      expect(out).not.toContain(secret)
+      expect(out).toContain("[已脱敏]")
+    }
+  })
+
+  it("日志正文预览保留上下文并遮蔽常见凭据", () => {
+    const out = describeMessage([
+      seg.text("正文上下文 token=abc123 cookie=session-cookie password=secret42 Authorization: Bearer auth-xyz "),
+      seg.image("https://example.com/pic.png?access_token=private-token")
+    ], 200)
+    expect(out).toContain("正文上下文")
+    expect(describeMessage([seg.text("[31m颜色[0m")], 200)).not.toContain("")
+    for (const secret of ["abc123", "session-cookie", "secret42", "auth-xyz", "private-token"]) expect(out).not.toContain(secret)
+    expect(out.match(/\[已脱敏\]/g)).toHaveLength(3)
+  })
+
   it("describeMessage 把超长文本截断", () => {
     const out = describeMessage([seg.text("字".repeat(50))])
     expect([...out]).toHaveLength(41)

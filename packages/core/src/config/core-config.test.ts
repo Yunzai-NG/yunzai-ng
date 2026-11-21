@@ -18,6 +18,10 @@ describe("内核配置", () => {
     expect(defaults.server.port).toBe(2536)
     expect(defaults.bot.prefix).toEqual(["#", "*", "%"])
     expect(defaults.store.driver).toBe("sqlite")
+    expect(defaults.log.level).toBe("mark")
+    expect(coreConfigSchema.parse({ log: { messageContent: false } }).log.messageContent).toBe(false)
+    expect(defaults.log.messageContent).toBe(true)
+    expect(coreConfigSchema.safeParse({ log: { level: "info", messageContent: false } }).ok).toBe(true)
   })
 
   it("发送与重连时长不能让定时器立即触发，冷却仍允许关闭", () => {

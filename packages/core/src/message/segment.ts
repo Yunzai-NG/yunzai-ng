@@ -42,13 +42,27 @@ import type {
   VideoSegment,
   XmlSegment
 } from "@yunzai-ng/types"
-import { truncate } from "../util/text.js"
+import { stripAnsi, truncate } from "../util/text.js"
 
 /** `data:` URI 的头部形式 */
 const DATA_URI_RE = /^data:([^;,]*)(;charset=[^;,]*)?;base64,(.*)$/s
 
 /** 日志里描述消息时，文本段最多展示多少字 */
 const DESCRIBE_TEXT_MAX = 40
+
+/** 把消息文本转为单行摘要，并遮蔽具备键名的凭据。 */
+function safeLogText(input: string, limit: number): string {
+  let text = stripAnsi(input.replace(/\s+/g, " "))
+  text = text.replace(
+    /((?:\b(?:authorization|proxy-authorization|access[_-]?token|auth[_-]?token|refresh[_-]?token|token|password|passwd|pwd|secret|api[_-]?key|client[_-]?secret|stoken(?:_v\d+)?|ltoken(?:_v\d+)?|login[_-]?ticket)\b)|访问令牌|会话令牌|密码|密钥|口令)(\s*[:=：]\s*)(?:(?:bearer|basic)\s+)?("[^"]*"|'[^']*'|[^\s,;]+)/gi,
+    "$1$2[已脱敏]"
+  )
+  text = text.replace(/\b(?:bearer|basic)\s+[a-z0-9._~+\x2f-]+=*/gi, "[已脱敏]")
+  const cookie = /\b(cookie|set-cookie)(\s*[:=]\s*|\s+)[^\r\n]*/i.exec(text)
+  if (cookie !== null) text = text.slice(0, cookie.index) + `${cookie[1]}${cookie[2]}[已脱敏]`
+  text = text.replace(/([a-z][a-z\d+.-]*:\/\/)[^\s/:@]+:[^\s/@]+@/gi, "$1[已脱敏]@")
+  return truncate(text, limit)
+}
 
 /**
  * 判断是否已经是归一化后的媒体引用
@@ -119,7 +133,7 @@ export function toMediaRef(input: MediaInput): MediaRef {
 export function describeMedia(ref: MediaRef): string {
   switch (ref.kind) {
     case "url":
-      return truncate(ref.url, 60)
+      return truncate(safeLogText(ref.url, 60), 60)
     case "path":
       return ref.path
     case "buffer":
@@ -510,12 +524,12 @@ export function countByType(segments: readonly Segment[]): Partial<Record<Segmen
  * @param segments 消息段
  * @returns 单行描述
  */
-export function describeMessage(segments: readonly Segment[]): string {
+export function describeMessage(segments: readonly Segment[], textLimit = DESCRIBE_TEXT_MAX, totalLimit = Number.MAX_SAFE_INTEGER): string {
   const parts: string[] = []
   for (const s of segments) {
     switch (s.type) {
       case "text":
-        parts.push(truncate(s.text.replace(/\s+/g, " "), DESCRIBE_TEXT_MAX))
+        parts.push(safeLogText(s.text, textLimit))
         break
       case "image":
         parts.push(`[图片 ${describeMedia(s.file)}]`)
@@ -561,5 +575,5 @@ export function describeMessage(segments: readonly Segment[]): string {
         parts.push(`[${s.type}]`)
     }
   }
-  return parts.join("")
+  return truncate(stripAnsi(parts.map(part => safeLogText(part, totalLimit)).join("")), totalLimit)
 }
