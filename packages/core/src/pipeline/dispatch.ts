@@ -28,7 +28,7 @@ import type {
 } from "@yunzai-ng/types"
 import type { CommandRegistration } from "../plugin/hooks.js"
 import type { CoreEventBus } from "../plugin/events.js"
-import { textOf } from "../message/segment.js"
+import { describeMessage, textOf } from "../message/segment.js"
 import { parseDuration } from "../util/duration.js"
 import { Semaphore } from "../util/queue.js"
 import { cooldownKey, renderCooldownTip } from "./cooldown.js"
@@ -52,6 +52,8 @@ export interface DispatchPolicyView {
    * @returns 是否响应
    */
   canRespond(uid: string): boolean
+  /** 是否在入站摘要里显示安全正文预览。 */
+  logMessageContent?: boolean | (() => boolean)
 }
 
 /** 分发器构造参数 */
@@ -461,7 +463,12 @@ export class EventDispatcher {
   #logIncoming(e: RuntimeMessageEvent, level: "mark" | "info"): void {
     if (!this.#logger.isLevelEnabled(level)) return
     const who = `${e.sender.name ?? ""}(${e.sender.uid})`
-    const body = `收到消息（${e.message.length} 段）`
+    const showContent = typeof this.#policy.logMessageContent === "function"
+      ? this.#policy.logMessageContent()
+      : this.#policy.logMessageContent !== false
+    const body = showContent
+      ? `收到消息（${e.message.length} 段）：${describeMessage(e.message, 240, 240)}`
+      : `收到消息（${e.message.length} 段）`
     const via = `${e.bot.platform}:${e.bot.selfId}`
     switch (e.scene) {
       case "group":

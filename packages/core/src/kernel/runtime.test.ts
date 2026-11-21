@@ -754,7 +754,7 @@ describe("群规则", () => {
  * 只 mock 一个 logger 去断言「调用过 info」并不能说明默认级别下它会被记下。
  */
 describe("埋点与统计事件", () => {
-  it("收到的消息记明协议与账号，而非只记场景与发送者", async () => {
+  it("收到的消息记明协议、账号与脱敏正文摘要", async () => {
     const { app, mock } = await boot()
     await login(app, "10086")
 
@@ -768,7 +768,20 @@ describe("埋点与统计事件", () => {
     expect(line?.msg).toContain("[mock:10086]")
     expect(line?.msg).toContain("[私聊]")
     expect(line?.level).toBe("info")
-    expect(app.loggerHub.tail().some(r => r.msg.includes("正文样本不应进入日志"))).toBe(false)
+    expect(app.loggerHub.tail().some(r => r.msg.includes("正文样本不应进入日志"))).toBe(true)
+  })
+
+  it("正文摘要可以关闭；来源和段数仍保留", async () => {
+    const { app, mock } = await boot(`log:
+  messageContent: false
+`)
+    await login(app)
+    mock.driver.receivePrivate("不写出的正文", { uid: "20011" })
+    await vi.waitFor(() => {
+      const line = app.loggerHub.tail({ level: "mark" }).find(r => r.msg.includes("20011"))
+      expect(line?.msg).toContain("收到消息（1 段）")
+      expect(line?.msg).not.toContain("不写出的正文")
+    })
   })
 
   it("仅旁听的普通消息进 mark；监听器就地回复仍进 info", async () => {

@@ -241,7 +241,7 @@ export function installRuntime(deps: RuntimeDeps): RuntimeParts {
   const cooldown = new CooldownStore()
   const dispatcher = new EventDispatcher({
     logger,
-    policy,
+    policy: { canRespond: uid => policy.canRespond(uid), get logMessageContent() { return policy.logMessageContent } },
     events,
     factory,
     middlewares,

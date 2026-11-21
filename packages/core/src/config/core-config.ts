@@ -74,9 +74,14 @@ export const coreConfigSchema = s.object({
           fatal: "致命",
           silent: "关闭"
         })
-        .default("info")
+        .default("mark")
         .title("日志级别")
-        .desc("控制台显示什么、面板的日志页缺省看什么。日志文件不受它影响，一律记全量。"),
+        .desc("缺省显示日常 mark 及以上级别；可单独调节控制台与文件阈值。日志文件默认记全量。"),
+      messageContent: s
+        .boolean()
+        .default(true)
+        .title("消息日志正文摘要")
+        .desc("入站摘要最多显示 240 字，并遮蔽常见 token、Cookie、密码键名。关闭后仅记录段数与来源。"),
       consoleLevel: s
         .enum(["trace", "debug", "mark", "info", "warn", "error", "fatal", "silent"])
         .optional()
