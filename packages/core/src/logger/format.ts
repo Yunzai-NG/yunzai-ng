@@ -269,7 +269,7 @@ export function formatRecord(rec: LogRecord, opts: FormatOptions): string {
 
   if (label !== fullScope) extra += ` scope=${JSON.stringify(fullScope)}`
 
-  let out = `${time} ${level}${scope} ${rec.level === "mark" ? paint("90", rec.msg, color) : rec.msg}${extra}\n`
+  let out = `${time} ${level}${scope} ${rec.msg}${extra}\n`
 
   if (rec.stack && opts.stack !== false) {
     out += `${paint("90", indent(rec.stack), color)}\n`

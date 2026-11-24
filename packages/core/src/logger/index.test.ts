@@ -60,8 +60,13 @@ describe("LoggerHub 的级别语义", () => {
     expect(rec.level).toBe("mark")
     expect(hub.tail({ level: "info" })).toHaveLength(0)
     expect(hub.tail({ level: "mark" })).toHaveLength(1)
-    expect(formatRecord(rec, { color: true })).toContain("[90m日常事件")
-    expect(formatRecord(rec, { color: false })).not.toContain("")
+    const colored = formatRecord(rec, { color: true })
+    const esc = String.fromCharCode(27)
+    expect(colored).toContain(`${esc}[90mMARK `)
+    expect(colored.slice(0, colored.indexOf(`${esc}[0m`))).toMatch(/\d{2}:\d{2}:\d{2}\.\d{3}/)
+    expect(colored).toContain("日常事件")
+    expect(colored).not.toContain(`${esc}[90m日常事件`)
+    expect(formatRecord(rec, { color: false })).not.toContain(esc)
   })
 
   it("配置就绪后同一写入器使用新的大小和保留上限", async () => {
