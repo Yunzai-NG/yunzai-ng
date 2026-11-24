@@ -48,6 +48,7 @@ import type {
 import { DisposalRegistry } from "../util/dispose.js"
 import { parseDuration } from "../util/duration.js"
 import { safeJoin } from "../util/fs.js"
+import { TempFiles } from "./temp.js"
 import { LruCache } from "../util/lru.js"
 import type { CoreEventBus } from "./events.js"
 import type { CommandRegistration, KernelHooks } from "./hooks.js"
@@ -315,6 +316,17 @@ class Context implements PluginContext<unknown> {
   readonly root: string
   /** 插件数据目录 */
   readonly dataDir: string
+  #temp?: TempFiles
+  /** 本插件的临时文件；不用时不分配缓存和回收器。 */
+  get temp(): TempFiles {
+    if (!this.#temp) {
+      const dir = safeJoin(join(this.app.paths.temp, "plugins"), this.name)
+      const files = new TempFiles(dir, this.http, err => this.logger.warn(`清理临时文件失败：${String(err)}`))
+      this.#own(() => void files.close(), "temp")
+      this.#temp = files
+    }
+    return this.#temp
+  }
   /** 插件日志器 */
   readonly logger: Logger
   /** 插件 KV 命名空间 */

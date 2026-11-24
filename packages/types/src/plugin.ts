@@ -24,6 +24,7 @@ import type { Logger } from "./logger.js"
 import type { PlatformInfo, ResourceUsage, RuntimePaths } from "./platform.js"
 import type { RenderOptions, RenderablePage, RenderedImage, RendererProvider } from "./renderer.js"
 import type { KvNamespace, SqlHandle } from "./store.js"
+import type { PluginTemp } from "./temp.js"
 import type {
   HttpMethod,
   RouteHandler,
@@ -667,6 +668,8 @@ export interface PluginContext<C = unknown> {
   readonly root: string
   /** 本插件专属的数据目录（绝对路径，已创建） */
   readonly dataDir: string
+  /** 本插件的临时文件与短期磁盘缓存 */
+  readonly temp: PluginTemp
   /** 本插件专属日志器 */
   readonly logger: Logger
   /** 本插件专属 KV 命名空间 */
